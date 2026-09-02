@@ -10,6 +10,7 @@ $state = Join-Path $root 'state'
 $logs = Join-Path $root 'logs'
 $enabledFile = Join-Path $state 'enabled'
 $activeFile = Join-Path $state 'active'
+$stackStoppedFile = Join-Path $state 'stack-stopped'
 $reloadFile = Join-Path $state 'reload.request'
 $errorFile = Join-Path $state 'last-error.txt'
 $logFile = Join-Path $logs 'controller.log'
@@ -57,7 +58,7 @@ function Get-ManagedProcess([string] $pidName, [string] $processName) {
 function Test-StackActive {
     $service = Get-Service -Name $configuration.ServiceName -ErrorAction SilentlyContinue
     $rule = Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -eq $configuration.NrptDisplayName }
+        Where-Object { Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $configuration.NrptDisplayName }
     return $service -and $service.Status -eq 'Running' -and $rule -and
         (Get-ManagedProcess 'dns-dispatcher.pid' 'dns-dispatcher') -and
         (Get-ManagedProcess 'wfp-filters.pid' 'wfp-probe')
@@ -66,9 +67,9 @@ function Test-StackActive {
 function Test-StackPresent {
     if (Test-Path -LiteralPath $activeFile -PathType Leaf) { return $true }
     $service = Get-Service -Name $configuration.ServiceName -ErrorAction SilentlyContinue
-    if ($service -and $service.Status -eq 'Running') { return $true }
+    if ($service -and $service.Status -ne 'Stopped') { return $true }
     if (Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -eq $configuration.NrptDisplayName }) { return $true }
+        Where-Object { Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $configuration.NrptDisplayName }) { return $true }
     return [bool]((Get-ManagedProcess 'dns-dispatcher.pid' 'dns-dispatcher') -or
         (Get-ManagedProcess 'wfp-filters.pid' 'wfp-probe'))
 }
@@ -117,6 +118,7 @@ function Invoke-Repair {
 
 function Start-Stack {
     $script:configuration = Get-ProgramSplitConfiguration -Root $root
+    Remove-Item -LiteralPath $stackStoppedFile -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $activeFile -Force -ErrorAction SilentlyContinue
     try {
         Write-ControllerLog 'Starting stack.'
@@ -187,8 +189,24 @@ $repairDelaySeconds = 2
 try {
     while ($true) {
         $desired = Test-Path -LiteralPath $enabledFile -PathType Leaf
+        if ($desired) {
+            try { Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile }
+            catch {
+                Write-ControllerLog $_.Exception.Message
+                Start-Sleep -Seconds 2
+                continue
+            }
+        }
         if (-not $desired) {
             if (Test-StackPresent) { Stop-Stack -RestoreCache }
+            if (-not (Test-StackPresent)) {
+                if (-not (Test-Path -LiteralPath $stackStoppedFile -PathType Leaf)) {
+                    try { [IO.File]::WriteAllText($stackStoppedFile, (Get-Date -Format o)) }
+                    catch { Write-ControllerLog $_.Exception.Message }
+                }
+            } else {
+                Remove-Item -LiteralPath $stackStoppedFile -Force -ErrorAction SilentlyContinue
+            }
         } elseif (Test-Path -LiteralPath $reloadFile) {
             Remove-Item -LiteralPath $reloadFile -Force -ErrorAction SilentlyContinue
             Stop-Stack

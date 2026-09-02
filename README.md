@@ -62,7 +62,7 @@ See [Installation](docs/installation.md), [Architecture](docs/architecture.md), 
 
 ## Development
 
-`./tests/run.sh` cross-compiles with warnings as errors, runs native self-tests, parses every PowerShell script, tests profile transformation, and tests the non-mutating installation plan.
+`./tests/run.sh` cross-compiles with warnings as errors, runs native self-tests, parses every PowerShell script, tests profile transformation and rollback, verifies resource-ownership checks, and tests the non-mutating installation plan.
 
 Contributions are welcome under [GPL-3.0-or-later](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 

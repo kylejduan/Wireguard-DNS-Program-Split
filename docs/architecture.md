@@ -33,7 +33,7 @@ Windows commonly performs application DNS through the shared DNS Client service.
 
 Attribution waits up to 500 ms. A selected hint chooses tunnel DNS; an attributed unlisted query chooses physical DNS. Missing or inaccessible attribution is blocked with `SERVFAIL`. Responses have TTLs zeroed, and the controller temporarily caps the Windows positive cache at one second, reducing cross-process cache reuse.
 
-Selected attribution takes precedence whenever it arrives before forwarding begins. One intentional race remains: a direct lookup may already be in flight when a nearly simultaneous selected-process event for the same name and record type arrives. See [Limitations](limitations.md).
+Selected attribution takes precedence whenever it arrives before forwarding begins. DNS packets and ETW events do not share a transaction identifier, so delayed or simultaneous events for the same name and record type cannot always be paired uniquely. See [Limitations](limitations.md).
 
 ## Startup
 

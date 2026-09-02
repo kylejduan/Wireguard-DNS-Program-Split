@@ -22,6 +22,9 @@ $sawAllowedIps = $false
 $tableWritten = $false
 $tunnelAddress = $null
 $tunnelDns = $null
+$interfaceSections = 0
+$peerSections = 0
+$seenRequiredFields = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
 function Add-TableOff {
     if ($script:section -eq 'interface' -and -not $script:tableWritten) {
@@ -30,11 +33,22 @@ function Add-TableOff {
     }
 }
 
+function Assert-WireGuardKey([string] $Value, [string] $Name) {
+    if ($Value -notmatch '^[A-Za-z0-9+/]{43}=$') {
+        throw "$Name must use canonical WireGuard base64 syntax."
+    }
+    try { $bytes = [Convert]::FromBase64String($Value) }
+    catch { throw "$Name must be a valid base64 WireGuard key." }
+    if ($bytes.Length -ne 32) { throw "$Name must decode to 32 bytes." }
+}
+
 foreach ($line in $lines) {
     $trimmed = $line.Trim()
     if ($trimmed -match '^\[(.+)\]$') {
         Add-TableOff
         $section = $Matches[1].ToLowerInvariant()
+        if ($section -eq 'interface') { ++$interfaceSections }
+        if ($section -eq 'peer') { ++$peerSections }
         $result.Add($line)
         continue
     }
@@ -43,8 +57,17 @@ foreach ($line in $lines) {
         $key = $Matches[1].Trim().ToLowerInvariant()
         $value = $Matches[2].Trim()
 
+        $requiredField = ($section -eq 'interface' -and $key -in @('privatekey', 'address', 'dns')) -or
+            ($section -eq 'peer' -and $key -in @('publickey', 'allowedips', 'endpoint'))
+        if ($requiredField -and -not $seenRequiredFields.Add("$section.$key")) {
+            throw "Duplicate required WireGuard field: $section.$key"
+        }
+
         if ($section -eq 'interface') {
-            if ($key -eq 'privatekey') { $sawPrivateKey = $true }
+            if ($key -eq 'privatekey') {
+                Assert-WireGuardKey $value 'PrivateKey'
+                $sawPrivateKey = $true
+            }
             if ($key -eq 'dns') {
                 $dnsValues = @($value.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
                 $parsedDns = $null
@@ -76,9 +99,20 @@ foreach ($line in $lines) {
         }
 
         if ($section -eq 'peer') {
-            if ($key -eq 'publickey') { $sawPublicKey = $true }
-            if ($key -eq 'endpoint') { $sawEndpoint = $true }
+            if ($key -eq 'publickey') {
+                Assert-WireGuardKey $value 'PublicKey'
+                $sawPublicKey = $true
+            }
+            if ($key -eq 'endpoint') {
+                if ($value -notmatch '^(?<host>[^:\s]+):(?<port>\d{1,5})$' -or
+                    [int] $Matches.port -lt 1 -or [int] $Matches.port -gt 65535 -or
+                    [Uri]::CheckHostName($Matches.host) -eq [UriHostNameType]::Unknown) {
+                    throw 'Endpoint must be an IPv4 address or hostname with a valid port.'
+                }
+                $sawEndpoint = $true
+            }
             if ($key -eq 'allowedips') {
+                if (-not $value) { throw 'AllowedIPs cannot be empty.' }
                 $result.Add('AllowedIPs = 0.0.0.0/0')
                 $sawAllowedIps = $true
                 continue
@@ -90,6 +124,9 @@ foreach ($line in $lines) {
 }
 Add-TableOff
 
+if ($interfaceSections -ne 1 -or $peerSections -ne 1) {
+    throw 'Expected exactly one [Interface] section and one [Peer] section.'
+}
 if (-not ($sawPrivateKey -and $sawAddress -and $sawDns -and $sawPublicKey -and $sawEndpoint -and $sawAllowedIps)) {
     throw 'The WireGuard profile is missing a required field.'
 }

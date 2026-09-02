@@ -13,6 +13,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $destinationCreated = $false
+. (Join-Path $PSScriptRoot 'src\powershell\Common.ps1')
 
 function Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -31,6 +32,11 @@ function Assert-ValidSignature([string] $Path, [string] $SubjectPattern) {
 
 $profilePath = (Get-Item -LiteralPath $Profile -ErrorAction Stop).FullName
 if ($DestinationRoot -match '\s') { throw 'DestinationRoot cannot contain whitespace.' }
+$fullDestinationRoot = [IO.Path]::GetFullPath($DestinationRoot)
+if ([IO.Path]::GetPathRoot($fullDestinationRoot).TrimEnd('\') -eq $fullDestinationRoot.TrimEnd('\')) {
+    throw 'DestinationRoot cannot be a filesystem root.'
+}
+$DestinationRoot = $fullDestinationRoot.TrimEnd('\')
 $applicationPaths = @($Applications | ForEach-Object {
     $item = Get-Item -LiteralPath $_ -ErrorAction Stop
     if ($item.PSIsContainer -or $item.Extension -ine '.exe') { throw "Included application must be an .exe file: $_" }
@@ -75,6 +81,11 @@ try {
     if (Test-Path -LiteralPath $DestinationRoot) {
         throw "An installation already exists at $DestinationRoot. Run Uninstall.ps1 before reinstalling."
     }
+    $existingTasks = @(foreach ($taskName in @($plan.ControllerTask, $plan.TrayTask)) {
+        Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
+    })
+    $existingService = Get-CimInstance Win32_Service -Filter "Name='$($plan.ServiceName)'" -ErrorAction SilentlyContinue
+    Assert-ProgramSplitInstallNamesAvailable -Tasks $existingTasks -Service $existingService
     Assert-ValidSignature (Join-Path $WireGuardRuntimeDirectory 'tunnel.dll') 'WireGuard|Proton'
     Assert-ValidSignature (Join-Path $WireGuardRuntimeDirectory 'wireguard.dll') 'WireGuard|Proton|Microsoft Windows Hardware Compatibility Publisher'
     Assert-ValidSignature (Join-Path $PiaDriverDirectory 'PiaWfpCallout.sys') 'Private Internet Access|Microsoft Windows Hardware Compatibility Publisher'
@@ -114,27 +125,25 @@ try {
 
     $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     $controllerAction = New-ScheduledTaskAction -Execute $powerShell -Argument (
-        "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"{0}`"" -f
-        (Join-Path $DestinationRoot 'src\Controller.ps1'))
+        Get-ProgramSplitTaskArguments -ScriptPath (Join-Path $DestinationRoot 'src\Controller.ps1'))
     $controllerSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
         -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    Register-ScheduledTask -TaskName $plan.ControllerTask -Action $controllerAction `
+    Register-ScheduledTask -TaskName $plan.ControllerTask -TaskPath '\' -Action $controllerAction `
         -Trigger (New-ScheduledTaskTrigger -AtStartup) `
         -Principal (New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest) `
-        -Settings $controllerSettings -Description 'Owns per-application WireGuard payload and DNS routing.' -Force | Out-Null
+        -Settings $controllerSettings -Description 'Owns per-application WireGuard payload and DNS routing.' | Out-Null
 
     $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $trayAction = New-ScheduledTaskAction -Execute $powerShell -Argument (
-        "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"{0}`"" -f
-        (Join-Path $DestinationRoot 'src\Tray.ps1'))
+        Get-ProgramSplitTaskArguments -ScriptPath (Join-Path $DestinationRoot 'src\Tray.ps1'))
     $traySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    Register-ScheduledTask -TaskName $plan.TrayTask -Action $trayAction `
+    Register-ScheduledTask -TaskName $plan.TrayTask -TaskPath '\' -Action $trayAction `
         -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $currentUser) `
         -Principal (New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest) `
-        -Settings $traySettings -Description 'Tray controls for WireGuard Program Split.' -Force | Out-Null
+        -Settings $traySettings -Description 'Tray controls for WireGuard Program Split.' | Out-Null
 
     if ($DisableBrowserSecureDns) {
         & (Join-Path $DestinationRoot 'src\Invoke-BrowserDnsPolicy.ps1') -Action Enable | Out-Null

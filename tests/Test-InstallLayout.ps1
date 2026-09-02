@@ -39,7 +39,9 @@ Endpoint = 198.51.100.10:51820
 
     $plan = & (Join-Path $RepositoryRoot 'Install.ps1') -Profile $profile -Applications $application `
         -WireGuardRuntimeDirectory $runtime -PiaDriverDirectory $driver -BuildDirectory $build `
-        -DestinationRoot 'C:\ProgramData\WireGuardProgramSplit' -PlanOnly
+        -DestinationRoot 'C:\ProgramData\WireGuardProgramSplit\' -PlanOnly
+    Assert-True ($plan.DestinationRoot -eq 'C:\ProgramData\WireGuardProgramSplit') `
+        'installer normalizes the destination root before planning resource ownership'
     Assert-True ($plan.ServiceName -eq 'WireGuardTunnel$WireGuardSplit') 'installer plans the neutral tunnel service'
     Assert-True ($plan.ServiceStartType -eq 'Automatic') 'installer pre-starts WireGuard at boot'
     Assert-True ($plan.ControllerTask -eq 'WireGuard Program Split Controller') 'installer plans the controller task'
@@ -56,6 +58,11 @@ Endpoint = 198.51.100.10:51820
     Assert-True ($removal.ServiceName -eq 'WireGuardTunnel$WireGuardSplit') 'uninstaller scopes the tunnel service'
     Assert-True ($removal.ControllerTask -eq $plan.ControllerTask) 'installer and uninstaller own the same controller task'
     Assert-True ($removal.RemovePiaDriver -eq $false) 'uninstaller leaves the potentially shared PIA driver installed'
+
+    $missingRoot = Join-Path $temporary 'not-installed'
+    $notInstalled = & (Join-Path $RepositoryRoot 'Uninstall.ps1') -DestinationRoot $missingRoot
+    Assert-True ($notInstalled -eq 'WireGuard Program Split is not installed; nothing was changed.') `
+        'uninstaller is a no-op when the owned installation root is absent'
 } finally {
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }
