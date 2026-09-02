@@ -125,6 +125,26 @@ function Test-TunnelDns([int] $TimeoutMilliseconds = 5000) {
     Write-ControllerLog 'Tunnel DNS health probe passed.'
 }
 
+function Test-LocalDns {
+    $probe = Join-Path $root 'bin\dns-probe.exe'
+    $stdout = Join-Path $logs 'dns-dispatcher-health.log'
+    $stderr = Join-Path $logs 'dns-dispatcher-health-error.log'
+    $process = Start-Process -FilePath $probe -ArgumentList @('--system', 'example.com') `
+        -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
+    $null = $process.Handle
+    if (-not $process.WaitForExit(8000)) {
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        throw 'Local split-DNS health probe timed out.'
+    }
+    $process.WaitForExit()
+    $output = @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue)
+    $errors = @(Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue)
+    if ($process.ExitCode -ne 0 -or -not ($output -match '^PASS:')) {
+        throw "Local split-DNS health probe failed: $($output + $errors -join ' ')"
+    }
+    Write-ControllerLog 'Local split-DNS health probe passed.'
+}
+
 function Test-StackHealth {
     Invoke-Component 'Invoke-LocalNrpt.ps1' 'Validate'
     Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Validate'
@@ -145,6 +165,8 @@ function Invoke-Repair {
 
 function Start-Stack {
     $script:configuration = Get-ProgramSplitConfiguration -Root $root
+    $dispatcherWasRunning = [bool](Get-ManagedProcess 'dns-dispatcher.pid' 'dns-dispatcher' `
+        (Join-Path $root 'bin\dns-dispatcher.exe'))
     Remove-Item -LiteralPath $stackStoppedFile -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $activeFile -Force -ErrorAction SilentlyContinue
     try {
@@ -166,7 +188,9 @@ function Start-Stack {
         Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Start'
         Write-ControllerLog 'Enabling local split-DNS NRPT rule.'
         Invoke-Component 'Invoke-LocalNrpt.ps1' 'Enable'
-        Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Validate'
+        if ($dispatcherWasRunning) {
+            Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Validate'
+        } else { Test-LocalDns }
         Write-ControllerLog 'Starting per-application WFP filters.'
         Invoke-Component 'Invoke-WfpFilters.ps1' 'Start'
         $activeAt = Get-Date

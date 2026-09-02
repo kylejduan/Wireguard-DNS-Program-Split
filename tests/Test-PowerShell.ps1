@@ -38,6 +38,11 @@ $tunnelProbeSource = $controllerSource.Substring(
     $controllerSource.IndexOf('function Invoke-Repair') - $controllerSource.IndexOf('function Test-TunnelDns'))
 Assert-True ($tunnelProbeSource -match '(?s)\.Handle.*?WaitForExit\(\$TimeoutMilliseconds \+ 3000\).*?WaitForExit\(\)') `
     'tunnel DNS probe drains redirected output before evaluating it'
+$startStackSource = $controllerSource.Substring(
+    $controllerSource.IndexOf('function Start-Stack'),
+    $controllerSource.IndexOf('$required = @(') - $controllerSource.IndexOf('function Start-Stack'))
+Assert-True ($startStackSource -match '(?s)if \(\$dispatcherWasRunning\).*?Invoke-Component ''Invoke-DnsDispatcher\.ps1'' ''Validate''.*?else \{ Test-LocalDns \}') `
+    'fresh startup uses the native DNS gate while an adopted dispatcher receives full validation'
 Assert-True ($controllerSource -match '(?s)\$wfpStopped\s*=.*?if \(\$wfpStopped\).*?Invoke-LocalNrpt') `
     'controller does not restore direct DNS after a WFP-stop failure'
 Assert-True ($controllerSource -match 'Test-Path -LiteralPath \$activeFile -PathType Leaf') `
