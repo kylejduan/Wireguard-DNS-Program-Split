@@ -1,0 +1,52 @@
+# Troubleshooting
+
+## Start with state and logs
+
+The tray's **Open logs** command opens `C:\ProgramData\WireGuardProgramSplit\logs`. `controller.log` shows component order; `last-error.txt` records the latest activation failure.
+
+Useful checks from elevated PowerShell:
+
+```powershell
+Get-Service 'WireGuardTunnel$WireGuardSplit', 'PiaWFPCallout'
+Get-ScheduledTask 'WireGuard Program Split Controller', 'WireGuard Program Split Tray'
+Get-DnsClientNrptPolicy -Effective
+Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0'
+```
+
+## Browser says the proxy refused connections
+
+This project does not configure an HTTP proxy. Clear any manual proxy setting left by an earlier tool, then restart the browser:
+
+```powershell
+netsh winhttp show proxy
+```
+
+Firefox also has its own proxy control under Settings → Network Settings; use **No proxy** or **Use system proxy settings** unless you intentionally operate another proxy.
+
+## Selected application has the normal public IP
+
+- Confirm its exact executable path appears in the tray list.
+- Add helper or child executables separately.
+- Fully terminate and relaunch the application; existing sockets are not migrated.
+- Check `wfp-filters.log` for its path and `controller.log` for a healthy stack.
+- Confirm no other VPN is connected and no foreign catch-all NRPT policy exists.
+
+## DNS fails
+
+- Disable application-owned Secure DNS/DoH during testing.
+- Confirm the profile had exactly one reachable IPv4 DNS address.
+- Inspect `dns-dispatcher.log` for `TUNNEL`, `DIRECT`, `BLOCKED`, or `FAILED`.
+- `BLOCKED (no process hint)` means the dispatcher deliberately returned `SERVFAIL` because it could not safely attribute the query.
+- Ensure no other service owns `127.0.0.1:53`.
+
+## Direct traffic is slower
+
+Unlisted payload should not traverse the tunnel. Confirm the physical default route wins and the tunnel route remains metric `9999`. Compare the same server, browser, protocol, and time window; multi-gigabit browser tests are sensitive to CPU, server capacity, extensions, and HTTP implementation.
+
+## Tunnel does not start after an update
+
+Runtime DLLs are a matched dependency pair. Restore the pair that previously worked or obtain a compatible current pair, reinstall, and rerun the acceptance checks. Never replace only one DLL.
+
+## Startup is slow
+
+The tunnel service should report `Automatic`. Compare the boot timestamp to the first `Stack active after tunnel readiness check` line. The controller has no fixed 20-second post-success delay; remaining time is task launch, adapter creation, endpoint handshake, and the first successful DNS probe.

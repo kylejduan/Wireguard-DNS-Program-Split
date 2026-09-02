@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Build and run native checks
+        shell: msys2 {0}
+        run: |
+          CXX=g++ ./scripts/build-wsl.sh
+          ./build/dns-dispatcher.exe --self-test
+          ./build/dns-probe.exe --self-test
+          ./build/wfp-probe.exe --self-test
+      - name: Run PowerShell checks
+        shell: powershell
+        run: |
+          ./tests/Test-PowerShell.ps1 -RepositoryRoot $PWD
+          ./tests/Test-InstallLayout.ps1 -RepositoryRoot $PWD
+      - name: Check public tree
+        shell: msys2 {0}
+        run: ./tests/check-public-tree.sh
