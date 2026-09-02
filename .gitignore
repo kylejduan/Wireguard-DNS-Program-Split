@@ -1,0 +1,13 @@
+/build/
+/local/
+*.conf
+*.dll
+*.exe
+*.sys
+*.cat
+*.log
+*.pid
+*.dpapi
+/config/settings.json
+/profiles/
+/state/
