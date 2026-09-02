@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cwctype>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -27,6 +28,9 @@ constexpr GUID kDnsClientProvider{0x1c95126e, 0x7eea, 0x49a9, {0xa3, 0xfe, 0xa3,
 constexpr wchar_t kTraceName[] = L"WireGuardProgramSplitDnsEtw";
 constexpr USHORT kQueryEvent = 3006;
 constexpr unsigned kMaxWorkers = 256;
+constexpr ULONG kProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD |
+                                    PROCESS_TRACE_MODE_RAW_TIMESTAMP;
+static_assert(kProcessTraceMode & PROCESS_TRACE_MODE_RAW_TIMESTAMP);
 std::atomic_bool gRunning{true};
 std::atomic<HANDLE> gTraceFlushRequested{nullptr};
 std::atomic_uint gActiveWorkers{};
@@ -163,14 +167,29 @@ std::unordered_set<std::wstring> loadIncludedPaths(const std::wstring& path) {
     return result;
 }
 
-void logLine(const std::wstring& line) {
+void logLine(const std::wstring& line, bool flush = false) {
     std::lock_guard lock(gLogMutex);
     static unsigned pending{};
     std::wcout << line << L'\n';
-    if (++pending == 64) {
+    if (flush || ++pending == 64) {
         std::wcout.flush();
         pending = 0;
     }
+}
+
+long long qpcNow() {
+    LARGE_INTEGER value{};
+    return QueryPerformanceCounter(&value) ? value.QuadPart : 0;
+}
+
+long long qpcElapsedMilliseconds(long long now, long long then, long long frequency) {
+    if (frequency <= 0 || now <= 0 || then <= 0 || now < then) return -1;
+    const long double milliseconds =
+        (static_cast<long double>(now) - static_cast<long double>(then)) * 1000 / frequency;
+    if (milliseconds > std::numeric_limits<long long>::max()) {
+        return std::numeric_limits<long long>::max();
+    }
+    return static_cast<long long>(milliseconds);
 }
 
 std::vector<BYTE> eventProperty(EVENT_RECORD* event, const wchar_t* name) {
@@ -188,8 +207,8 @@ class Hints {
 public:
     explicit Hints(std::unordered_set<std::wstring> included) : included_(std::move(included)) {}
 
-    void add(const std::wstring& name, uint16_t type, DWORD pid, long long deliveryMilliseconds,
-             USHORT eventId) {
+    void add(const std::wstring& name, uint16_t type, DWORD pid, long long eventQpc,
+             long long deliveryMilliseconds, USHORT eventId) {
         const std::wstring path = lower(processPath(pid));
         const bool selected = !path.empty() && included_.count(path);
         addResolved(name, type, path);
@@ -197,7 +216,7 @@ public:
                 L" pid=" + std::to_wstring(pid) + L" selected=" +
                 std::to_wstring(selected ? 1 : 0) + L" delivery=" +
                 std::to_wstring(deliveryMilliseconds) + L"ms event=" + std::to_wstring(eventId) +
-                L" path=" + path);
+                L" event-qpc=" + std::to_wstring(eventQpc) + L" path=" + path);
     }
 
     void addResolved(const std::wstring& name, uint16_t type, const std::wstring& path) {
@@ -284,6 +303,9 @@ private:
 class DnsTrace {
 public:
     explicit DnsTrace(Hints& hints) : hints_(hints) {
+        if (!QueryPerformanceFrequency(&frequency_) || frequency_.QuadPart <= 0) {
+            throw std::runtime_error("QueryPerformanceFrequency failed");
+        }
         const size_t bytes = sizeof(EVENT_TRACE_PROPERTIES) + sizeof(kTraceName);
         properties_.resize(bytes);
         auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(properties_.data());
@@ -307,7 +329,8 @@ public:
                              TRACE_LEVEL_INFORMATION, 0, 0, 0, nullptr), "EnableTraceEx2");
 
         log_.LoggerName = const_cast<wchar_t*>(kTraceName);
-        log_.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        // ClientContext=1 selects QPC; RAW_TIMESTAMP prevents ProcessTrace from converting it to FILETIME.
+        log_.ProcessTraceMode = kProcessTraceMode;
         log_.EventRecordCallback = onEvent;
         log_.Context = this;
         trace_ = OpenTraceW(&log_);
@@ -325,6 +348,8 @@ public:
             }
         });
     }
+
+    long long frequency() const { return frequency_.QuadPart; }
 
     ~DnsTrace() {
         stopping_ = true;
@@ -350,16 +375,11 @@ private:
         const std::wstring name(reinterpret_cast<const wchar_t*>(nameData.data()));
         uint16_t type{};
         memcpy(&type, typeData.data(), std::min(typeData.size(), sizeof(type)));
-        LARGE_INTEGER now{}, frequency{};
-        QueryPerformanceCounter(&now);
-        QueryPerformanceFrequency(&frequency);
-        const long long deliveryMilliseconds = frequency.QuadPart > 0
-                                                   ? std::max<long long>(
-                                                         0, (now.QuadPart - event->EventHeader.TimeStamp.QuadPart) *
-                                                                1000 / frequency.QuadPart)
-                                                   : -1;
-        self->hints_.add(name, type, event->EventHeader.ProcessId, deliveryMilliseconds,
-                         event->EventHeader.EventDescriptor.Id);
+        const long long eventQpc = event->EventHeader.TimeStamp.QuadPart;
+        const long long deliveryMilliseconds =
+            qpcElapsedMilliseconds(qpcNow(), eventQpc, self->frequency_.QuadPart);
+        self->hints_.add(name, type, event->EventHeader.ProcessId, eventQpc,
+                         deliveryMilliseconds, event->EventHeader.EventDescriptor.Id);
     }
 
     Hints& hints_;
@@ -371,6 +391,7 @@ private:
     HANDLE flushRequested_{};
     std::thread consumer_;
     std::thread flusher_;
+    LARGE_INTEGER frequency_{};
 };
 
 struct Question {
@@ -531,22 +552,24 @@ std::optional<std::vector<char>> tcpExchange(const std::vector<char>& packet, so
 }
 
 std::optional<bool> selectRoute(Hints& hints, const Question& question, const wchar_t* transport,
-                                long long& waitMilliseconds) {
+                                long long queryQpc, long long& waitMilliseconds) {
     const auto started = std::chrono::steady_clock::now();
     const auto route = hints.take(question.name, question.type);
     waitMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - started)
                            .count();
     if (!route) {
-        logLine(L"DNS " + question.name + L" -> BLOCKED (no process hint, " + transport +
-                L", wait=" + std::to_wstring(waitMilliseconds) + L"ms)");
+        logLine(L"DNS " + question.name + L" type=" + std::to_wstring(question.type) +
+                L" -> BLOCKED (no process hint, " + transport + L", wait=" +
+                std::to_wstring(waitMilliseconds) + L"ms, query-qpc=" +
+                std::to_wstring(queryQpc) + L")", true);
     }
     return route;
 }
 
 void handleUdpQuery(Hints& hints, std::vector<char> packet, sockaddr_in client, int clientSize,
                     sockaddr_in directSource, sockaddr_in directDns, sockaddr_in tunnelSource,
-                    sockaddr_in tunnelDns) {
+                    sockaddr_in tunnelDns, long long queryQpc) {
     const auto question = parseQuestion(packet);
     if (!question) {
         const auto failure = makeServfail(packet);
@@ -555,7 +578,7 @@ void handleUdpQuery(Hints& hints, std::vector<char> packet, sockaddr_in client, 
         return;
     }
     long long classifyMilliseconds{};
-    const auto tunnel = selectRoute(hints, *question, L"UDP", classifyMilliseconds);
+    const auto tunnel = selectRoute(hints, *question, L"UDP", queryQpc, classifyMilliseconds);
     std::optional<std::vector<char>> response;
     if (tunnel) {
         response = udpExchange(packet, *tunnel ? tunnelSource : directSource,
@@ -569,7 +592,8 @@ void handleUdpQuery(Hints& hints, std::vector<char> packet, sockaddr_in client, 
         hints.complete(question->name, question->type);
         logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
                 (*tunnel ? L"TUNNEL" : L"DIRECT") + (answered ? L"" : L" FAILED") +
-                L" classify=" + std::to_wstring(classifyMilliseconds) + L"ms");
+                L" classify=" + std::to_wstring(classifyMilliseconds) + L"ms query-qpc=" +
+                std::to_wstring(queryQpc), !answered);
     }
 }
 
@@ -585,10 +609,11 @@ void handleTcpClient(SOCKET client, Hints& hints, sockaddr_in directSource, sock
         if (size < 12) break;
         std::vector<char> packet(size);
         if (!receiveAll(client, packet.data(), size)) break;
+        const long long queryQpc = qpcNow();
         const auto question = parseQuestion(packet);
         std::optional<bool> tunnel;
         long long classifyMilliseconds{};
-        if (question) tunnel = selectRoute(hints, *question, L"TCP", classifyMilliseconds);
+        if (question) tunnel = selectRoute(hints, *question, L"TCP", queryQpc, classifyMilliseconds);
         std::optional<std::vector<char>> response;
         if (question && tunnel) {
             response = tcpExchange(packet, *tunnel ? tunnelSource : directSource,
@@ -609,7 +634,8 @@ void handleTcpClient(SOCKET client, Hints& hints, sockaddr_in directSource, sock
             hints.complete(question->name, question->type);
             logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
                     (*tunnel ? L"TUNNEL" : L"DIRECT") + L" (TCP)" + (answered ? L"" : L" FAILED") +
-                    L" classify=" + std::to_wstring(classifyMilliseconds) + L"ms");
+                    L" classify=" + std::to_wstring(classifyMilliseconds) + L"ms query-qpc=" +
+                    std::to_wstring(queryQpc), !answered);
         }
     }
     closesocket(client);
@@ -670,6 +696,10 @@ int selfTest() {
     if (acquireWorker()) return 13;
     for (unsigned i = 0; i < kMaxWorkers; ++i) gActiveWorkers.fetch_sub(1);
     if (gActiveWorkers.load()) return 14;
+    if (qpcElapsedMilliseconds(1500, 1000, 1000) != 500) return 15;
+    if (qpcElapsedMilliseconds(999, 1000, 1000) != -1) return 16;
+    if (qpcElapsedMilliseconds(1500, 1000, 0) != -1) return 17;
+    if (qpcElapsedMilliseconds(0, 0, 1000) != -1) return 18;
     std::wcout << L"PASS: DNS question parser.\n";
     return 0;
 }
@@ -713,7 +743,7 @@ int wmain(int argc, wchar_t** argv) {
             throw std::runtime_error("Cannot bind local DNS port 53");
         }
         std::wcout << L"READY: ETW split-DNS dispatcher on 127.0.0.1:53 (UDP/TCP), apps="
-                   << includedCount << L"\n";
+                   << includedCount << L", qpc-frequency=" << trace.frequency() << L"\n";
         std::wcout.flush();
 
         std::thread tcpAcceptor([&] {
@@ -751,6 +781,7 @@ int wmain(int argc, wchar_t** argv) {
             const int received = recvfrom(gUdpListener, packet.data(), static_cast<int>(packet.size()), 0,
                                           reinterpret_cast<sockaddr*>(&client), &clientSize);
             if (received <= 0) continue;
+            const long long queryQpc = qpcNow();
             packet.resize(received);
             if (!acquireWorker()) {
                 const auto failure = makeServfail(packet);
@@ -759,11 +790,11 @@ int wmain(int argc, wchar_t** argv) {
                 continue;
             }
             try {
-                std::thread([&, packet = std::move(packet), client, clientSize]() mutable {
+                std::thread([&, packet = std::move(packet), client, clientSize, queryQpc]() mutable {
                     WorkerLease lease;
                     try {
                         handleUdpQuery(hints, std::move(packet), client, clientSize, directSource,
-                                       directDns, tunnelSource, tunnelDns);
+                                       directDns, tunnelSource, tunnelDns, queryQpc);
                     } catch (...) {
                     }
                 }).detach();

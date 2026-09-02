@@ -11,6 +11,7 @@ $logs = Join-Path $root 'logs'
 $includeFile = Join-Path $state 'included-apps.txt'
 $enabledFile = Join-Path $state 'enabled'
 $activeFile = Join-Path $state 'active'
+$stackStoppedFile = Join-Path $state 'stack-stopped'
 $reloadFile = Join-Path $state 'reload.request'
 $errorFile = Join-Path $state 'last-error.txt'
 $activeProfile = $configuration.ProfilePath
@@ -136,41 +137,79 @@ $importItem.add_Click({
     $dialog = [Windows.Forms.OpenFileDialog]::new()
     $dialog.Filter = 'WireGuard profiles (*.conf)|*.conf'
     $dialog.CheckFileExists = $true
+    $wasEnabled = $false
+    $disableRequested = $false
+    $stopConfirmed = $false
+    $replacementAttempted = $false
     try {
         if ($dialog.ShowDialog() -ne 'OK') { return }
         $wasEnabled = Test-Path -LiteralPath $enabledFile
+        if ((Test-Path -LiteralPath "$activeProfile.previous") -or
+            (Test-Path -LiteralPath "$activeSettings.previous")) {
+            throw 'A preserved recovery backup exists; resolve it before importing another profile.'
+        }
+        Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile
         Remove-Item -LiteralPath $enabledFile -Force -ErrorAction SilentlyContinue
+        $disableRequested = $true
         $deadline = (Get-Date).AddSeconds(20)
-        while ((Test-Path -LiteralPath $activeFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
-        if (Test-Path -LiteralPath $activeFile) { throw 'The controller did not stop the active profile.' }
+        while (-not (Test-Path -LiteralPath $stackStoppedFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+        if (-not (Test-Path -LiteralPath $stackStoppedFile)) { throw 'The controller did not stop the managed stack.' }
+        $stopConfirmed = $true
 
-        $profileBackup = "$activeProfile.previous"
-        $settingsBackup = "$activeSettings.previous"
-        Copy-Item -LiteralPath $activeProfile -Destination $profileBackup -Force
-        Copy-Item -LiteralPath $activeSettings -Destination $settingsBackup -Force
         $prepared = "$activeProfile.new"
         $preparedSettings = "$activeSettings.new"
         $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Prepare-Profile.ps1') `
             -InputPath $dialog.FileName -OutputPath $prepared -SettingsPath $preparedSettings -SkipAcl 2>&1
         if ($LASTEXITCODE -ne 0) { throw "Profile preparation failed: $($output -join ' ')" }
-        Move-Item -LiteralPath $prepared -Destination $activeProfile -Force
-        Move-Item -LiteralPath $preparedSettings -Destination $activeSettings -Force
+        $replacementAttempted = $true
+        Install-ProgramSplitProfilePair -ActiveProfile $activeProfile -ActiveSettings $activeSettings `
+            -PreparedProfile $prepared -PreparedSettings $preparedSettings | Out-Null
 
         if ($wasEnabled) {
+            Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile
             [IO.File]::WriteAllText($enabledFile, (Get-Date -Format o))
             $deadline = (Get-Date).AddSeconds(50)
             while (-not (Test-Path -LiteralPath $activeFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
             if (-not (Test-Path -LiteralPath $activeFile)) {
-                Remove-Item -LiteralPath $enabledFile -Force -ErrorAction SilentlyContinue
-                Move-Item -LiteralPath $profileBackup -Destination $activeProfile -Force
-                Move-Item -LiteralPath $settingsBackup -Destination $activeSettings -Force
-                [IO.File]::WriteAllText($enabledFile, (Get-Date -Format o))
-                throw 'The imported profile failed its tunnel-DNS readiness check; the previous profile was restored.'
+                throw 'The imported profile failed its tunnel-DNS readiness check.'
             }
         }
-        Remove-Item -LiteralPath $profileBackup, $settingsBackup -Force -ErrorAction SilentlyContinue
+        try {
+            Remove-Item -LiteralPath "$activeProfile.previous", "$activeSettings.previous" -Force -ErrorAction Stop
+        } catch {
+            Show-Notice 'Profile imported with warning' `
+                "The new profile is active, but recovery-backup cleanup failed: $($_.Exception.Message)" 'Warning'
+            return
+        }
         Show-Notice 'Profile imported' 'The WireGuard profile passed validation.'
-    } catch { Show-Notice 'Profile import failed' $_.Exception.Message 'Error' }
+    } catch {
+        $failure = $_.Exception.Message
+        if ($disableRequested) {
+            Remove-Item -LiteralPath $enabledFile -Force -ErrorAction SilentlyContinue
+        }
+        $rollbackErrors = [Collections.Generic.List[string]]::new()
+        if ($replacementAttempted) {
+            try { Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile }
+            catch { $rollbackErrors.Add($_.Exception.Message) }
+            if (-not $rollbackErrors.Count) {
+                try {
+                    Restore-ProgramSplitProfilePair -ActiveProfile $activeProfile -ActiveSettings $activeSettings `
+                        -StoppedMarker $stackStoppedFile
+                } catch { $rollbackErrors.Add($_.Exception.Message) }
+            }
+        }
+        Remove-Item -LiteralPath "$activeProfile.new", "$activeSettings.new" -Force -ErrorAction SilentlyContinue
+        if ($wasEnabled -and $disableRequested -and $stopConfirmed -and -not $rollbackErrors.Count) {
+            try {
+                Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile
+                [IO.File]::WriteAllText($enabledFile, (Get-Date -Format o))
+            } catch { $rollbackErrors.Add($_.Exception.Message) }
+        }
+        if ($rollbackErrors.Count) {
+            $failure += " Rollback also failed; the tunnel remains disabled: $($rollbackErrors -join '; ')"
+        }
+        Show-Notice 'Profile import failed' $failure 'Error'
+    }
     finally { $dialog.Dispose(); Update-Ui }
 })
 

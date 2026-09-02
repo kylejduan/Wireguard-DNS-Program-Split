@@ -36,7 +36,7 @@ This retains a native service where Windows already provides one and avoids a cu
 ## Acceptance
 
 - Native binaries compile warning-free and their self-tests pass.
-- PowerShell parses cleanly and profile import rejects missing DNS, missing IPv4 fields, IPv6, and malformed profiles.
+- PowerShell parses cleanly and profile import rejects missing required fields, non-IPv4 address/DNS values, and IPv6 profiles.
 - Repository secret and identity scans are clean before every push.
 - A selected browser reports the WireGuard exit and tunnel DNS; an unselected browser reports the physical ISP exit and router-provided DNS.
 - Unselected multi-gigabit traffic remains on the physical path without a universal TUN penalty.

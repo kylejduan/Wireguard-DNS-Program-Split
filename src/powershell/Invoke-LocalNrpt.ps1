@@ -21,7 +21,9 @@ function Assert-Administrator {
 }
 
 function Get-OwnedRule {
-    Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq $displayName }
+    Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {
+        Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $displayName
+    }
 }
 
 if ($Action -eq 'Status') {
@@ -40,8 +42,16 @@ if ($Action -eq 'Disable') {
     exit 0
 }
 
-$foreignCatchAll = Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-    Where-Object { $_.DisplayName -ne $displayName -and $_.Namespace -contains '.' }
+$allRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue)
+$sameNameCollision = $allRules | Where-Object {
+    $_.DisplayName -eq $displayName -and
+    -not (Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $displayName)
+}
+if ($sameNameCollision) { throw 'A foreign NRPT rule uses the WireGuard Program Split display name.' }
+$foreignCatchAll = $allRules | Where-Object {
+    $_.Namespace -contains '.' -and
+    -not (Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $displayName)
+}
 if ($foreignCatchAll) { throw 'Another catch-all NRPT rule is active.' }
 if (-not (Get-OwnedRule)) {
     Add-DnsClientNrptRule -Namespace '.' -NameServers '127.0.0.1' -DisplayName $displayName -Comment $comment | Out-Null

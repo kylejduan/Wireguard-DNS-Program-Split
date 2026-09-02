@@ -77,6 +77,11 @@ if ($Action -eq 'Status') {
 Assert-Administrator
 
 if ($Action -eq 'Stop') {
+    $serviceRecord = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
+    if ($serviceRecord -and -not (Test-ProgramSplitServiceOwnership -Service $serviceRecord `
+            -HostPath $hostExe -ProfilePath $config)) {
+        throw 'Refusing to stop a same-name foreign tunnel service.'
+    }
     $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
     if ($service -and $service.Status -ne 'Stopped') {
         Stop-Service -Name $serviceName -Force
@@ -132,7 +137,7 @@ if (-not $service) {
     if ($LASTEXITCODE -ne 0) { throw "Failed to create the tunnel service: $($createOutput -join ' ')" }
     & sc.exe sidtype $serviceName unrestricted | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to configure the tunnel service SID.' }
-} elseif ($service.PathName -ne $expectedCommand) {
+} elseif (-not (Test-ProgramSplitServiceOwnership -Service $service -HostPath $hostExe -ProfilePath $config)) {
     throw 'An unexpected service already uses the WireGuard Program Split tunnel name.'
 }
 

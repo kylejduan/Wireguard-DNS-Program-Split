@@ -37,6 +37,7 @@ Firefox also has its own proxy control under Settings → Network Settings; use 
 - Confirm the profile had exactly one reachable IPv4 DNS address.
 - Inspect `dns-dispatcher.log` for `TUNNEL`, `DIRECT`, `BLOCKED`, or `FAILED`.
 - `BLOCKED (no process hint)` means the dispatcher deliberately returned `SERVFAIL` because it could not safely attribute the query.
+- `type`, `event-qpc`, `query-qpc`, and `qpc-frequency` fields support ordering diagnostics; do not treat them as a unique transaction ID.
 - Ensure no other service owns `127.0.0.1:53`.
 
 ## Direct traffic is slower
