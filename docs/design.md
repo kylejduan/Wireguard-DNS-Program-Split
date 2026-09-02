@@ -14,7 +14,7 @@ On Windows 11, route all IPv4 TCP and UDP sockets created by an explicit list of
 
 ## Fast startup
 
-The WireGuard tunnel service starts automatically through the Windows Service Control Manager. The controller adopts a healthy early-started tunnel instead of tearing it down, performs one successful tunnel-DNS readiness probe, then enables the dispatcher, NRPT rule, and dynamic WFP filters. Ongoing 30-second health checks replace the old fixed 20-second second-probe soak.
+The WireGuard tunnel service starts automatically through the Windows Service Control Manager. The controller adopts a healthy early-started tunnel, polls a short tunnel-DNS probe until its first success instead of imposing a fixed delay, then enables and validates the dispatcher and NRPT path before dynamic WFP filters. Ongoing 30-second checks retry transient failures and verify the real Windows DNS Client, ETW attribution, loopback dispatcher, physical resolver snapshot, NRPT ownership, and tunnel DNS.
 
 This retains a native service where Windows already provides one and avoids a custom controller-service wrapper. A wrapper is warranted only if measured Task Scheduler latency remains material after the tunnel is pre-started.
 

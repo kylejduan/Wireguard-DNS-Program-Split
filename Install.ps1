@@ -91,6 +91,7 @@ try {
     }
     if ($PlanOnly) { return $plan }
 
+    Assert-ProgramSplit64BitPowerShell
     Assert-Administrator
     if (Test-Path -LiteralPath $DestinationRoot) {
         throw "An installation already exists at $DestinationRoot. Run Uninstall.ps1 before reinstalling."

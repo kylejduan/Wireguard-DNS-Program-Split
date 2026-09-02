@@ -10,7 +10,7 @@ mkdir -p "$output"
 "$compiler" "${common[@]}" -municode "$repo_root/src/native/dns-dispatcher.cpp" \
   -o "$output/dns-dispatcher.exe" -lws2_32 -ltdh
 "$compiler" "${common[@]}" "$repo_root/src/native/dns-probe.cpp" \
-  -o "$output/dns-probe.exe" -lws2_32
+  -o "$output/dns-probe.exe" -lws2_32 -ldnsapi
 "$compiler" "${common[@]}" -municode "$repo_root/src/native/tunnel-host.cpp" \
   -o "$output/tunnel-host.exe"
 "$compiler" "${common[@]}" -municode "$repo_root/src/native/wfp-probe.cpp" \

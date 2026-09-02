@@ -9,6 +9,7 @@ Set-StrictMode -Version Latest
 
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Common.ps1')
+Assert-ProgramSplit64BitPowerShell
 $configuration = Get-ProgramSplitConfiguration -Root $root
 if (-not $IncludedAppsFile) { $IncludedAppsFile = Join-Path $root 'state\included-apps.txt' }
 $exe = Join-Path $root 'bin\wfp-probe.exe'
@@ -29,9 +30,23 @@ function Get-ManagedProcess {
     $managedPid = 0
     if (-not [int]::TryParse([IO.File]::ReadAllText($pidFile), [ref]$managedPid)) { return $null }
     $process = Get-Process -Id $managedPid -ErrorAction SilentlyContinue
-    if (-not $process) { return $null }
-    if ($process.ProcessName -ne 'wfp-probe') { return $null }
-    return $process
+    if ($process -and $process.ProcessName -eq 'wfp-probe' -and [string]$process.Path -eq $exe) {
+        return $process
+    }
+    return $null
+}
+
+function Get-ExpectedProcesses {
+    @(Get-Process -Name 'wfp-probe' -ErrorAction SilentlyContinue | Where-Object {
+        [string]$_.Path -eq $exe
+    })
+}
+
+function Stop-ExpectedProcesses {
+    foreach ($process in @(Get-ExpectedProcesses)) {
+        Stop-Process -Id $process.Id -Force
+        $process.WaitForExit()
+    }
 }
 
 if ($Action -eq 'Status') {
@@ -44,11 +59,7 @@ if ($Action -eq 'Status') {
 Assert-Administrator
 
 if ($Action -eq 'Stop') {
-    $process = Get-ManagedProcess
-    if ($process) {
-        Stop-Process -Id $process.Id -Force
-        $process.WaitForExit()
-    }
+    Stop-ExpectedProcesses
     if (Test-Path -LiteralPath $pidFile) { [IO.File]::Delete($pidFile) }
     Write-Output 'Dynamic WFP filters stopped and removed.'
     exit 0
@@ -70,18 +81,30 @@ if (-not (Get-NetIPAddress -InterfaceAlias $configuration.AdapterName -AddressFa
 }
 $existing = Get-ManagedProcess
 if ($existing) { Write-Output 'Dynamic WFP filters are already running.'; exit 0 }
+Stop-ExpectedProcesses
 
 [IO.Directory]::CreateDirectory((Split-Path -Parent $stdout)) | Out-Null
-$process = Start-Process -FilePath $exe -ArgumentList @($IncludedAppsFile, $configuration.TunnelAddress) -RedirectStandardOutput $stdout `
-    -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
-[IO.File]::WriteAllText($pidFile, [string]$process.Id)
-$deadline = [DateTime]::UtcNow.AddSeconds(10)
-do {
-    if ($process.HasExited) { throw "WFP filter host exited: $([IO.File]::ReadAllText($stderr))" }
-    if ((Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue) -match '^READY:') {
-        Write-Output "Dynamic WFP payload filters ready for $($includedPaths.Count) included application(s)."
-        exit 0
+$process = $null
+$started = $false
+try {
+    $process = Start-Process -FilePath $exe -ArgumentList @(
+        $IncludedAppsFile, $configuration.TunnelAddress
+    ) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
+    [IO.File]::WriteAllText($pidFile, [string]$process.Id)
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        if ($process.HasExited) { throw "WFP filter host exited: $([IO.File]::ReadAllText($stderr))" }
+        if ((Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue) -match '^READY:') {
+            $started = $true
+            Write-Output "Dynamic WFP payload filters ready for $($includedPaths.Count) included application(s)."
+            exit 0
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'WFP filter host did not become ready.'
+} finally {
+    if (-not $started) {
+        if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
     }
-    Start-Sleep -Milliseconds 100
-} while ([DateTime]::UtcNow -lt $deadline)
-throw 'WFP filter host did not become ready.'
+}

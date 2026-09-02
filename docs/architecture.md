@@ -16,9 +16,9 @@ unlisted executable ────────────────────
 
 - `tunnel-host.exe` exposes a compatible WireGuard tunnel DLL as a Windows service.
 - `wfp-probe.exe` installs dynamic WFP filters for the exact executable paths in `included-apps.txt`. It supplies the tunnel IPv4 address to the signed PIA WFP callout.
-- `dns-dispatcher.exe` listens on loopback port 53. It consumes Microsoft-Windows-DNS-Client ETW query events, resolves each event's process path, and binds the upstream query to either the physical or tunnel source address.
+- `dns-dispatcher.exe` listens on loopback port 53. It owns a unique per-launch Microsoft-Windows-DNS-Client ETW session, resolves each event's process path, and binds the upstream query to either the physical or tunnel source address.
 - A narrowly owned NRPT `.` rule sends ordinary Windows resolver queries to the dispatcher.
-- `Controller.ps1`, running as SYSTEM, owns startup, recovery, and 30-second tunnel-DNS health checks.
+- `Controller.ps1`, running as SYSTEM, owns startup, recovery, and 30-second tunnel plus end-to-end split-DNS health checks.
 - `Tray.ps1`, running as the interactive user, changes the desired state, executable list, and profile.
 
 ## Route invariant
@@ -37,4 +37,4 @@ Selected attribution takes precedence whenever it arrives before forwarding begi
 
 ## Startup
 
-The WireGuard tunnel service uses `Automatic` start so Service Control Manager can bring the adapter up early. The startup task then adopts that service, performs one successful tunnel-DNS gate, and enables the dispatcher, NRPT, and dynamic WFP filters. There is no fixed post-success soak. Every 30 seconds the controller also verifies that the physical interface, source address, and DNS resolver still match the dispatcher's startup snapshot; a change restarts the stack with fresh values.
+The WireGuard tunnel service uses `Automatic` start so Service Control Manager can bring the adapter up early. The startup task adopts that service and polls tunnel DNS until the first successful answer instead of sleeping for a fixed delay. It then enables and validates the dispatcher and NRPT path before starting dynamic WFP filters. Every 30 seconds the controller rechecks NRPT conflicts, executable and port ownership, ETW-backed loopback DNS, tunnel DNS, and the physical interface snapshot; repeated failure restarts the stack with fresh values.

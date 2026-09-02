@@ -25,7 +25,6 @@
 namespace {
 
 constexpr GUID kDnsClientProvider{0x1c95126e, 0x7eea, 0x49a9, {0xa3, 0xfe, 0xa3, 0x78, 0xb0, 0x3d, 0xdb, 0x4d}};
-constexpr wchar_t kTraceName[] = L"WireGuardProgramSplitDnsEtw";
 constexpr USHORT kQueryEvent = 3006;
 constexpr unsigned kMaxWorkers = 256;
 constexpr ULONG kProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD |
@@ -302,11 +301,14 @@ private:
 
 class DnsTrace {
 public:
-    explicit DnsTrace(Hints& hints) : hints_(hints) {
+    DnsTrace(Hints& hints, std::wstring traceName)
+        : hints_(hints), traceName_(std::move(traceName)) {
+        if (traceName_.empty()) throw std::runtime_error("ETW trace name is empty");
         if (!QueryPerformanceFrequency(&frequency_) || frequency_.QuadPart <= 0) {
             throw std::runtime_error("QueryPerformanceFrequency failed");
         }
-        const size_t bytes = sizeof(EVENT_TRACE_PROPERTIES) + sizeof(kTraceName);
+        const size_t traceNameBytes = (traceName_.size() + 1) * sizeof(wchar_t);
+        const size_t bytes = sizeof(EVENT_TRACE_PROPERTIES) + traceNameBytes;
         properties_.resize(bytes);
         auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(properties_.data());
         properties->Wnode.BufferSize = static_cast<ULONG>(bytes);
@@ -318,17 +320,13 @@ public:
         properties->FlushTimer = 1;
         properties->LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING;
         properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        memcpy(properties_.data() + properties->LoggerNameOffset, traceName_.c_str(), traceNameBytes);
 
-        DWORD status = StartTraceW(&session_, kTraceName, properties);
-        if (status == ERROR_ALREADY_EXISTS) {
-            ControlTraceW(0, kTraceName, properties, EVENT_TRACE_CONTROL_STOP);
-            status = StartTraceW(&session_, kTraceName, properties);
-        }
-        check(status, "StartTraceW");
+        check(StartTraceW(&session_, traceName_.c_str(), properties), "StartTraceW");
         check(EnableTraceEx2(session_, &kDnsClientProvider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                              TRACE_LEVEL_INFORMATION, 0, 0, 0, nullptr), "EnableTraceEx2");
 
-        log_.LoggerName = const_cast<wchar_t*>(kTraceName);
+        log_.LoggerName = traceName_.data();
         // ClientContext=1 selects QPC; RAW_TIMESTAMP prevents ProcessTrace from converting it to FILETIME.
         log_.ProcessTraceMode = kProcessTraceMode;
         log_.EventRecordCallback = onEvent;
@@ -344,7 +342,7 @@ public:
             while (!stopping_) {
                 WaitForSingleObject(flushRequested_, 10);
                 if (stopping_) break;
-                FlushTraceW(session_, kTraceName, current);
+                FlushTraceW(session_, traceName_.c_str(), current);
             }
         });
     }
@@ -358,7 +356,7 @@ public:
         if (flusher_.joinable()) flusher_.join();
         auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(properties_.data());
         EnableTraceEx2(session_, &kDnsClientProvider, EVENT_CONTROL_CODE_DISABLE_PROVIDER, 0, 0, 0, 0, nullptr);
-        ControlTraceW(session_, kTraceName, properties, EVENT_TRACE_CONTROL_STOP);
+        ControlTraceW(session_, traceName_.c_str(), properties, EVENT_TRACE_CONTROL_STOP);
         if (consumer_.joinable()) consumer_.join();
         if (trace_ != INVALID_PROCESSTRACE_HANDLE) CloseTrace(trace_);
         if (flushRequested_) CloseHandle(flushRequested_);
@@ -383,6 +381,7 @@ private:
     }
 
     Hints& hints_;
+    std::wstring traceName_;
     std::vector<BYTE> properties_;
     TRACEHANDLE session_{};
     TRACEHANDLE trace_{INVALID_PROCESSTRACE_HANDLE};
@@ -709,8 +708,8 @@ int selfTest() {
 int wmain(int argc, wchar_t** argv) {
     try {
         if (argc == 2 && std::wstring(argv[1]) == L"--self-test") return selfTest();
-        if (argc != 6) {
-            std::wcerr << L"Usage: dns-dispatcher.exe <included-apps.txt> <direct-source> <direct-dns> <tunnel-source> <tunnel-dns>\n";
+        if (argc != 7) {
+            std::wcerr << L"Usage: dns-dispatcher.exe <included-apps.txt> <direct-source> <direct-dns> <tunnel-source> <tunnel-dns> <etw-session>\n";
             return 2;
         }
         WSADATA winsock{};
@@ -720,7 +719,7 @@ int wmain(int argc, wchar_t** argv) {
         auto included = loadIncludedPaths(argv[1]);
         const size_t includedCount = included.size();
         Hints hints(std::move(included));
-        DnsTrace trace(hints);
+        DnsTrace trace(hints, argv[6]);
         const auto directSource = address(argv[2], 0);
         const auto directDns = address(argv[3], 53);
         const auto tunnelSource = address(argv[4], 0);

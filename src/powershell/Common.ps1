@@ -1,5 +1,26 @@
 Set-StrictMode -Version Latest
 
+function Assert-ProgramSplit64BitPowerShell {
+    if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitProcess) {
+        throw 'WireGuard Program Split requires 64-bit Windows PowerShell for process ownership checks.'
+    }
+}
+
+function Get-ProgramSplitOwnedTraceNames {
+    param(
+        [AllowNull()] [string] $StateValue,
+        [AllowEmptyCollection()] [string[]] $CommandLines = @()
+    )
+
+    $pattern = 'WireGuardProgramSplitDnsEtw-[0-9a-f]{32}'
+    $names = [Collections.Generic.List[string]]::new()
+    if ($StateValue -and $StateValue.Trim() -match "^$pattern$") { $names.Add($Matches[0]) }
+    foreach ($commandLine in $CommandLines) {
+        foreach ($match in [regex]::Matches([string]$commandLine, $pattern)) { $names.Add($match.Value) }
+    }
+    @($names | Sort-Object -Unique)
+}
+
 function Get-ProgramSplitTaskArguments {
     param([Parameter(Mandatory)] [string] $ScriptPath)
 
@@ -46,6 +67,56 @@ function Test-ProgramSplitNrptRuleOwnership {
         $namespaces.Count -eq 1 -and [string] $namespaces[0] -eq '.' -and
         $nameServers.Count -eq 1 -and [string] $nameServers[0] -eq '127.0.0.1' -and
         [string] $Rule.Comment -eq 'Owned by WireGuardProgramSplit; safe to remove on recovery.'
+}
+
+function Assert-ProgramSplitNrptRulesCompatible {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Rules,
+        [Parameter(Mandatory)] [string] $DisplayName,
+        [switch] $RequireOwned
+    )
+
+    $owned = @($Rules | Where-Object {
+        Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $DisplayName
+    })
+    if ($Rules | Where-Object { $_.DisplayName -eq $DisplayName -and $_ -notin $owned }) {
+        throw 'A foreign NRPT rule uses the WireGuard Program Split display name.'
+    }
+    if ($Rules | Where-Object { $_.Namespace -contains '.' -and $_ -notin $owned }) {
+        throw 'Another catch-all NRPT rule is active.'
+    }
+    if ($RequireOwned -and $owned.Count -ne 1) {
+        throw 'The owned local split-DNS NRPT rule is missing or duplicated.'
+    }
+}
+
+function Assert-ProgramSplitEffectiveNrptPolicy {
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Policies)
+
+    $catchAll = @($Policies | Where-Object { $_.Namespace -contains '.' })
+    if ($catchAll.Count -ne 1) { throw 'Effective NRPT must contain exactly one catch-all policy.' }
+    $servers = @($catchAll[0].NameServers | ForEach-Object {
+        if ($_ -is [Net.IPAddress]) { $_.IPAddressToString } else { [string]$_ }
+    })
+    if ($servers.Count -ne 1 -or $servers[0] -ne '127.0.0.1') {
+        throw 'Effective catch-all NRPT policy does not use the owned loopback dispatcher.'
+    }
+}
+
+function Wait-ProgramSplitProbe {
+    param(
+        [Parameter(Mandatory)] [scriptblock] $Probe,
+        [ValidateRange(0, 60000)] [int] $TimeoutMilliseconds = 8000,
+        [ValidateRange(0, 5000)] [int] $RetryMilliseconds = 250
+    )
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    while ($true) {
+        try { & $Probe; return }
+        catch { $lastError = $_ }
+        if ([DateTime]::UtcNow -ge $deadline) { throw $lastError }
+        if ($RetryMilliseconds) { Start-Sleep -Milliseconds $RetryMilliseconds }
+    }
 }
 
 function Assert-ProgramSplitInstallNamesAvailable {
