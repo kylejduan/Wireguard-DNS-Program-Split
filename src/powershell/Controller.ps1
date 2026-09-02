@@ -132,9 +132,23 @@ function Start-Stack {
         Invoke-Component 'Invoke-LocalNrpt.ps1' 'Enable'
         Write-ControllerLog 'Starting per-application WFP filters.'
         Invoke-Component 'Invoke-WfpFilters.ps1' 'Start'
-        [IO.File]::WriteAllText($activeFile, (Get-Date -Format o))
+        $activeAt = Get-Date
+        [IO.File]::WriteAllText($activeFile, $activeAt.ToString('o'))
         Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
         Write-ControllerLog 'Stack active after tunnel readiness check.'
+        try {
+            $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+            if (($activeAt - $boot).TotalMinutes -le 10) {
+                $audit = [ordered]@{
+                    Boot = $boot.ToString('o')
+                    Active = $activeAt.ToString('o')
+                    BootToActiveSeconds = [Math]::Round(($activeAt - $boot).TotalSeconds, 2)
+                }
+                [IO.File]::WriteAllText((Join-Path $state 'startup-audit.json'),
+                    ($audit | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+                Write-ControllerLog "Cold boot to active: $($audit.BootToActiveSeconds) seconds."
+            }
+        } catch { Write-ControllerLog "Startup timing audit failed: $($_.Exception.Message)" }
     } catch {
         $message = $_ | Out-String
         [IO.File]::WriteAllText($errorFile, $message)
