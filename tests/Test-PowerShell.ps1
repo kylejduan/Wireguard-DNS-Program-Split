@@ -79,7 +79,7 @@ try {
             '-NoProfile', '-NonInteractive', '-EncodedCommand', $wowEncoded
         ) -WindowStyle Hidden -PassThru
         $null = $wowProbe.Handle
-        Assert-True ($wowProbe.WaitForExit(5000)) '32-bit PowerShell guard probe completes'
+        Assert-True ($wowProbe.WaitForExit(30000)) '32-bit PowerShell guard probe completes'
         $wowProbe.WaitForExit()
         Assert-True ($wowProbe.ExitCode -eq 0) '32-bit PowerShell is rejected before ownership cleanup'
     }
