@@ -67,6 +67,33 @@ function Clear-ProgramSplitStoppedMarker {
     }
 }
 
+function Remove-ProgramSplitStagingDirectory {
+    param([Parameter(Mandatory)] [string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    try { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop }
+    catch { throw "Sensitive installer staging could not be removed: $Path. $($_.Exception.Message)" }
+    if (Test-Path -LiteralPath $Path) {
+        throw "Sensitive installer staging could not be removed: $Path."
+    }
+}
+
+function Close-ProgramSplitInstallScope {
+    param(
+        [AllowNull()] [string] $StagingPath,
+        [Parameter(Mandatory)] [Threading.Mutex] $Mutex,
+        [Parameter(Mandatory)] [bool] $MutexHeld
+    )
+
+    try {
+        if ($StagingPath) { Remove-ProgramSplitStagingDirectory -Path $StagingPath }
+    } finally {
+        try {
+            if ($MutexHeld) { $Mutex.ReleaseMutex() }
+        } finally { $Mutex.Dispose() }
+    }
+}
+
 function Install-ProgramSplitProfilePair {
     param(
         [Parameter(Mandatory)] [string] $ActiveProfile,
