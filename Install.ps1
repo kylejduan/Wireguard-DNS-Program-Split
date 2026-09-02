@@ -55,9 +55,23 @@ foreach ($path in @(
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing installation input: $path" }
 }
 
-$staging = Join-Path ([IO.Path]::GetTempPath()) ("WireGuardProgramSplit-install-{0}" -f [guid]::NewGuid())
-[IO.Directory]::CreateDirectory($staging) | Out-Null
+$installMutex = [Threading.Mutex]::new($false, 'Global\WireGuardProgramSplitInstall')
+$installMutexHeld = $false
+$staging = $null
 try {
+    try { $installMutexHeld = $installMutex.WaitOne(0) }
+    catch [Threading.AbandonedMutexException] { $installMutexHeld = $true }
+    if (-not $installMutexHeld) { throw 'Another WireGuard Program Split installation is already running.' }
+
+    $stagingNamePattern = '^WireGuardProgramSplit-install-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Filter 'WireGuardProgramSplit-install-*' `
+        -ErrorAction Stop | Where-Object {
+            $_.Name -match $stagingNamePattern -and
+            -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
+        } | ForEach-Object { Remove-ProgramSplitStagingDirectory -Path $_.FullName }
+
+    $staging = Join-Path ([IO.Path]::GetTempPath()) ("WireGuardProgramSplit-install-{0}" -f [guid]::NewGuid())
+    [IO.Directory]::CreateDirectory($staging) | Out-Null
     $stagedProfile = Join-Path $staging 'WireGuardSplit.conf'
     $stagedSettings = Join-Path $staging 'settings.json'
     & (Join-Path $PSScriptRoot 'src\powershell\Prepare-Profile.ps1') -InputPath $profilePath `
@@ -167,5 +181,5 @@ try {
     }
     throw $installError
 } finally {
-    Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+    Close-ProgramSplitInstallScope -StagingPath $staging -Mutex $installMutex -MutexHeld $installMutexHeld
 }

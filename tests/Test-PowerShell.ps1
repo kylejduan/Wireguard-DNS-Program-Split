@@ -44,6 +44,59 @@ try {
     $common = Join-Path $RepositoryRoot 'src\powershell\Common.ps1'
     . $common
 
+    $lockedStaging = Join-Path $temporary 'locked-install-staging'
+    [IO.Directory]::CreateDirectory($lockedStaging) | Out-Null
+    $lockedProfile = Join-Path $lockedStaging 'WireGuardSplit.conf'
+    [IO.File]::WriteAllText($lockedProfile, 'test profile')
+    $profileLock = [IO.File]::Open($lockedProfile, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        [IO.FileShare]::None)
+    $cleanupFailure = $null
+    try { Remove-ProgramSplitStagingDirectory -Path $lockedStaging }
+    catch { $cleanupFailure = $_.Exception.Message }
+    finally { $profileLock.Dispose() }
+    Assert-True ($cleanupFailure -like 'Sensitive installer staging could not be removed:*') `
+        'staging cleanup reports a plaintext-profile deletion failure'
+    Assert-True (Test-Path -LiteralPath $lockedStaging) `
+        'failed staging cleanup leaves the locked directory visible for recovery'
+    Remove-ProgramSplitStagingDirectory -Path $lockedStaging
+    Assert-True (-not (Test-Path -LiteralPath $lockedStaging)) `
+        'staging cleanup confirms deletion after the lock is released'
+
+    $scopeStaging = Join-Path $temporary 'locked-installer-scope'
+    [IO.Directory]::CreateDirectory($scopeStaging) | Out-Null
+    $scopeProfile = Join-Path $scopeStaging 'WireGuardSplit.conf'
+    [IO.File]::WriteAllText($scopeProfile, 'test profile')
+    $scopeLock = [IO.File]::Open($scopeProfile, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        [IO.FileShare]::None)
+    $scopeMutexName = "Global\WireGuardProgramSplitTest-$([guid]::NewGuid())"
+    $scopeMutex = [Threading.Mutex]::new($false, $scopeMutexName)
+    Assert-True ($scopeMutex.WaitOne(0)) 'installer-scope test acquires its named mutex'
+    $scopeFailure = $null
+    try { Close-ProgramSplitInstallScope -StagingPath $scopeStaging -Mutex $scopeMutex -MutexHeld $true }
+    catch { $scopeFailure = $_.Exception.Message }
+    finally { $scopeLock.Dispose() }
+    $probeCommand = @"
+`$mutex = [Threading.Mutex]::new(`$false, '$scopeMutexName')
+try {
+    if (-not `$mutex.WaitOne(0)) { exit 1 }
+    `$mutex.ReleaseMutex()
+    exit 0
+} finally { `$mutex.Dispose() }
+"@
+    $encodedProbe = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probeCommand))
+    $mutexProbe = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-NonInteractive',
+        '-EncodedCommand', $encodedProbe) -WindowStyle Hidden -PassThru
+    $null = $mutexProbe.Handle
+    Assert-True ($mutexProbe.WaitForExit(5000)) 'installer-scope mutex probe completes'
+    $mutexProbe.WaitForExit()
+    Assert-True ($scopeFailure -like 'Sensitive installer staging could not be removed:*') `
+        'installer scope propagates its staging-cleanup failure'
+    Assert-True ($mutexProbe.ExitCode -eq 0) `
+        'installer scope releases its machine-wide mutex even when staging cleanup fails'
+    try { $scopeMutex.ReleaseMutex() } catch { }
+    try { $scopeMutex.Dispose() } catch { }
+    Remove-ProgramSplitStagingDirectory -Path $scopeStaging
+
     $powerShell = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
     $controller = 'C:\ProgramData\WireGuardProgramSplit\src\Controller.ps1'
     $taskArguments = Get-ProgramSplitTaskArguments -ScriptPath $controller

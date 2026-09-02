@@ -7,6 +7,7 @@
 - Preserve recovery backups across failed or repeated profile-import attempts.
 - Reject duplicate WireGuard sections/required fields, invalid keys, and invalid endpoint ports.
 - Preserve raw ETW performance-counter timestamps and flush actionable DNS failure diagnostics.
+- Serialize installs and remove exact-owned profile staging left by interrupted runs.
 
 ## 0.1.0 - 2026-09-02
 

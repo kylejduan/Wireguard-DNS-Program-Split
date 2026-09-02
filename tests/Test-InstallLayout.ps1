@@ -8,6 +8,8 @@ function Assert-True([bool] $Condition, [string] $Message) {
 }
 
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("WireGuardProgramSplit-install-test-{0}" -f [guid]::NewGuid())
+$staleOwnedStaging = Join-Path ([IO.Path]::GetTempPath()) ("WireGuardProgramSplit-install-{0}" -f [guid]::NewGuid())
+$nearMatchStaging = Join-Path ([IO.Path]::GetTempPath()) ("WireGuardProgramSplit-install-not-owned-{0}" -f [guid]::NewGuid())
 [IO.Directory]::CreateDirectory($temporary) | Out-Null
 try {
     $profile = Join-Path $temporary 'provider.conf'
@@ -37,9 +39,17 @@ AllowedIPs = 0.0.0.0/0
 Endpoint = 198.51.100.10:51820
 "@)
 
+    [IO.Directory]::CreateDirectory($staleOwnedStaging) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $staleOwnedStaging 'WireGuardSplit.conf'), 'stale test profile')
+    [IO.Directory]::CreateDirectory($nearMatchStaging) | Out-Null
+
     $plan = & (Join-Path $RepositoryRoot 'Install.ps1') -Profile $profile -Applications $application `
         -WireGuardRuntimeDirectory $runtime -PiaDriverDirectory $driver -BuildDirectory $build `
         -DestinationRoot 'C:\ProgramData\WireGuardProgramSplit\' -PlanOnly
+    Assert-True (-not (Test-Path -LiteralPath $staleOwnedStaging)) `
+        'installer removes a stale exact-owned staging directory before processing a new profile'
+    Assert-True (Test-Path -LiteralPath $nearMatchStaging -PathType Container) `
+        'installer preserves a similarly prefixed directory outside its exact GUID namespace'
     Assert-True ($plan.DestinationRoot -eq 'C:\ProgramData\WireGuardProgramSplit') `
         'installer normalizes the destination root before planning resource ownership'
     Assert-True ($plan.ServiceName -eq 'WireGuardTunnel$WireGuardSplit') 'installer plans the neutral tunnel service'
@@ -65,6 +75,7 @@ Endpoint = 198.51.100.10:51820
         'uninstaller is a no-op when the owned installation root is absent'
 } finally {
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $staleOwnedStaging, $nearMatchStaging -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Output 'PASS: installer produces a provider-neutral, automatic-service deployment plan.'
