@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cwchar>
 #include <cwctype>
 #include <iostream>
 #include <stdexcept>
@@ -267,7 +268,7 @@ private:
 
 int wmain(int argc, wchar_t** argv) {
     try {
-        if (argc == 2 && std::wstring(argv[1]) == L"--self-test") {
+        if (argc == 2 && std::wcscmp(argv[1], L"--self-test") == 0) {
             if (parseIpv4(L"192.0.2.2") != 0xc0000202) return 2;
             const auto included = parseIncludedText(L"C:\\Apps\\One.exe\r\n# comment\nC:\\Apps\\Two.exe\n");
             if (included.size() != 2 || !included.count(L"c:\\apps\\one.exe") ||
