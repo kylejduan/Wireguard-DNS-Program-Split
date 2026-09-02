@@ -16,7 +16,7 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: mingw-w64-ucrt-x86_64-gcc
+          install: git mingw-w64-ucrt-x86_64-gcc
       - name: Build and run native checks
         shell: msys2 {0}
         run: |
