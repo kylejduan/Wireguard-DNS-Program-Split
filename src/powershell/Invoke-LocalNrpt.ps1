@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Enable', 'Disable', 'Status')]
+    [ValidateSet('Enable', 'Disable', 'Status', 'Validate')]
     [string] $Action = 'Status'
 )
 
@@ -8,6 +8,7 @@ Set-StrictMode -Version Latest
 
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Common.ps1')
+Assert-ProgramSplit64BitPowerShell
 $configuration = Get-ProgramSplitConfiguration -Root $root
 $displayName = $configuration.NrptDisplayName
 $comment = 'Owned by WireGuardProgramSplit; safe to remove on recovery.'
@@ -36,6 +37,12 @@ if ($Action -eq 'Status') {
 Assert-Administrator
 
 if ($Action -eq 'Disable') {
+    $wfpExe = Join-Path $root 'bin\wfp-probe.exe'
+    if (Get-Process -Name 'wfp-probe' -ErrorAction SilentlyContinue | Where-Object {
+        [string]$_.Path -eq $wfpExe
+    }) {
+        throw 'Refusing to restore direct DNS while owned WFP payload filters are active.'
+    }
     Get-OwnedRule | ForEach-Object { Remove-DnsClientNrptRule -Name $_.Name -Force }
     & ipconfig.exe /flushdns | Out-Null
     Write-Output 'Local split-DNS NRPT rule removed.'
@@ -43,18 +50,20 @@ if ($Action -eq 'Disable') {
 }
 
 $allRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue)
-$sameNameCollision = $allRules | Where-Object {
-    $_.DisplayName -eq $displayName -and
-    -not (Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $displayName)
+Assert-ProgramSplitNrptRulesCompatible -Rules $allRules -DisplayName $displayName `
+    -RequireOwned:($Action -eq 'Validate')
+if ($Action -eq 'Validate') {
+    Assert-ProgramSplitEffectiveNrptPolicy -Policies @(
+        Get-DnsClientNrptPolicy -Effective -ErrorAction Stop
+    )
+    Write-Output 'PASS: local split-DNS NRPT rule is owned and conflict-free.'
+    exit 0
 }
-if ($sameNameCollision) { throw 'A foreign NRPT rule uses the WireGuard Program Split display name.' }
-$foreignCatchAll = $allRules | Where-Object {
-    $_.Namespace -contains '.' -and
-    -not (Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $displayName)
-}
-if ($foreignCatchAll) { throw 'Another catch-all NRPT rule is active.' }
 if (-not (Get-OwnedRule)) {
     Add-DnsClientNrptRule -Namespace '.' -NameServers '127.0.0.1' -DisplayName $displayName -Comment $comment | Out-Null
 }
 & ipconfig.exe /flushdns | Out-Null
+Assert-ProgramSplitEffectiveNrptPolicy -Policies @(
+    Get-DnsClientNrptPolicy -Effective -ErrorAction Stop
+)
 Write-Output 'Ordinary Windows DNS now enters the local per-process dispatcher.'

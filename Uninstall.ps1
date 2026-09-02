@@ -18,6 +18,8 @@ $plan = [pscustomobject]@{
 }
 if ($PlanOnly) { return $plan }
 
+Assert-ProgramSplit64BitPowerShell
+
 $fullRoot = [IO.Path]::GetFullPath($DestinationRoot).TrimEnd('\')
 if ([IO.Path]::GetPathRoot($fullRoot).TrimEnd('\') -eq $fullRoot) {
     throw 'Refusing to uninstall from a filesystem root.'
@@ -78,8 +80,10 @@ function Invoke-Cleanup([string] $ScriptName, [string] $Action) {
     catch { $script:errors.Add("$ScriptName $Action failed: $($_.Exception.Message)") }
 }
 
-Invoke-Cleanup 'Invoke-LocalNrpt.ps1' 'Disable'
+$beforeWfp = $errors.Count
 Invoke-Cleanup 'Invoke-WfpFilters.ps1' 'Stop'
+$wfpStopped = $errors.Count -eq $beforeWfp
+if ($wfpStopped) { Invoke-Cleanup 'Invoke-LocalNrpt.ps1' 'Disable' }
 Invoke-Cleanup 'Invoke-DnsDispatcher.ps1' 'Stop'
 Invoke-Cleanup 'Invoke-Tunnel.ps1' 'Stop'
 Invoke-Cleanup 'Invoke-DnsCachePolicy.ps1' 'Disable'

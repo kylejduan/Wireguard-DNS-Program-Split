@@ -24,6 +24,26 @@ foreach ($name in @('Invoke-BrowserDnsPolicy.ps1', 'Invoke-DnsCachePolicy.ps1'))
 $controllerSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Controller.ps1'))
 Assert-True ($controllerSource -match '(?s)\.Handle.*?WaitForExit\(45000\).*?WaitForExit\(\).*?\.ExitCode') `
     'controller retains the child handle and finalizes its wait before reading ExitCode'
+Assert-True ($controllerSource -notmatch 'Start-Sleep -Seconds 2\s+Test-TunnelDns') `
+    'controller startup has no fixed pre-probe sleep'
+$stopStack = $controllerSource.IndexOf('function Stop-Stack')
+$stopWfp = $controllerSource.IndexOf("Invoke-Component 'Invoke-WfpFilters.ps1' 'Stop'", $stopStack)
+$stopNrpt = $controllerSource.IndexOf("Invoke-Component 'Invoke-LocalNrpt.ps1' 'Disable'", $stopStack)
+Assert-True ($stopWfp -gt $stopStack -and $stopWfp -lt $stopNrpt) `
+    'controller removes payload filters before restoring direct DNS'
+Assert-True ($controllerSource -match "Invoke-Component 'Invoke-LocalNrpt.ps1' 'Validate'") `
+    'controller health validates the active NRPT namespace'
+$tunnelProbeSource = $controllerSource.Substring(
+    $controllerSource.IndexOf('function Test-TunnelDns'),
+    $controllerSource.IndexOf('function Invoke-Repair') - $controllerSource.IndexOf('function Test-TunnelDns'))
+Assert-True ($tunnelProbeSource -match '(?s)\.Handle.*?WaitForExit\(\$TimeoutMilliseconds \+ 3000\).*?WaitForExit\(\)') `
+    'tunnel DNS probe drains redirected output before evaluating it'
+Assert-True ($controllerSource -match '(?s)\$wfpStopped\s*=.*?if \(\$wfpStopped\).*?Invoke-LocalNrpt') `
+    'controller does not restore direct DNS after a WFP-stop failure'
+Assert-True ($controllerSource -match 'Test-Path -LiteralPath \$activeFile -PathType Leaf') `
+    'controller adopts only a stack that completed its readiness gates'
+Assert-True ($controllerSource -match 'Test-Path -LiteralPath \(Join-Path \$state ''dns-etw-session\.txt''\)') `
+    'controller treats owned ETW session state as a managed stack component'
 
 $probeOut = Join-Path ([IO.Path]::GetTempPath()) "wgps-exit-$([guid]::NewGuid()).out"
 $probeError = "$probeOut.err"
@@ -43,6 +63,46 @@ $temporary = Join-Path ([IO.Path]::GetTempPath()) ("WireGuardProgramSplit-test-{
 try {
     $common = Join-Path $RepositoryRoot 'src\powershell\Common.ps1'
     . $common
+
+    Assert-ProgramSplit64BitPowerShell
+    $wowPowerShell = Join-Path $env:WINDIR 'SysWOW64\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path -LiteralPath $wowPowerShell -PathType Leaf) {
+        $escapedCommon = $common.Replace("'", "''")
+        $wowCommand = ". '$escapedCommon'; try { Assert-ProgramSplit64BitPowerShell; exit 1 } catch { exit 0 }"
+        $wowEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wowCommand))
+        $wowProbe = Start-Process -FilePath $wowPowerShell -ArgumentList @(
+            '-NoProfile', '-NonInteractive', '-EncodedCommand', $wowEncoded
+        ) -WindowStyle Hidden -PassThru
+        $null = $wowProbe.Handle
+        Assert-True ($wowProbe.WaitForExit(5000)) '32-bit PowerShell guard probe completes'
+        $wowProbe.WaitForExit()
+        Assert-True ($wowProbe.ExitCode -eq 0) '32-bit PowerShell is rejected before ownership cleanup'
+    }
+
+    $traceNames = @(Get-ProgramSplitOwnedTraceNames -StateValue 'broken' -CommandLines @(
+        'dns-dispatcher.exe args WireGuardProgramSplitDnsEtw-0123456789abcdef0123456789abcdef'
+    ))
+    Assert-True ($traceNames.Count -eq 1 -and
+        $traceNames[0] -eq 'WireGuardProgramSplitDnsEtw-0123456789abcdef0123456789abcdef') `
+        'ETW ownership recovers from a strict dispatcher command-line name when state is corrupt'
+    $traceNames = @(Get-ProgramSplitOwnedTraceNames `
+        -StateValue 'WireGuardProgramSplitDnsEtw-0123456789abcdef0123456789abcdef' `
+        -CommandLines @('WireGuardProgramSplitDnsEtw-0123456789abcdef0123456789abcdef'))
+    Assert-True ($traceNames.Count -eq 1) 'ETW ownership de-duplicates state and command-line evidence'
+
+    $probeAttempts = 0
+    Wait-ProgramSplitProbe -Probe { ++$script:probeAttempts } -TimeoutMilliseconds 100
+    Assert-True ($probeAttempts -eq 1) 'probe wait returns immediately on success'
+    $probeAttempts = 0
+    Wait-ProgramSplitProbe -Probe {
+        ++$script:probeAttempts
+        if ($script:probeAttempts -lt 3) { throw 'not ready' }
+    } -TimeoutMilliseconds 100 -RetryMilliseconds 0
+    Assert-True ($probeAttempts -eq 3) 'probe wait tolerates a transient readiness race'
+    $probeFailed = $false
+    try { Wait-ProgramSplitProbe -Probe { throw 'still unavailable' } -TimeoutMilliseconds 0 }
+    catch { $probeFailed = $_.Exception.Message -eq 'still unavailable' }
+    Assert-True $probeFailed 'probe wait preserves the terminal readiness error'
 
     $lockedStaging = Join-Path $temporary 'locked-install-staging'
     [IO.Directory]::CreateDirectory($lockedStaging) | Out-Null
@@ -137,6 +197,60 @@ try {
     $foreignNrpt.NameServers = @('203.0.113.53')
     Assert-True (-not (Test-ProgramSplitNrptRuleOwnership -Rule $foreignNrpt `
         -DisplayName $ownedNrpt.DisplayName)) 'NRPT ownership rejects a same-name foreign resolver'
+    Assert-ProgramSplitNrptRulesCompatible -Rules @($ownedNrpt) -DisplayName $ownedNrpt.DisplayName `
+        -RequireOwned
+    $foreignCatchAll = $ownedNrpt.PSObject.Copy()
+    $foreignCatchAll.DisplayName = 'Another VPN'
+    $foreignCatchAll.NameServers = @('203.0.113.53')
+    $nrptCollisionFailed = $false
+    try {
+        Assert-ProgramSplitNrptRulesCompatible -Rules @($ownedNrpt, $foreignCatchAll) `
+            -DisplayName $ownedNrpt.DisplayName -RequireOwned
+    } catch { $nrptCollisionFailed = $true }
+    Assert-True $nrptCollisionFailed 'NRPT validation rejects a foreign catch-all rule'
+    $nrptMissingFailed = $false
+    try {
+        Assert-ProgramSplitNrptRulesCompatible -Rules @() -DisplayName $ownedNrpt.DisplayName `
+            -RequireOwned
+    } catch { $nrptMissingFailed = $true }
+    Assert-True $nrptMissingFailed 'NRPT validation requires the owned rule while active'
+    Assert-ProgramSplitEffectiveNrptPolicy -Policies @([pscustomobject]@{
+        Namespace = @('.'); NameServers = @('127.0.0.1')
+    })
+    $effectiveCollisionFailed = $false
+    try {
+        Assert-ProgramSplitEffectiveNrptPolicy -Policies @([pscustomobject]@{
+            Namespace = @('.'); NameServers = @('10.2.0.1')
+        })
+    } catch { $effectiveCollisionFailed = $true }
+    Assert-True $effectiveCollisionFailed 'effective NRPT validation rejects an overriding resolver'
+
+    $dispatcherScriptSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Invoke-DnsDispatcher.ps1'))
+    Assert-True ($dispatcherScriptSource -match 'dns-etw-session\.txt' -and
+        $dispatcherScriptSource -match 'WireGuardProgramSplitDnsEtw-') `
+        'dispatcher persists a unique owned ETW session name'
+    Assert-True ($dispatcherScriptSource -match "'--system'") `
+        'dispatcher validation probes the Windows DNS Client path'
+    Assert-True ($dispatcherScriptSource -match 'Get-ExpectedProcesses') `
+        'dispatcher can recover an exact-path child after PID-state loss'
+    $wfpScriptSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Invoke-WfpFilters.ps1'))
+    Assert-True ($wfpScriptSource -match 'Get-ExpectedProcesses') `
+        'WFP cleanup can recover exact-path filter hosts after PID-state loss'
+    $nrptScriptSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Invoke-LocalNrpt.ps1'))
+    Assert-True ($nrptScriptSource -match 'Refusing to restore direct DNS while owned WFP payload filters are active') `
+        'NRPT disable independently guards the WFP-before-DNS teardown invariant'
+    $nativeProbeSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\native\dns-probe.cpp'))
+    Assert-True ($nativeProbeSource -match 'DnsQuery_A') 'native probe supports Windows DNS Client validation'
+    Assert-True ($nativeProbeSource -match 'peer\.sin_addr\.s_addr' -and
+        $nativeProbeSource -match 'response\[3\].*0x0f') `
+        'raw tunnel readiness rejects foreign-source and DNS-error responses'
+    $buildSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'scripts\build-wsl.sh'))
+    Assert-True ($buildSource -match 'dns-probe\.exe.*-ldnsapi') 'native DNS probe links the Windows DNS API'
+    $uninstallSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'Uninstall.ps1'))
+    Assert-True ($uninstallSource -match '(?s)Invoke-Cleanup ''Invoke-WfpFilters\.ps1'' ''Stop''.*?if \(\$wfpStopped\).*?Invoke-Cleanup ''Invoke-LocalNrpt\.ps1'' ''Disable''') `
+        'uninstaller restores direct DNS only after WFP filters stop'
+    Assert-True ($uninstallSource -match 'Assert-ProgramSplit64BitPowerShell') `
+        'uninstaller refuses cross-bitness process ownership checks'
 
     Assert-ProgramSplitInstallNamesAvailable -Tasks @() -Service $null
     $collisionFailed = $false
