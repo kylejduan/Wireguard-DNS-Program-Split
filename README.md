@@ -48,7 +48,7 @@ Set-ExecutionPolicy -Scope Process Bypass
   -DisableBrowserSecureDns
 ```
 
-The installer validates inputs and signatures, deploys to `C:\ProgramData\WireGuardProgramSplit`, starts a SYSTEM controller, and adds a current-user tray icon. Use the tray to enable/disable routing, add or remove executables, import another profile, and open logs.
+The installer validates inputs and signatures, deploys to `C:\ProgramData\WireGuardProgramSplit`, starts an automatic SYSTEM controller service, and adds a current-user tray icon. Use the tray to enable/disable routing, add or remove executables, import another profile, and open logs.
 
 See [Installation](docs/installation.md), [Architecture](docs/architecture.md), and [Troubleshooting](docs/troubleshooting.md).
 

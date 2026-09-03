@@ -49,10 +49,10 @@ function Test-ProgramSplitServiceOwnership {
     param(
         [Parameter(Mandatory)] $Service,
         [Parameter(Mandatory)] [string] $HostPath,
-        [Parameter(Mandatory)] [string] $ProfilePath
+        [Parameter(Mandatory)] [string] $ArgumentPath
     )
 
-    return [string] $Service.PathName -eq ('{0} /service {1}' -f $HostPath, $ProfilePath)
+    return [string] $Service.PathName -eq ('{0} /service {1}' -f $HostPath, $ArgumentPath)
 }
 
 function Test-ProgramSplitNrptRuleOwnership {
@@ -120,9 +120,10 @@ function Wait-ProgramSplitProbe {
 }
 
 function Assert-ProgramSplitInstallNamesAvailable {
-    param($Tasks, $Service)
+    param($Tasks, $Services)
 
-    if (@($Tasks).Count -gt 0 -or $null -ne $Service) {
+    if (@($Tasks | Where-Object { $null -ne $_ }).Count -gt 0 -or
+        @($Services | Where-Object { $null -ne $_ }).Count -gt 0) {
         throw 'A scheduled task or service already uses a WireGuard Program Split resource name.'
     }
 }
@@ -276,7 +277,7 @@ function Get-ProgramSplitConfiguration {
         Root = $Root
         AdapterName = 'WireGuardSplit'
         ServiceName = 'WireGuardTunnel$WireGuardSplit'
-        ControllerTask = 'WireGuard Program Split Controller'
+        ControllerServiceName = 'WireGuardProgramSplitController'
         TrayTask = 'WireGuard Program Split Tray'
         NrptDisplayName = 'WireGuard Program Split local dispatcher'
         ProfilePath = Join-Path $Root 'profiles\WireGuardSplit.conf'

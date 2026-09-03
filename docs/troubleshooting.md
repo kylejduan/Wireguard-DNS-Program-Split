@@ -7,8 +7,8 @@ The tray's **Open logs** command opens `C:\ProgramData\WireGuardProgramSplit\log
 Useful checks from elevated PowerShell:
 
 ```powershell
-Get-Service 'WireGuardTunnel$WireGuardSplit', 'PiaWFPCallout'
-Get-ScheduledTask 'WireGuard Program Split Controller', 'WireGuard Program Split Tray'
+Get-Service 'WireGuardProgramSplitController', 'WireGuardTunnel$WireGuardSplit', 'PiaWFPCallout'
+Get-ScheduledTask 'WireGuard Program Split Tray'
 Get-DnsClientNrptPolicy -Effective
 Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0'
 ```
@@ -50,4 +50,4 @@ Runtime DLLs are a matched dependency pair. Restore the pair that previously wor
 
 ## Startup is slow
 
-The tunnel service should report `Automatic`. Compare the boot timestamp to the first `Stack active after tunnel readiness check` line. The controller has no fixed 20-second post-success delay; remaining time is task launch, adapter creation, endpoint handshake, and the first successful DNS probe.
+Both `WireGuardProgramSplitController` and the tunnel service should report `Automatic`. Compare the boot timestamp to the first `Stack active after tunnel readiness check` line. The controller has no fixed post-success delay; remaining time is physical-network readiness, adapter creation, endpoint handshake, and the first successful DNS probe. Inspect `controller-service.log` if the controller service itself repeatedly restarts.

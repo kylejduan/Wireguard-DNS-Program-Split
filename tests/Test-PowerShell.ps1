@@ -20,6 +20,9 @@ foreach ($name in @('Invoke-BrowserDnsPolicy.ps1', 'Invoke-DnsCachePolicy.ps1'))
     Assert-True ($source -notmatch '@\(\s*Get-Content[^\r\n]+ConvertFrom-Json') `
         "$name must enumerate a JSON array on Windows PowerShell 5.1"
 }
+$dnsCacheSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Invoke-DnsCachePolicy.ps1'))
+Assert-True ($dnsCacheSource -match 'Failed to restore DNS cache policy value') `
+    'DNS cache teardown verifies restored registry values'
 
 $controllerSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Controller.ps1'))
 Assert-True ($controllerSource -match '(?s)\.Handle.*?WaitForExit\(45000\).*?WaitForExit\(\).*?\.ExitCode') `
@@ -49,6 +52,21 @@ Assert-True ($controllerSource -match 'Test-Path -LiteralPath \$activeFile -Path
     'controller adopts only a stack that completed its readiness gates'
 Assert-True ($controllerSource -match 'Test-Path -LiteralPath \(Join-Path \$state ''dns-etw-session\.txt''\)') `
     'controller treats owned ETW session state as a managed stack component'
+Assert-True ($controllerSource -match '(?s)StopEventHandle.*?SafeWaitHandle.*?WaitOne\(0\).*?Stop-Stack -RestoreCache.*?break') `
+    'controller cooperatively cleans the stack before a service stop'
+Assert-True ($controllerSource -match '(?s)Stop-Stack -RestoreCache.*?Test-StackPresent.*?continue.*?break') `
+    'controller verifies cleanup before completing a service stop'
+Assert-True ($controllerSource -match '(?s)function Stop-Stack.*?ThrowOnFailure.*?cleanupErrors.*?throw' -and
+    $controllerSource -match 'Stop-Stack -RestoreCache -ThrowOnFailure') `
+    'service stop reports component cleanup failures to SCM'
+Assert-True ($controllerSource -match '(?s)if \(-not \$desired\).*?Stop-Stack -RestoreCache -ThrowOnFailure') `
+    'interactive disable also reports component cleanup failures'
+Assert-True ($controllerSource -match 'Test-Path -LiteralPath \(Join-Path \$state ''endpoint-route\.txt''\)') `
+    'controller treats endpoint-route recovery state as a managed stack component'
+Assert-True ($controllerSource -match '(?s)if \(-not \$StopEventHandle\).*?Global\\WireGuardProgramSplitController') `
+    'service-mode controller relies on SCM ownership instead of a spoofable global mutex'
+Assert-True ($controllerSource -match '(?s)Get-ProgramSplitPhysicalDefault.*?catch \{.*?return.*?Start-Stack') `
+    'controller waits for a physical default route without entering repair backoff'
 
 $probeOut = Join-Path ([IO.Path]::GetTempPath()) "wgps-exit-$([guid]::NewGuid()).out"
 $probeError = "$probeOut.err"
@@ -102,7 +120,7 @@ try {
     Wait-ProgramSplitProbe -Probe {
         ++$script:probeAttempts
         if ($script:probeAttempts -lt 3) { throw 'not ready' }
-    } -TimeoutMilliseconds 100 -RetryMilliseconds 0
+    } -TimeoutMilliseconds 5000 -RetryMilliseconds 0
     Assert-True ($probeAttempts -eq 3) 'probe wait tolerates a transient readiness race'
     $probeFailed = $false
     try { Wait-ProgramSplitProbe -Probe { throw 'still unavailable' } -TimeoutMilliseconds 0 }
@@ -185,10 +203,16 @@ try {
     $profilePath = 'C:\ProgramData\WireGuardProgramSplit\profiles\WireGuardSplit.conf'
     $ownedService = [pscustomobject]@{ PathName = "$hostExe /service $profilePath" }
     Assert-True (Test-ProgramSplitServiceOwnership -Service $ownedService -HostPath $hostExe `
-        -ProfilePath $profilePath) 'service ownership accepts the exact tunnel host command'
+        -ArgumentPath $profilePath) 'service ownership accepts the exact tunnel host command'
     $foreignService = [pscustomobject]@{ PathName = 'C:\Other\service.exe' }
     Assert-True (-not (Test-ProgramSplitServiceOwnership -Service $foreignService -HostPath $hostExe `
-        -ProfilePath $profilePath)) 'service ownership rejects a same-name foreign command'
+        -ArgumentPath $profilePath)) 'service ownership rejects a same-name foreign command'
+    $controllerHost = 'C:\ProgramData\WireGuardProgramSplit\bin\controller-service.exe'
+    $controllerScript = 'C:\ProgramData\WireGuardProgramSplit\src\Controller.ps1'
+    $ownedControllerService = [pscustomobject]@{ PathName = "$controllerHost /service $controllerScript" }
+    Assert-True (Test-ProgramSplitServiceOwnership -Service $ownedControllerService `
+        -HostPath $controllerHost -ArgumentPath $controllerScript) `
+        'service ownership accepts the exact controller host command'
 
     $ownedNrpt = [pscustomobject]@{
         DisplayName = 'WireGuard Program Split local dispatcher'
@@ -251,19 +275,43 @@ try {
         'raw tunnel readiness rejects foreign-source and DNS-error responses'
     $buildSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'scripts\build-wsl.sh'))
     Assert-True ($buildSource -match 'dns-probe\.exe.*-ldnsapi') 'native DNS probe links the Windows DNS API'
+    Assert-True ($buildSource -match 'controller-service\.exe') 'build includes the native controller service host'
+    $controllerServiceSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\native\controller-service.cpp'))
+    $controllerHandlerSource = $controllerServiceSource.Substring(
+        $controllerServiceSource.IndexOf('DWORD WINAPI controlHandler'),
+        $controllerServiceSource.IndexOf('void WINAPI serviceMain') -
+            $controllerServiceSource.IndexOf('DWORD WINAPI controlHandler'))
+    Assert-True ($controllerHandlerSource -notmatch 'reportStatus') `
+        'controller service serializes status updates on its service-main thread'
+    Assert-True ($controllerServiceSource -notmatch 'Global\\\\WireGuardProgramSplitControllerStop' -and
+        $controllerServiceSource -match 'CreateEventW\(&eventAttributes, TRUE, FALSE, nullptr\)' -and
+        $controllerServiceSource -match '-StopEventHandle') `
+        'controller service uses an inherited unnamed stop event'
+    Assert-True ($controllerServiceSource -match 'JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE' -and
+        $controllerServiceSource -match 'JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK') `
+        'controller service preserves adoptable data-plane children across supervisor recovery'
+    Assert-True ($controllerServiceSource -match '(?s)controller-service\.log.*?GENERIC_WRITE,\s*FILE_SHARE_READ\s*\|\s*FILE_SHARE_WRITE') `
+        'controller service can reopen its log while adoptable children retain inherited handles'
+    Assert-True ($controllerServiceSource -match 'kStopTimeoutMilliseconds = 240000' -and
+        $controllerServiceSource -match '(?s)TerminateJobObject.*?SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR') `
+        'controller service gives ordered cleanup time and reports forced stop as failure'
     $uninstallSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'Uninstall.ps1'))
     Assert-True ($uninstallSource -match '(?s)Invoke-Cleanup ''Invoke-WfpFilters\.ps1'' ''Stop''.*?if \(\$wfpStopped\).*?Invoke-Cleanup ''Invoke-LocalNrpt\.ps1'' ''Disable''') `
         'uninstaller restores direct DNS only after WFP filters stop'
     Assert-True ($uninstallSource -match 'Assert-ProgramSplit64BitPowerShell') `
         'uninstaller refuses cross-bitness process ownership checks'
+    Assert-True ($uninstallSource -match '(?s)Set-Service -Name \$plan\.ControllerServiceName -StartupType Disabled.*?failureflag.*?0.*?Stop-Service -Name \$plan\.ControllerServiceName') `
+        'uninstaller disables startup and recovery before stopping the controller service'
+    Assert-True ($uninstallSource -match 'if \(\$controllerService\.Status -ne ''StopPending''\)') `
+        'uninstaller waits for an existing controller stop instead of issuing a duplicate control'
 
-    Assert-ProgramSplitInstallNamesAvailable -Tasks @() -Service $null
+    Assert-ProgramSplitInstallNamesAvailable -Tasks @() -Services @()
     $collisionFailed = $false
-    try { Assert-ProgramSplitInstallNamesAvailable -Tasks @($foreignTask) -Service $null }
+    try { Assert-ProgramSplitInstallNamesAvailable -Tasks @($foreignTask) -Services @() }
     catch { $collisionFailed = $true }
     Assert-True $collisionFailed 'installation refuses an existing same-name task'
     $collisionFailed = $false
-    try { Assert-ProgramSplitInstallNamesAvailable -Tasks @() -Service $foreignService }
+    try { Assert-ProgramSplitInstallNamesAvailable -Tasks @() -Services @($null, $foreignService) }
     catch { $collisionFailed = $true }
     Assert-True $collisionFailed 'installation refuses an existing same-name service'
 

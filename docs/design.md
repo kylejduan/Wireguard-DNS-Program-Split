@@ -14,9 +14,9 @@ On Windows 11, route all IPv4 TCP and UDP sockets created by an explicit list of
 
 ## Fast startup
 
-The WireGuard tunnel service starts automatically through the Windows Service Control Manager. The controller adopts a healthy early-started tunnel, polls a short tunnel-DNS probe until its first success instead of imposing a fixed delay, then enables and validates the dispatcher and NRPT path before dynamic WFP filters. Ongoing 30-second checks retry transient failures and verify the real Windows DNS Client, ETW attribution, loopback dispatcher, physical resolver snapshot, NRPT ownership, and tunnel DNS.
+The WireGuard tunnel and controller services start automatically through the Windows Service Control Manager. The controller waits for a physical IPv4 default route without entering failure backoff, adopts a healthy early-started tunnel, polls a short tunnel-DNS probe until its first success instead of imposing a fixed delay, then enables and validates the dispatcher and NRPT path before dynamic WFP filters. Ongoing 30-second checks retry transient failures and verify the real Windows DNS Client, ETW attribution, loopback dispatcher, physical resolver snapshot, NRPT ownership, and tunnel DNS.
 
-This retains a native service where Windows already provides one and avoids a custom controller-service wrapper. A wrapper is warranted only if measured Task Scheduler latency remains material after the tunnel is pre-started.
+The small native controller host exists because measured Task Scheduler startup added roughly 24 seconds on the reference machine. It adds no routing logic: it supplies SCM lifecycle, cooperative shutdown, and restart-on-failure around the existing PowerShell controller.
 
 ## Trust and security boundaries
 
@@ -41,4 +41,4 @@ This retains a native service where Windows already provides one and avoids a cu
 - A selected browser reports the WireGuard exit and tunnel DNS; an unselected browser reports the physical ISP exit and router-provided DNS.
 - Unselected multi-gigabit traffic remains on the physical path without a universal TUN penalty.
 - Cold-boot logs measure boot-to-active time and prove the fixed 20-second soak is absent.
-- Installer rollback and uninstaller restore NRPT, DNS-cache policy, tasks, routes, services, and local processes they own.
+- Installer rollback and uninstaller restore NRPT, DNS-cache policy, the owned tray task, routes, services, and local processes they own.

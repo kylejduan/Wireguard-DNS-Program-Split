@@ -88,4 +88,4 @@ Run elevated:
 ./Uninstall.ps1
 ```
 
-The uninstaller stops and removes the tasks, dynamic filters, dispatcher, tunnel service, owned NRPT rule, deployed files, and restored DNS/browser policies. It intentionally leaves the signed PIA driver installed because another application may share it.
+The uninstaller disables controller recovery, requests ordered stack cleanup, and removes the controller and tunnel services, tray task, dynamic filters, dispatcher, owned NRPT rule, deployed files, and restored DNS/browser policies. It intentionally leaves the signed PIA driver installed because another application may share it.
