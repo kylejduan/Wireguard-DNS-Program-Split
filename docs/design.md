@@ -14,7 +14,7 @@ On Windows 11, route all IPv4 TCP and UDP sockets created by an explicit list of
 
 ## Fast startup
 
-The WireGuard tunnel and controller services start automatically through the Windows Service Control Manager. The controller waits for a physical IPv4 default route without entering failure backoff, adopts a healthy early-started tunnel, polls a short tunnel-DNS probe until its first success instead of imposing a fixed delay, then enables and validates the dispatcher and NRPT path before dynamic WFP filters. Ongoing 30-second checks retry transient failures and verify the real Windows DNS Client, ETW attribution, loopback dispatcher, physical resolver snapshot, NRPT ownership, and tunnel DNS.
+The WireGuard tunnel and controller services start automatically through the Windows Service Control Manager. The controller waits for a physical IPv4 default route without entering failure backoff, adopts a healthy early-started tunnel, polls a short tunnel-DNS probe until its first success instead of imposing a fixed delay, then enables and validates the dispatcher and NRPT path before dynamic WFP filters. Ongoing 30-second checks retry transient failures and verify the absence of an IPv6 default route, the real Windows DNS Client, ETW attribution, loopback dispatcher, physical resolver snapshot, NRPT ownership, and tunnel DNS.
 
 The small native controller host exists because measured Task Scheduler startup added roughly 24 seconds on the reference machine. It adds no routing logic: it supplies SCM lifecycle, cooperative shutdown, and restart-on-failure around the existing PowerShell controller.
 

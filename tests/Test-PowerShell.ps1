@@ -23,6 +23,9 @@ foreach ($name in @('Invoke-BrowserDnsPolicy.ps1', 'Invoke-DnsCachePolicy.ps1'))
 $dnsCacheSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Invoke-DnsCachePolicy.ps1'))
 Assert-True ($dnsCacheSource -match 'Failed to restore DNS cache policy value') `
     'DNS cache teardown verifies restored registry values'
+$commonSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Common.ps1'))
+Assert-True ($commonSource -match "(?s)function Assert-ProgramSplitNoIpv6DefaultRoute.*?Get-NetRoute -AddressFamily IPv6.*?'::/0'.*?-ErrorAction SilentlyContinue.*?throw") `
+    'shared IPv4-only guard treats a missing IPv6 default as healthy'
 
 $controllerSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Controller.ps1'))
 Assert-True ($controllerSource -match '(?s)\.Handle.*?WaitForExit\(45000\).*?WaitForExit\(\).*?\.ExitCode') `
@@ -66,6 +69,12 @@ Assert-True ($stopWfp -gt $stopStack -and $stopWfp -lt $stopNrpt) `
     'controller removes payload filters before restoring direct DNS'
 Assert-True ($controllerSource -match "Invoke-Component 'Invoke-LocalNrpt.ps1' 'Validate'") `
     'controller health validates the active NRPT namespace'
+$stackHealthSource = $controllerSource.Substring(
+    $controllerSource.IndexOf('function Test-StackHealth'),
+    $controllerSource.IndexOf('function Invoke-Repair') -
+        $controllerSource.IndexOf('function Test-StackHealth'))
+Assert-True ($stackHealthSource -match 'Assert-ProgramSplitNoIpv6DefaultRoute') `
+    'controller health rejects an IPv6 default route that appears after startup'
 $tunnelProbeSource = $controllerSource.Substring(
     $controllerSource.IndexOf('function Test-TunnelDns'),
     $controllerSource.IndexOf('function Invoke-Repair') - $controllerSource.IndexOf('function Test-TunnelDns'))
@@ -74,6 +83,10 @@ Assert-True ($tunnelProbeSource -match '(?s)\.Handle.*?WaitForExit\(\$TimeoutMil
 $startStackSource = $controllerSource.Substring(
     $controllerSource.IndexOf('function Start-Stack'),
     $controllerSource.IndexOf('$required = @(') - $controllerSource.IndexOf('function Start-Stack'))
+Assert-True ($startStackSource.IndexOf('Assert-ProgramSplitNoIpv6DefaultRoute') -ge 0 -and
+    $startStackSource.IndexOf('Assert-ProgramSplitNoIpv6DefaultRoute') -lt
+        $startStackSource.IndexOf('$startupComponents')) `
+    'controller rejects persistent IPv6 before launching repair components'
 Assert-True ($startStackSource -match '(?s)if \(\$dispatcherWasRunning\).*?Invoke-Component ''Invoke-DnsDispatcher\.ps1'' ''Validate''.*?else \{ Test-LocalDns \}') `
     'fresh startup uses the native DNS gate while an adopted dispatcher receives full validation'
 $tunnelParallelStart = $startStackSource.IndexOf("Start-Component 'Invoke-Tunnel.ps1' 'Start'")
@@ -132,6 +145,31 @@ $temporary = Join-Path ([IO.Path]::GetTempPath()) ("WireGuardProgramSplit-test-{
 try {
     $common = Join-Path $RepositoryRoot 'src\powershell\Common.ps1'
     . $common
+
+    $ownedEndpointState = [pscustomobject]@{
+        DestinationPrefix = '203.0.113.8/32'; InterfaceIndex = 7
+        NextHop = '192.0.2.1'; RouteMetric = 1
+    }
+    $ownedEndpointRoute = [pscustomobject]@{
+        DestinationPrefix = '203.0.113.8/32'; InterfaceIndex = 7
+        NextHop = '192.0.2.1'; RouteMetric = 1
+    }
+    $foreignEndpointRoute = [pscustomobject]@{
+        DestinationPrefix = '203.0.113.8/32'; InterfaceIndex = 19
+        NextHop = '198.51.100.1'; RouteMetric = 1
+    }
+    Assert-True (Test-ProgramSplitEndpointRouteOwnership -Route $ownedEndpointRoute `
+        -State $ownedEndpointState) 'endpoint route ownership accepts the exact recorded tuple'
+    Assert-True (-not (Test-ProgramSplitEndpointRouteOwnership -Route $foreignEndpointRoute `
+        -State $ownedEndpointState)) 'endpoint route ownership rejects a foreign same-prefix route'
+    foreach ($field in @('InterfaceIndex', 'NextHop', 'RouteMetric')) {
+        $differentEndpointRoute = $ownedEndpointRoute.PSObject.Copy()
+        if ($field -eq 'InterfaceIndex') { $differentEndpointRoute.InterfaceIndex = 8 }
+        elseif ($field -eq 'NextHop') { $differentEndpointRoute.NextHop = '192.0.2.2' }
+        else { $differentEndpointRoute.RouteMetric = 2 }
+        Assert-True (-not (Test-ProgramSplitEndpointRouteOwnership -Route $differentEndpointRoute `
+            -State $ownedEndpointState)) "endpoint route ownership rejects a $field mismatch"
+    }
 
     Assert-ProgramSplit64BitPowerShell
     $wowPowerShell = Join-Path $env:WINDIR 'SysWOW64\WindowsPowerShell\v1.0\powershell.exe'
@@ -317,14 +355,16 @@ try {
     Assert-True ($dispatcherValidateSource -match 'Get-NetUDPEndpoint' -and
         $dispatcherValidateSource -match 'Get-NetTCPConnection') `
         'dispatcher health validation retains independent socket ownership checks'
-    Assert-True ($dispatcherStartSource -match "\^READY:" -and
+    Assert-True ($dispatcherStartSource -match "\(\?m\)\^READY:" -and
         $dispatcherStartSource -notmatch 'Get-NetUDPEndpoint|Get-NetTCPConnection') `
         'dispatcher startup uses its flushed native readiness signal without slow endpoint cmdlets'
     $clearIndex = $dispatcherStartSource.IndexOf('[IO.File]::WriteAllText($stdout')
     $startIndex = $dispatcherStartSource.IndexOf('Start-Process')
-    $pollIndex = $dispatcherStartSource.IndexOf("-match '^READY:'")
+    $pollIndex = $dispatcherStartSource.IndexOf("-match '(?m)^READY:'")
     Assert-True ($clearIndex -ge 0 -and $startIndex -gt $clearIndex -and $pollIndex -gt $startIndex) `
         'dispatcher clears stale readiness output before launch and polling'
+    Assert-True ("HINT example.com`r`nREADY: dispatcher" -match '(?m)^READY:') `
+        'dispatcher readiness pattern accepts a preceding ETW hint line'
     $wfpScriptSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Invoke-WfpFilters.ps1'))
     Assert-True ($wfpScriptSource -match 'Get-ExpectedProcesses') `
         'WFP cleanup can recover exact-path filter hosts after PID-state loss'
@@ -338,10 +378,25 @@ try {
         'raw tunnel readiness rejects foreign-source and DNS-error responses'
     $nativeDispatcherSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\native\dns-dispatcher.cpp'))
     $listenIndex = $nativeDispatcherSource.IndexOf('listen(gTcpListener')
-    $readyIndex = $nativeDispatcherSource.IndexOf('READY: ETW split-DNS dispatcher')
-    $flushIndex = $nativeDispatcherSource.IndexOf('std::wcout.flush()', $readyIndex)
-    Assert-True ($listenIndex -ge 0 -and $readyIndex -gt $listenIndex -and $flushIndex -gt $readyIndex) `
-        'native dispatcher flushes READY only after UDP/TCP bind and TCP listen succeed'
+    $readyIndex = $nativeDispatcherSource.IndexOf('logLine(L"READY: ETW split-DNS dispatcher')
+    Assert-True ($listenIndex -ge 0 -and $readyIndex -gt $listenIndex -and
+        $nativeDispatcherSource -match '(?s)logLine\(L"READY: ETW split-DNS dispatcher.*?std::to_wstring\(trace\.frequency\(\)\), true\);') `
+        'native dispatcher serializes and flushes READY after UDP/TCP bind and TCP listen succeed'
+    $tunnelSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Invoke-Tunnel.ps1'))
+    Assert-True ($tunnelSource -notmatch 'InterfaceAlias -ne \$adapterName' -and
+        $tunnelSource -notmatch 'Add-ActiveRoute -prefix "\$endpoint/32"' -and
+        $tunnelSource -match 'Test-ProgramSplitEndpointRouteOwnership') `
+        'tunnel cleanup removes only a recorded exact endpoint-route tuple'
+    Assert-True ($tunnelSource -match 'DestinationPrefix\s*=\s*"\$endpoint/32"' -and
+        $tunnelSource -match 'InterfaceIndex\s*=\s*\[uint32\]\s*\$physical\.InterfaceIndex' -and
+        $tunnelSource -match 'NextHop\s*=\s*\[string\]\s*\$physical\.NextHop' -and
+        $tunnelSource -match 'RouteMetric\s*=\s*1') `
+        'endpoint-route recovery state records the complete created route identity'
+    $endpointStateIndex = $tunnelSource.IndexOf('Set-OwnedEndpointRouteState $routeState')
+    $endpointCreateIndex = $tunnelSource.IndexOf('New-NetRoute', $endpointStateIndex)
+    Assert-True ($tunnelSource -match '(?s)\$existingEndpointRoute\s*=\s*Get-NetRoute.*?if \(-not \$existingEndpointRoute\).*?New-NetRoute' -and
+        $endpointStateIndex -ge 0 -and $endpointCreateIndex -gt $endpointStateIndex) `
+        'tunnel leaves a pre-existing exact route untouched and records ownership before creation'
     $buildSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'scripts\build-wsl.sh'))
     Assert-True ($buildSource -match 'dns-probe\.exe.*-ldnsapi') 'native DNS probe links the Windows DNS API'
     Assert-True ($buildSource -match 'controller-service\.exe') 'build includes the native controller service host'
