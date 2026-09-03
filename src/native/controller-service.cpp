@@ -1,6 +1,7 @@
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
 
+#include <cwchar>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -209,8 +210,8 @@ int selfTest() {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc == 2 && std::wstring(argv[1]) == L"--self-test") return selfTest();
-    if (argc != 3 || std::wstring(argv[1]) != L"/service") {
+    if (argc == 2 && std::wcscmp(argv[1], L"--self-test") == 0) return selfTest();
+    if (argc != 3 || std::wcscmp(argv[1], L"/service") != 0) {
         std::wcerr << L"Usage: controller-service.exe /service <Controller.ps1>\n";
         return 2;
     }
