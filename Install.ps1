@@ -46,7 +46,8 @@ if (-not $applicationPaths) { throw 'At least one application is required.' }
 
 $runtimeFiles = @('tunnel.dll', 'wireguard.dll')
 $driverFiles = @('PiaWFPCallout.inf', 'PiaWfpCallout.sys', 'piawfpcallout.cat')
-$projectExecutables = @('dns-dispatcher.exe', 'dns-probe.exe', 'tunnel-host.exe', 'wfp-probe.exe')
+$projectExecutables = @('controller-service.exe', 'dns-dispatcher.exe', 'dns-probe.exe',
+    'tunnel-host.exe', 'wfp-probe.exe')
 foreach ($path in @(
     $runtimeFiles | ForEach-Object { Join-Path $WireGuardRuntimeDirectory $_ }
     $driverFiles | ForEach-Object { Join-Path $PiaDriverDirectory $_ }
@@ -82,7 +83,9 @@ try {
         DestinationRoot = $DestinationRoot
         ServiceName = 'WireGuardTunnel$WireGuardSplit'
         ServiceStartType = 'Automatic'
-        ControllerTask = 'WireGuard Program Split Controller'
+        ControllerServiceName = 'WireGuardProgramSplitController'
+        ControllerServiceStartType = 'Automatic'
+        LegacyControllerTask = 'WireGuard Program Split Controller'
         TrayTask = 'WireGuard Program Split Tray'
         InstallationMarker = 'state\installation.json'
         TunnelAddress = [string] $derived.TunnelAddress
@@ -96,11 +99,13 @@ try {
     if (Test-Path -LiteralPath $DestinationRoot) {
         throw "An installation already exists at $DestinationRoot. Run Uninstall.ps1 before reinstalling."
     }
-    $existingTasks = @(foreach ($taskName in @($plan.ControllerTask, $plan.TrayTask)) {
+    $existingTasks = @(foreach ($taskName in @($plan.LegacyControllerTask, $plan.TrayTask)) {
         Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
     })
-    $existingService = Get-CimInstance Win32_Service -Filter "Name='$($plan.ServiceName)'" -ErrorAction SilentlyContinue
-    Assert-ProgramSplitInstallNamesAvailable -Tasks $existingTasks -Service $existingService
+    $existingServices = @(foreach ($serviceName in @($plan.ServiceName, $plan.ControllerServiceName)) {
+        Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
+    })
+    Assert-ProgramSplitInstallNamesAvailable -Tasks $existingTasks -Services $existingServices
     Assert-ValidSignature (Join-Path $WireGuardRuntimeDirectory 'tunnel.dll') 'WireGuard|Proton'
     Assert-ValidSignature (Join-Path $WireGuardRuntimeDirectory 'wireguard.dll') 'WireGuard|Proton|Microsoft Windows Hardware Compatibility Publisher'
     Assert-ValidSignature (Join-Path $PiaDriverDirectory 'PiaWfpCallout.sys') 'Private Internet Access|Microsoft Windows Hardware Compatibility Publisher'
@@ -138,17 +143,23 @@ try {
         [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $DestinationRoot 'state\enabled'), (Get-Date -Format o))
 
-    $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $controllerAction = New-ScheduledTaskAction -Execute $powerShell -Argument (
-        Get-ProgramSplitTaskArguments -ScriptPath (Join-Path $DestinationRoot 'src\Controller.ps1'))
-    $controllerSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
-        -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) `
-        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    Register-ScheduledTask -TaskName $plan.ControllerTask -TaskPath '\' -Action $controllerAction `
-        -Trigger (New-ScheduledTaskTrigger -AtStartup) `
-        -Principal (New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest) `
-        -Settings $controllerSettings -Description 'Owns per-application WireGuard payload and DNS routing.' | Out-Null
+    & (Join-Path $DestinationRoot 'src\Invoke-Tunnel.ps1') -Action Start | Out-Null
+    $controllerHost = Join-Path $DestinationRoot 'bin\controller-service.exe'
+    $controllerScript = Join-Path $DestinationRoot 'src\Controller.ps1'
+    $controllerCommand = '{0} /service {1}' -f $controllerHost, $controllerScript
+    $createOutput = & sc.exe create $plan.ControllerServiceName 'binPath=' $controllerCommand `
+        'type=' 'own' 'start=' 'auto' 'error=' 'normal' 'depend=' 'Nsi/TcpIp' `
+        'DisplayName=' 'WireGuard Program Split Controller' 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "Failed to create the controller service: $($createOutput -join ' ')" }
+    & sc.exe sidtype $plan.ControllerServiceName unrestricted | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to configure the controller service SID.' }
+    & sc.exe failure $plan.ControllerServiceName 'reset=' '86400' `
+        'actions=' 'restart/2000/restart/5000/restart/10000' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to configure controller service recovery.' }
+    & sc.exe failureflag $plan.ControllerServiceName 1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to enable controller recovery for non-crash failures.' }
 
+    $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $trayAction = New-ScheduledTaskAction -Execute $powerShell -Argument (
         Get-ProgramSplitTaskArguments -ScriptPath (Join-Path $DestinationRoot 'src\Tray.ps1'))
@@ -163,7 +174,7 @@ try {
     if ($DisableBrowserSecureDns) {
         & (Join-Path $DestinationRoot 'src\Invoke-BrowserDnsPolicy.ps1') -Action Enable | Out-Null
     }
-    Start-ScheduledTask -TaskName $plan.ControllerTask
+    Start-Service -Name $plan.ControllerServiceName
     $deadline = (Get-Date).AddSeconds(60)
     $activeFile = Join-Path $DestinationRoot 'state\active'
     while (-not (Test-Path -LiteralPath $activeFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }

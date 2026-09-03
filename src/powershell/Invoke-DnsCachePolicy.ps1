@@ -70,4 +70,12 @@ foreach ($item in $saved) {
         Remove-ItemProperty -LiteralPath $keyPath -Name $item.Name -ErrorAction SilentlyContinue
     }
 }
+$key = Get-Item -LiteralPath $keyPath
+foreach ($item in $saved) {
+    $actual = $key.GetValue($item.Name, $null)
+    if (($item.Exists -and ($null -eq $actual -or [int]$actual -ne [int]$item.Value)) -or
+        (-not $item.Exists -and $null -ne $actual)) {
+        throw "Failed to restore DNS cache policy value: $($item.Name)"
+    }
+}
 Write-Output 'Original Windows DNS Client cache policy restored.'

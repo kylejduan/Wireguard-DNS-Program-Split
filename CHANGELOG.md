@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Replace the delayed startup controller task with an automatic, restartable Windows service.
+- Wait for physical-route readiness without repair backoff and tolerate a tunnel-service `StartPending` race.
 - Refuse to overwrite or uninstall same-name foreign scheduled tasks, services, or NRPT rules.
 - Roll back both active profile files, after a stopped-controller acknowledgement, if a tray import fails.
 - Preserve recovery backups across failed or repeated profile-import attempts.

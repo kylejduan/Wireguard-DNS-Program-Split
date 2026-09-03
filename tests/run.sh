@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 "$repo_root/scripts/build-wsl.sh"
 
-for executable in dns-dispatcher dns-probe wfp-probe; do
+for executable in controller-service dns-dispatcher dns-probe wfp-probe; do
   "$repo_root/build/$executable.exe" --self-test
 done
 

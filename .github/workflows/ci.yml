@@ -21,6 +21,7 @@ jobs:
         shell: msys2 {0}
         run: |
           CXX=g++ ./scripts/build-wsl.sh
+          ./build/controller-service.exe --self-test
           ./build/dns-dispatcher.exe --self-test
           ./build/dns-probe.exe --self-test
           ./build/wfp-probe.exe --self-test

@@ -1,4 +1,4 @@
-param([switch] $SelfTest)
+param([switch] $SelfTest, [long] $StopEventHandle)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -79,27 +79,36 @@ function Test-StackPresent {
     $service = Get-Service -Name $configuration.ServiceName -ErrorAction SilentlyContinue
     if ($service -and $service.Status -ne 'Stopped') { return $true }
     if (Test-Path -LiteralPath (Join-Path $state 'dns-etw-session.txt') -PathType Leaf) { return $true }
+    if (Test-Path -LiteralPath (Join-Path $state 'endpoint-route.txt') -PathType Leaf) { return $true }
     if (Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
         Where-Object { Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $configuration.NrptDisplayName }) { return $true }
     return [bool]((Get-ExpectedProcesses 'dns-dispatcher' (Join-Path $root 'bin\dns-dispatcher.exe')) -or
         (Get-ExpectedProcesses 'wfp-probe' (Join-Path $root 'bin\wfp-probe.exe')))
 }
 
-function Stop-Stack([switch] $RestoreCache) {
+function Stop-Stack([switch] $RestoreCache, [switch] $ThrowOnFailure) {
+    $cleanupErrors = [Collections.Generic.List[string]]::new()
     $wfpStopped = $false
     try {
         Invoke-Component 'Invoke-WfpFilters.ps1' 'Stop'
         $wfpStopped = $true
-    } catch { Write-ControllerLog $_ }
+    } catch { $cleanupErrors.Add([string]$_); Write-ControllerLog $_ }
     if ($wfpStopped) {
-        try { Invoke-Component 'Invoke-LocalNrpt.ps1' 'Disable' } catch { Write-ControllerLog $_ }
+        try { Invoke-Component 'Invoke-LocalNrpt.ps1' 'Disable' }
+        catch { $cleanupErrors.Add([string]$_); Write-ControllerLog $_ }
     }
-    try { Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Stop' } catch { Write-ControllerLog $_ }
-    try { Invoke-Component 'Invoke-Tunnel.ps1' 'Stop' } catch { Write-ControllerLog $_ }
+    try { Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Stop' }
+    catch { $cleanupErrors.Add([string]$_); Write-ControllerLog $_ }
+    try { Invoke-Component 'Invoke-Tunnel.ps1' 'Stop' }
+    catch { $cleanupErrors.Add([string]$_); Write-ControllerLog $_ }
     if ($RestoreCache) {
-        try { Invoke-Component 'Invoke-DnsCachePolicy.ps1' 'Disable' } catch { Write-ControllerLog $_ }
+        try { Invoke-Component 'Invoke-DnsCachePolicy.ps1' 'Disable' }
+        catch { $cleanupErrors.Add([string]$_); Write-ControllerLog $_ }
     }
     Remove-Item -LiteralPath $activeFile -Force -ErrorAction SilentlyContinue
+    if ($ThrowOnFailure -and $cleanupErrors.Count) {
+        throw "Stack cleanup failed: $($cleanupErrors -join ' | ')"
+    }
 }
 
 function Test-TunnelDns([int] $TimeoutMilliseconds = 5000) {
@@ -154,6 +163,16 @@ function Test-StackHealth {
 function Invoke-Repair {
     if ((Get-Date) -lt $script:nextRepair) { return }
     try {
+        Get-ProgramSplitPhysicalDefault -AdapterName $configuration.AdapterName | Out-Null
+        $script:networkWaitLogged = $false
+    } catch {
+        if (-not $script:networkWaitLogged) {
+            Write-ControllerLog 'Waiting for a physical IPv4 default route.'
+            $script:networkWaitLogged = $true
+        }
+        return
+    }
+    try {
         Start-Stack
         $script:repairDelaySeconds = 2
         $script:nextRepair = [DateTime]::MinValue
@@ -183,7 +202,7 @@ function Start-Stack {
         Invoke-Component 'Invoke-PiaDriver.ps1' 'Install'
         Invoke-Component 'Invoke-Tunnel.ps1' 'Start'
         Wait-ProgramSplitProbe -Probe { Test-TunnelDns -TimeoutMilliseconds 750 } `
-            -TimeoutMilliseconds 8000 -RetryMilliseconds 250
+            -TimeoutMilliseconds 20000 -RetryMilliseconds 250
         Write-ControllerLog 'Starting DNS dispatcher.'
         Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Start'
         Write-ControllerLog 'Enabling local split-DNS NRPT rule.'
@@ -237,16 +256,36 @@ if ($SelfTest) { Write-Output 'PASS: controller inputs and include list.'; exit 
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $identity.IsSystem) { throw 'The controller must run as SYSTEM.' }
-$mutex = [Threading.Mutex]::new($false, 'Global\WireGuardProgramSplitController')
-if (-not $mutex.WaitOne(0)) { exit 0 }
+$mutex = $null
+if (-not $StopEventHandle) {
+    $mutex = [Threading.Mutex]::new($false, 'Global\WireGuardProgramSplitController')
+    if (-not $mutex.WaitOne(0)) { exit 0 }
+}
 
 [IO.Directory]::CreateDirectory($state) | Out-Null
 [IO.Directory]::CreateDirectory($logs) | Out-Null
 $lastHealth = [DateTime]::MinValue
 $nextRepair = [DateTime]::MinValue
 $repairDelaySeconds = 2
+$networkWaitLogged = $false
+$stopEvent = $null
 try {
+    if ($StopEventHandle) {
+        $stopEvent = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset)
+        $stopEvent.SafeWaitHandle = [Microsoft.Win32.SafeHandles.SafeWaitHandle]::new(
+            [IntPtr]$StopEventHandle, $true)
+    }
     while ($true) {
+        if ($stopEvent -and $stopEvent.WaitOne(0)) {
+            Write-ControllerLog 'Controller service stop requested.'
+            Stop-Stack -RestoreCache -ThrowOnFailure
+            if (Test-StackPresent) {
+                Write-ControllerLog 'Managed stack remains present; retrying service-stop cleanup.'
+                Start-Sleep -Seconds 1
+                continue
+            }
+            break
+        }
         $desired = Test-Path -LiteralPath $enabledFile -PathType Leaf
         if ($desired) {
             try { Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile }
@@ -257,7 +296,7 @@ try {
             }
         }
         if (-not $desired) {
-            if (Test-StackPresent) { Stop-Stack -RestoreCache }
+            if (Test-StackPresent) { Stop-Stack -RestoreCache -ThrowOnFailure }
             if (-not (Test-StackPresent)) {
                 if (-not (Test-Path -LiteralPath $stackStoppedFile -PathType Leaf)) {
                     try { [IO.File]::WriteAllText($stackStoppedFile, (Get-Date -Format o)) }
@@ -282,9 +321,13 @@ try {
             } catch { Stop-Stack; Invoke-Repair }
             $lastHealth = Get-Date
         }
-        Start-Sleep -Seconds 2
+        if ($stopEvent) { $null = $stopEvent.WaitOne(2000) }
+        else { Start-Sleep -Seconds 2 }
     }
 } finally {
-    $mutex.ReleaseMutex()
-    $mutex.Dispose()
+    if ($stopEvent) { $stopEvent.Dispose() }
+    if ($mutex) {
+        $mutex.ReleaseMutex()
+        $mutex.Dispose()
+    }
 }

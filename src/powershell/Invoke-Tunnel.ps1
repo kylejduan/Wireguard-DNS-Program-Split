@@ -79,7 +79,7 @@ Assert-Administrator
 if ($Action -eq 'Stop') {
     $serviceRecord = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
     if ($serviceRecord -and -not (Test-ProgramSplitServiceOwnership -Service $serviceRecord `
-            -HostPath $hostExe -ProfilePath $config)) {
+            -HostPath $hostExe -ArgumentPath $config)) {
         throw 'Refusing to stop a same-name foreign tunnel service.'
     }
     $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
@@ -137,7 +137,7 @@ if (-not $service) {
     if ($LASTEXITCODE -ne 0) { throw "Failed to create the tunnel service: $($createOutput -join ' ')" }
     & sc.exe sidtype $serviceName unrestricted | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to configure the tunnel service SID.' }
-} elseif (-not (Test-ProgramSplitServiceOwnership -Service $service -HostPath $hostExe -ProfilePath $config)) {
+} elseif (-not (Test-ProgramSplitServiceOwnership -Service $service -HostPath $hostExe -ArgumentPath $config)) {
     throw 'An unexpected service already uses the WireGuard Program Split tunnel name.'
 }
 
@@ -147,8 +147,8 @@ Add-ActiveRoute -prefix "$endpoint/32" -index $physical.InterfaceIndex -nextHop 
 [IO.Directory]::CreateDirectory((Split-Path -Parent $endpointState)) | Out-Null
 [IO.File]::WriteAllText($endpointState, $endpoint)
 $serviceState = Get-Service -Name $serviceName
-if ($serviceState.Status -ne 'Running') { Start-Service -Name $serviceName }
-(Get-Service -Name $serviceName).WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
+if ($serviceState.Status -eq 'Stopped') { Start-Service -Name $serviceName }
+$serviceState.WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
 $adapter = Wait-Adapter
 
 if (-not (Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -IPAddress $tunnelAddress -ErrorAction SilentlyContinue)) {

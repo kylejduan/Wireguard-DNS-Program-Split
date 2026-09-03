@@ -18,7 +18,8 @@ unlisted executable ────────────────────
 - `wfp-probe.exe` installs dynamic WFP filters for the exact executable paths in `included-apps.txt`. It supplies the tunnel IPv4 address to the signed PIA WFP callout.
 - `dns-dispatcher.exe` listens on loopback port 53. It owns a unique per-launch Microsoft-Windows-DNS-Client ETW session, resolves each event's process path, and binds the upstream query to either the physical or tunnel source address.
 - A narrowly owned NRPT `.` rule sends ordinary Windows resolver queries to the dispatcher.
-- `Controller.ps1`, running as SYSTEM, owns startup, recovery, and 30-second tunnel plus end-to-end split-DNS health checks.
+- `controller-service.exe` starts `Controller.ps1` as an automatic SYSTEM service, cooperates with ordered shutdown, and lets Service Control Manager restart a failed controller.
+- `Controller.ps1` owns startup, recovery, and 30-second tunnel plus end-to-end split-DNS health checks.
 - `Tray.ps1`, running as the interactive user, changes the desired state, executable list, and profile.
 
 ## Route invariant
@@ -37,4 +38,6 @@ Selected attribution takes precedence whenever it arrives before forwarding begi
 
 ## Startup
 
-The WireGuard tunnel service uses `Automatic` start so Service Control Manager can bring the adapter up early. The startup task adopts that service and polls tunnel DNS until the first successful answer instead of sleeping for a fixed delay. It then enables and validates the dispatcher and NRPT path before starting dynamic WFP filters. Every 30 seconds the controller rechecks NRPT conflicts, executable and port ownership, ETW-backed loopback DNS, tunnel DNS, and the physical interface snapshot; repeated failure restarts the stack with fresh values.
+The WireGuard tunnel and controller services use `Automatic` start. The controller waits for a physical IPv4 default route, adopts an early-started tunnel when available, and polls tunnel DNS until the first successful answer instead of sleeping for a fixed delay. It then enables and validates the dispatcher and NRPT path before starting dynamic WFP filters. Every 30 seconds the controller rechecks NRPT conflicts, executable and port ownership, ETW-backed loopback DNS, tunnel DNS, and the physical interface snapshot; repeated failure restarts the stack with fresh values.
+
+The controller service reports running as soon as supervision starts, so Service Control Manager is not held pending on network readiness. On service stop it gives ordered cleanup up to four minutes to remove WFP filters before NRPT and the remaining stack; a forced or failed stop is reported as a service failure. On an unexpected controller exit, SCM restarts supervision while the last-known-good dispatcher and WFP hosts remain available for validation or repair.

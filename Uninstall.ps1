@@ -12,7 +12,8 @@ if ($DestinationRoot -match '\s') { throw 'DestinationRoot cannot contain whites
 $plan = [pscustomobject]@{
     DestinationRoot = $DestinationRoot
     ServiceName = 'WireGuardTunnel$WireGuardSplit'
-    ControllerTask = 'WireGuard Program Split Controller'
+    ControllerServiceName = 'WireGuardProgramSplitController'
+    LegacyControllerTask = 'WireGuard Program Split Controller'
     TrayTask = 'WireGuard Program Split Tray'
     RemovePiaDriver = $false
 }
@@ -45,11 +46,11 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $taskScripts = @{
-    $plan.ControllerTask = Join-Path $fullRoot 'src\Controller.ps1'
+    $plan.LegacyControllerTask = Join-Path $fullRoot 'src\Controller.ps1'
     $plan.TrayTask = Join-Path $fullRoot 'src\Tray.ps1'
 }
 $ownedTasks = @{}
-foreach ($taskName in @($plan.ControllerTask, $plan.TrayTask)) {
+foreach ($taskName in @($plan.LegacyControllerTask, $plan.TrayTask)) {
     $task = Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
     if ($task -and -not (Test-ProgramSplitTaskOwnership -Task $task -PowerShellPath $powerShell `
             -ScriptPath $taskScripts[$taskName])) {
@@ -61,15 +62,45 @@ $hostExe = Join-Path $fullRoot 'bin\tunnel-host.exe'
 $profilePath = Join-Path $fullRoot 'profiles\WireGuardSplit.conf'
 $serviceRecord = Get-CimInstance Win32_Service -Filter "Name='$($plan.ServiceName)'" -ErrorAction SilentlyContinue
 if ($serviceRecord -and -not (Test-ProgramSplitServiceOwnership -Service $serviceRecord `
-        -HostPath $hostExe -ProfilePath $profilePath)) {
+        -HostPath $hostExe -ArgumentPath $profilePath)) {
     throw 'Refusing to remove a same-name foreign tunnel service.'
 }
+$controllerHost = Join-Path $fullRoot 'bin\controller-service.exe'
+$controllerScript = Join-Path $fullRoot 'src\Controller.ps1'
+$controllerServiceRecord = Get-CimInstance Win32_Service `
+    -Filter "Name='$($plan.ControllerServiceName)'" -ErrorAction SilentlyContinue
+if ($controllerServiceRecord -and -not (Test-ProgramSplitServiceOwnership `
+        -Service $controllerServiceRecord -HostPath $controllerHost -ArgumentPath $controllerScript)) {
+    throw 'Refusing to remove a same-name foreign controller service.'
+}
 
-foreach ($taskName in @($plan.ControllerTask, $plan.TrayTask)) {
+foreach ($taskName in @($plan.LegacyControllerTask, $plan.TrayTask)) {
     if ($ownedTasks.ContainsKey($taskName)) {
         Stop-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName $taskName -TaskPath '\' -Confirm:$false
     }
+}
+
+$controllerService = if ($controllerServiceRecord) {
+    Get-Service -Name $plan.ControllerServiceName -ErrorAction SilentlyContinue
+}
+if ($controllerServiceRecord) {
+    Set-Service -Name $plan.ControllerServiceName -StartupType Disabled
+    $recoveryOutput = & sc.exe failure $plan.ControllerServiceName 'reset=' '0' 'actions=' '""' 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to disable controller service recovery: $($recoveryOutput -join ' ')"
+    }
+    & sc.exe failureflag $plan.ControllerServiceName 0 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to disable controller non-crash recovery.' }
+}
+if ($controllerService -and $controllerService.Status -ne 'Stopped') {
+    try {
+        if ($controllerService.Status -ne 'StopPending') {
+            Stop-Service -Name $plan.ControllerServiceName -Force -ErrorAction Stop
+        }
+        $controllerService.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(250))
+        if ($controllerService.Status -ne 'Stopped') { throw 'The service did not report Stopped.' }
+    } catch { throw "Controller service stop failed: $($_.Exception.Message)" }
 }
 
 $errors = [Collections.Generic.List[string]]::new()
@@ -99,7 +130,14 @@ if ($serviceRecord) {
         try { Stop-Service -Name $plan.ServiceName -Force -ErrorAction Stop }
         catch { $errors.Add("Tunnel service stop failed: $($_.Exception.Message)") }
     }
-    if (-not $errors) {
+}
+
+if (-not $errors) {
+    if ($controllerServiceRecord) {
+        & sc.exe delete $plan.ControllerServiceName | Out-Null
+        if ($LASTEXITCODE -ne 0) { $errors.Add('Controller service deletion failed.') }
+    }
+    if ($serviceRecord) {
         & sc.exe delete $plan.ServiceName | Out-Null
         if ($LASTEXITCODE -ne 0) { $errors.Add('Tunnel service deletion failed.') }
     }
