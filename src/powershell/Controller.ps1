@@ -22,17 +22,31 @@ function Write-ControllerLog([string] $message) {
     Add-Content -LiteralPath $logFile -Value "$(Get-Date -Format o) $message"
 }
 
-function Invoke-Component([string] $name, [string] $action) {
+function Start-Component([string] $name, [string] $action) {
     $script = Join-Path $PSScriptRoot $name
     $key = [IO.Path]::GetFileNameWithoutExtension($name)
     $stdout = Join-Path $logs "$key-output.log"
     $stderr = Join-Path $logs "$key-error.log"
+    $timer = [Diagnostics.Stopwatch]::StartNew()
     $process = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script, '-Action', $action
     ) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
     # Materialize the process handle before it can exit. Windows PowerShell 5.1 otherwise
     # exposes a null ExitCode for short-lived children created with Start-Process.
     $null = $process.Handle
+    [pscustomobject]@{
+        Name = $name; Action = $action; Process = $process
+        Stdout = $stdout; Stderr = $stderr; Timer = $timer
+    }
+}
+
+function Complete-Component($component) {
+    $name = $component.Name
+    $action = $component.Action
+    $process = $component.Process
+    $stdout = $component.Stdout
+    $stderr = $component.Stderr
+    $timer = $component.Timer
     if (-not $process.WaitForExit(45000)) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         throw "$name $action timed out."
@@ -44,6 +58,15 @@ function Invoke-Component([string] $name, [string] $action) {
     if ($process.ExitCode -ne 0) { throw "$name $action exited with code $($process.ExitCode): $($errors -join ' ')" }
     if ($errors) { throw "$name $action failed: $($errors -join ' ')" }
     if ($output) { Write-ControllerLog ($output -join ' ') }
+    $timer.Stop()
+    try {
+        $elapsedMilliseconds = [long][Math]::Round(($process.ExitTime - $process.StartTime).TotalMilliseconds)
+    } catch { $elapsedMilliseconds = $timer.ElapsedMilliseconds }
+    Write-ControllerLog "$name $action completed in $elapsedMilliseconds ms."
+}
+
+function Invoke-Component([string] $name, [string] $action) {
+    Complete-Component (Start-Component -name $name -action $action)
 }
 
 function Get-ManagedProcess([string] $pidName, [string] $processName, [string] $expectedPath) {
@@ -165,6 +188,7 @@ function Invoke-Repair {
     try {
         Get-ProgramSplitPhysicalDefault -AdapterName $configuration.AdapterName | Out-Null
         $script:networkWaitLogged = $false
+        $script:networkRetryMilliseconds = 250
     } catch {
         if (-not $script:networkWaitLogged) {
             Write-ControllerLog 'Waiting for a physical IPv4 default route.'
@@ -182,7 +206,31 @@ function Invoke-Repair {
     }
 }
 
+function Test-DnsCachePolicyReady {
+    try {
+        if (-not (Test-Path -LiteralPath (Join-Path $state 'dnscache-policy-original.json') -PathType Leaf)) {
+            return $false
+        }
+        $key = Get-Item -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters'
+        $positiveTtl = $key.GetValue('MaxCacheTtl', $null)
+        $negativeTtl = $key.GetValue('MaxNegativeCacheTtl', $null)
+        return $null -ne $positiveTtl -and $null -ne $negativeTtl -and
+            [int]$positiveTtl -eq 1 -and [int]$negativeTtl -eq 0
+    } catch { return $false }
+}
+
+function Test-PiaDriverReady {
+    $driver = Get-Service -Name 'PiaWFPCallout' -ErrorAction SilentlyContinue
+    $driverRoot = Join-Path $root 'drivers\pia'
+    return $driver -and $driver.Status -eq 'Running' -and
+        [string]$driver.ServiceType -eq 'KernelDriver' -and
+        (Test-Path -LiteralPath (Join-Path $driverRoot 'PiaWFPCallout.inf') -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $driverRoot 'PiaWfpCallout.sys') -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $driverRoot 'piawfpcallout.cat') -PathType Leaf)
+}
+
 function Start-Stack {
+    $stackTimer = [Diagnostics.Stopwatch]::StartNew()
     $script:configuration = Get-ProgramSplitConfiguration -Root $root
     $dispatcherWasRunning = [bool](Get-ManagedProcess 'dns-dispatcher.pid' 'dns-dispatcher' `
         (Join-Path $root 'bin\dns-dispatcher.exe'))
@@ -198,13 +246,26 @@ function Start-Stack {
         }) {
             Invoke-Component 'Invoke-LocalNrpt.ps1' 'Disable'
         }
-        Invoke-Component 'Invoke-DnsCachePolicy.ps1' 'Enable'
-        Invoke-Component 'Invoke-PiaDriver.ps1' 'Install'
-        Invoke-Component 'Invoke-Tunnel.ps1' 'Start'
+        if (-not (Test-DnsCachePolicyReady)) { Invoke-Component 'Invoke-DnsCachePolicy.ps1' 'Enable' }
+        else { Write-ControllerLog 'DNS cache policy already ready; skipped repair.' }
+
+        $startupComponents = [Collections.Generic.List[object]]::new()
+        $startupFailures = [Collections.Generic.List[string]]::new()
+        try {
+            if (-not (Test-PiaDriverReady)) {
+                $startupComponents.Add((Start-Component 'Invoke-PiaDriver.ps1' 'Install'))
+            } else { Write-ControllerLog 'PIA WFP callout driver already running; skipped repair.' }
+            $startupComponents.Add((Start-Component 'Invoke-Tunnel.ps1' 'Start'))
+            Write-ControllerLog 'Starting DNS dispatcher.'
+            $startupComponents.Add((Start-Component 'Invoke-DnsDispatcher.ps1' 'Start'))
+        } catch { $startupFailures.Add([string]$_) }
+        foreach ($component in $startupComponents) {
+            try { Complete-Component $component }
+            catch { $startupFailures.Add([string]$_) }
+        }
+        if ($startupFailures.Count) { throw "Parallel startup failed: $($startupFailures -join ' | ')" }
         Wait-ProgramSplitProbe -Probe { Test-TunnelDns -TimeoutMilliseconds 750 } `
             -TimeoutMilliseconds 20000 -RetryMilliseconds 250
-        Write-ControllerLog 'Starting DNS dispatcher.'
-        Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Start'
         Write-ControllerLog 'Enabling local split-DNS NRPT rule.'
         Invoke-Component 'Invoke-LocalNrpt.ps1' 'Enable'
         if ($dispatcherWasRunning) {
@@ -215,7 +276,8 @@ function Start-Stack {
         $activeAt = Get-Date
         [IO.File]::WriteAllText($activeFile, $activeAt.ToString('o'))
         Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
-        Write-ControllerLog 'Stack active after tunnel readiness check.'
+        $stackTimer.Stop()
+        Write-ControllerLog "Stack active after tunnel readiness check in $($stackTimer.ElapsedMilliseconds) ms."
         try {
             $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
             if (($activeAt - $boot).TotalMinutes -le 10) {
@@ -268,6 +330,7 @@ $lastHealth = [DateTime]::MinValue
 $nextRepair = [DateTime]::MinValue
 $repairDelaySeconds = 2
 $networkWaitLogged = $false
+$networkRetryMilliseconds = 250
 $stopEvent = $null
 try {
     if ($StopEventHandle) {
@@ -321,8 +384,14 @@ try {
             } catch { Stop-Stack; Invoke-Repair }
             $lastHealth = Get-Date
         }
-        if ($stopEvent) { $null = $stopEvent.WaitOne(2000) }
-        else { Start-Sleep -Seconds 2 }
+        $loopWaitMilliseconds = if ($desired -and $script:networkWaitLogged) {
+            $script:networkRetryMilliseconds
+        } else { 2000 }
+        if ($desired -and $script:networkWaitLogged) {
+            $script:networkRetryMilliseconds = [Math]::Min(2000, $script:networkRetryMilliseconds * 2)
+        }
+        if ($stopEvent) { $null = $stopEvent.WaitOne($loopWaitMilliseconds) }
+        else { Start-Sleep -Milliseconds $loopWaitMilliseconds }
     }
 } finally {
     if ($stopEvent) { $stopEvent.Dispose() }

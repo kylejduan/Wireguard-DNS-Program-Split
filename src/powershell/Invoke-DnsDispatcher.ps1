@@ -196,6 +196,8 @@ $arguments = @($IncludedAppsFile, $source, $resolver, $configuration.TunnelAddre
 $process = $null
 $started = $false
 try {
+    [IO.File]::WriteAllText($stdout, '')
+    [IO.File]::WriteAllText($stderr, '')
     $process = Start-Process -FilePath $exe -ArgumentList $arguments -RedirectStandardOutput $stdout `
         -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
     [IO.File]::WriteAllText($pidFile, [string]$process.Id)
@@ -203,11 +205,7 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
         if ($process.HasExited) { throw "DNS dispatcher exited: $([IO.File]::ReadAllText($stderr))" }
-        $udpEndpoint = Get-NetUDPEndpoint -LocalAddress '127.0.0.1' -LocalPort 53 -ErrorAction SilentlyContinue |
-            Where-Object { $_.OwningProcess -eq $process.Id }
-        $tcpEndpoint = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 53 -State Listen -ErrorAction SilentlyContinue |
-            Where-Object { $_.OwningProcess -eq $process.Id }
-        if ($udpEndpoint -and $tcpEndpoint) {
+        if ((Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue) -match '^READY:') {
             $started = $true
             Write-Output "DNS dispatcher ready for $($includedPaths.Count) included application(s)."
             exit 0
