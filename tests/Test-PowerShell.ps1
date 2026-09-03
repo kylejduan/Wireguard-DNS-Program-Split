@@ -27,8 +27,38 @@ Assert-True ($dnsCacheSource -match 'Failed to restore DNS cache policy value') 
 $controllerSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Controller.ps1'))
 Assert-True ($controllerSource -match '(?s)\.Handle.*?WaitForExit\(45000\).*?WaitForExit\(\).*?\.ExitCode') `
     'controller retains the child handle and finalizes its wait before reading ExitCode'
+Assert-True ($controllerSource -match '(?s)function Invoke-Component.*?Start-Component.*?Complete-Component') `
+    'ordinary component calls retain the isolated start-and-complete path'
 Assert-True ($controllerSource -notmatch 'Start-Sleep -Seconds 2\s+Test-TunnelDns') `
     'controller startup has no fixed pre-probe sleep'
+Assert-True ($controllerSource -match 'function Test-DnsCachePolicyReady' -and
+    $controllerSource -match "(?s)if \(-not \(Test-DnsCachePolicyReady\)\).*?Invoke-Component 'Invoke-DnsCachePolicy\.ps1' 'Enable'") `
+    'controller skips DNS cache repair only when persisted policy state is already ready'
+$cacheReadySource = $controllerSource.Substring(
+    $controllerSource.IndexOf('function Test-DnsCachePolicyReady'),
+    $controllerSource.IndexOf('function Test-PiaDriverReady') -
+        $controllerSource.IndexOf('function Test-DnsCachePolicyReady'))
+Assert-True ($cacheReadySource -match 'dnscache-policy-original\.json.*?-PathType Leaf' -and
+    $cacheReadySource -match '\$null -ne \$positiveTtl' -and
+    $cacheReadySource -match '\$null -ne \$negativeTtl' -and
+    $cacheReadySource -match '\[int\]\$positiveTtl -eq 1' -and
+    $cacheReadySource -match '\[int\]\$negativeTtl -eq 0') `
+    'DNS cache fast path requires recovery state and both exact non-null policy values'
+Assert-True ($controllerSource -match '(?s)function Test-PiaDriverReady.*?Get-Service -Name ''PiaWFPCallout''.*?Status -eq ''Running''' -and
+    $controllerSource -match "(?s)if \(-not \(Test-PiaDriverReady\)\).*?Start-Component 'Invoke-PiaDriver\.ps1' 'Install'") `
+    'controller skips PIA driver setup only when the driver is already running'
+$piaReadySource = $controllerSource.Substring(
+    $controllerSource.IndexOf('function Test-PiaDriverReady'),
+    $controllerSource.IndexOf('function Start-Stack') -
+        $controllerSource.IndexOf('function Test-PiaDriverReady'))
+Assert-True ($piaReadySource -match 'ServiceType.*?KernelDriver' -and
+    $piaReadySource -match 'PiaWFPCallout\.inf' -and $piaReadySource -match 'PiaWfpCallout\.sys' -and
+    $piaReadySource -match 'piawfpcallout\.cat') `
+    'PIA fast path requires the kernel driver type and installed package files'
+Assert-True ($controllerSource -match '(?s)\.ExitTime.*?\.StartTime.*?completed in \$elapsedMilliseconds ms') `
+    'controller records each parallel child process actual runtime instead of queueing delay'
+Assert-True ($controllerSource -match 'Stack active after tunnel readiness check in \$\(\$stackTimer\.ElapsedMilliseconds\) ms') `
+    'controller records total stack startup timing'
 $stopStack = $controllerSource.IndexOf('function Stop-Stack')
 $stopWfp = $controllerSource.IndexOf("Invoke-Component 'Invoke-WfpFilters.ps1' 'Stop'", $stopStack)
 $stopNrpt = $controllerSource.IndexOf("Invoke-Component 'Invoke-LocalNrpt.ps1' 'Disable'", $stopStack)
@@ -46,6 +76,16 @@ $startStackSource = $controllerSource.Substring(
     $controllerSource.IndexOf('$required = @(') - $controllerSource.IndexOf('function Start-Stack'))
 Assert-True ($startStackSource -match '(?s)if \(\$dispatcherWasRunning\).*?Invoke-Component ''Invoke-DnsDispatcher\.ps1'' ''Validate''.*?else \{ Test-LocalDns \}') `
     'fresh startup uses the native DNS gate while an adopted dispatcher receives full validation'
+$tunnelParallelStart = $startStackSource.IndexOf("Start-Component 'Invoke-Tunnel.ps1' 'Start'")
+$dispatcherParallelStart = $startStackSource.IndexOf("Start-Component 'Invoke-DnsDispatcher.ps1' 'Start'")
+$parallelCompletion = $startStackSource.IndexOf('Complete-Component', [Math]::Max($tunnelParallelStart, $dispatcherParallelStart))
+$tunnelReadiness = $startStackSource.IndexOf('Wait-ProgramSplitProbe', $parallelCompletion)
+Assert-True ($tunnelParallelStart -ge 0 -and $dispatcherParallelStart -ge 0 -and
+    $parallelCompletion -gt $tunnelParallelStart -and $parallelCompletion -gt $dispatcherParallelStart -and
+    $tunnelReadiness -gt $parallelCompletion) `
+    'controller overlaps independent tunnel and dispatcher startup before enforcing tunnel readiness'
+Assert-True ($startStackSource -match '(?s)startupFailures.*?foreach \(\$component in \$startupComponents\).*?Complete-Component.*?if \(\$startupFailures\.Count\).*?throw') `
+    'parallel startup drains every launched component before propagating a failure'
 Assert-True ($controllerSource -match '(?s)\$wfpStopped\s*=.*?if \(\$wfpStopped\).*?Invoke-LocalNrpt') `
     'controller does not restore direct DNS after a WFP-stop failure'
 Assert-True ($controllerSource -match 'Test-Path -LiteralPath \$activeFile -PathType Leaf') `
@@ -67,6 +107,12 @@ Assert-True ($controllerSource -match '(?s)if \(-not \$StopEventHandle\).*?Globa
     'service-mode controller relies on SCM ownership instead of a spoofable global mutex'
 Assert-True ($controllerSource -match '(?s)Get-ProgramSplitPhysicalDefault.*?catch \{.*?return.*?Start-Stack') `
     'controller waits for a physical default route without entering repair backoff'
+Assert-True ($controllerSource -match '\$networkRetryMilliseconds\s*=\s*250' -and
+    $controllerSource -match '(?s)\$loopWaitMilliseconds\s*=\s*if \(\$desired -and \$script:networkWaitLogged\).*?\$script:networkRetryMilliseconds.*?2000' -and
+    $controllerSource -match '\[Math\]::Min\(2000, \$script:networkRetryMilliseconds \* 2\)' -and
+    $controllerSource -match 'WaitOne\(\$loopWaitMilliseconds\)' -and
+    $controllerSource -match 'Start-Sleep -Milliseconds \$loopWaitMilliseconds') `
+    'controller checks network readiness quickly with bounded backoff only while waiting for the physical route'
 
 $probeOut = Join-Path ([IO.Path]::GetTempPath()) "wgps-exit-$([guid]::NewGuid()).out"
 $probeError = "$probeOut.err"
@@ -262,6 +308,23 @@ try {
         'dispatcher validation probes the Windows DNS Client path'
     Assert-True ($dispatcherScriptSource -match 'Get-ExpectedProcesses') `
         'dispatcher can recover an exact-path child after PID-state loss'
+    $dispatcherValidateStart = $dispatcherScriptSource.IndexOf("if (`$Action -eq 'Validate')")
+    $dispatcherValidateEnd = $dispatcherScriptSource.IndexOf('$componentMutex =', $dispatcherValidateStart)
+    $dispatcherValidateSource = $dispatcherScriptSource.Substring(
+        $dispatcherValidateStart, $dispatcherValidateEnd - $dispatcherValidateStart)
+    $dispatcherStartSource = $dispatcherScriptSource.Substring(
+        $dispatcherScriptSource.IndexOf('$process = $null'))
+    Assert-True ($dispatcherValidateSource -match 'Get-NetUDPEndpoint' -and
+        $dispatcherValidateSource -match 'Get-NetTCPConnection') `
+        'dispatcher health validation retains independent socket ownership checks'
+    Assert-True ($dispatcherStartSource -match "\^READY:" -and
+        $dispatcherStartSource -notmatch 'Get-NetUDPEndpoint|Get-NetTCPConnection') `
+        'dispatcher startup uses its flushed native readiness signal without slow endpoint cmdlets'
+    $clearIndex = $dispatcherStartSource.IndexOf('[IO.File]::WriteAllText($stdout')
+    $startIndex = $dispatcherStartSource.IndexOf('Start-Process')
+    $pollIndex = $dispatcherStartSource.IndexOf("-match '^READY:'")
+    Assert-True ($clearIndex -ge 0 -and $startIndex -gt $clearIndex -and $pollIndex -gt $startIndex) `
+        'dispatcher clears stale readiness output before launch and polling'
     $wfpScriptSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Invoke-WfpFilters.ps1'))
     Assert-True ($wfpScriptSource -match 'Get-ExpectedProcesses') `
         'WFP cleanup can recover exact-path filter hosts after PID-state loss'
@@ -273,6 +336,12 @@ try {
     Assert-True ($nativeProbeSource -match 'peer\.sin_addr\.s_addr' -and
         $nativeProbeSource -match 'response\[3\].*0x0f') `
         'raw tunnel readiness rejects foreign-source and DNS-error responses'
+    $nativeDispatcherSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\native\dns-dispatcher.cpp'))
+    $listenIndex = $nativeDispatcherSource.IndexOf('listen(gTcpListener')
+    $readyIndex = $nativeDispatcherSource.IndexOf('READY: ETW split-DNS dispatcher')
+    $flushIndex = $nativeDispatcherSource.IndexOf('std::wcout.flush()', $readyIndex)
+    Assert-True ($listenIndex -ge 0 -and $readyIndex -gt $listenIndex -and $flushIndex -gt $readyIndex) `
+        'native dispatcher flushes READY only after UDP/TCP bind and TCP listen succeed'
     $buildSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'scripts\build-wsl.sh'))
     Assert-True ($buildSource -match 'dns-probe\.exe.*-ldnsapi') 'native DNS probe links the Windows DNS API'
     Assert-True ($buildSource -match 'controller-service\.exe') 'build includes the native controller service host'
