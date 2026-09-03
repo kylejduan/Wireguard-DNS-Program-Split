@@ -205,7 +205,7 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
         if ($process.HasExited) { throw "DNS dispatcher exited: $([IO.File]::ReadAllText($stderr))" }
-        if ((Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue) -match '^READY:') {
+        if ((Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue) -match '(?m)^READY:') {
             $started = $true
             Write-Output "DNS dispatcher ready for $($includedPaths.Count) included application(s)."
             exit 0

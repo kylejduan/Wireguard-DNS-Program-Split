@@ -741,9 +741,9 @@ int wmain(int argc, wchar_t** argv) {
             listen(gTcpListener, SOMAXCONN) == SOCKET_ERROR) {
             throw std::runtime_error("Cannot bind local DNS port 53");
         }
-        std::wcout << L"READY: ETW split-DNS dispatcher on 127.0.0.1:53 (UDP/TCP), apps="
-                   << includedCount << L", qpc-frequency=" << trace.frequency() << L"\n";
-        std::wcout.flush();
+        logLine(L"READY: ETW split-DNS dispatcher on 127.0.0.1:53 (UDP/TCP), apps=" +
+                    std::to_wstring(includedCount) + L", qpc-frequency=" +
+                    std::to_wstring(trace.frequency()), true);
 
         std::thread tcpAcceptor([&] {
             while (gRunning) {

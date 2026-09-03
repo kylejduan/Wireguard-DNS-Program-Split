@@ -119,6 +119,25 @@ function Wait-ProgramSplitProbe {
     }
 }
 
+function Assert-ProgramSplitNoIpv6DefaultRoute {
+    if (Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -PolicyStore ActiveStore `
+        -ErrorAction SilentlyContinue) {
+        throw 'An IPv6 default route is active; this IPv4-only release refuses partial routing.'
+    }
+}
+
+function Test-ProgramSplitEndpointRouteOwnership {
+    param(
+        [Parameter(Mandatory)] $Route,
+        [Parameter(Mandatory)] $State
+    )
+
+    return [string] $Route.DestinationPrefix -eq [string] $State.DestinationPrefix -and
+        [uint32] $Route.InterfaceIndex -eq [uint32] $State.InterfaceIndex -and
+        [string] $Route.NextHop -eq [string] $State.NextHop -and
+        [uint16] $Route.RouteMetric -eq [uint16] $State.RouteMetric
+}
+
 function Assert-ProgramSplitInstallNamesAvailable {
     param($Tasks, $Services)
 

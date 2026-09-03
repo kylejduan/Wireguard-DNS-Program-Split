@@ -178,6 +178,7 @@ function Test-LocalDns {
 }
 
 function Test-StackHealth {
+    Assert-ProgramSplitNoIpv6DefaultRoute
     Invoke-Component 'Invoke-LocalNrpt.ps1' 'Validate'
     Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Validate'
     Test-TunnelDns -TimeoutMilliseconds 1000
@@ -238,6 +239,7 @@ function Start-Stack {
     Remove-Item -LiteralPath $activeFile -Force -ErrorAction SilentlyContinue
     try {
         Write-ControllerLog 'Starting stack.'
+        Assert-ProgramSplitNoIpv6DefaultRoute
         if (Get-ExpectedProcesses 'wfp-probe' (Join-Path $root 'bin\wfp-probe.exe')) {
             Invoke-Component 'Invoke-WfpFilters.ps1' 'Stop'
         }

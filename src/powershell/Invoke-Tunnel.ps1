@@ -59,6 +59,53 @@ function Add-ActiveRoute([string] $prefix, [uint32] $index, [string] $nextHop, [
     }
 }
 
+function Read-OwnedEndpointRouteState {
+    if (-not (Test-Path -LiteralPath $endpointState -PathType Leaf)) { return $null }
+    try {
+        $saved = Get-Content -LiteralPath $endpointState -Raw | ConvertFrom-Json
+        $address = ([string] $saved.DestinationPrefix) -replace '/32$', ''
+        $parsedAddress = $null
+        $parsedNextHop = $null
+        if ([int] $saved.Schema -ne 1 -or [string] $saved.DestinationPrefix -ne "$address/32" -or
+            -not [Net.IPAddress]::TryParse($address, [ref] $parsedAddress) -or
+            $parsedAddress.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or
+            -not [Net.IPAddress]::TryParse([string] $saved.NextHop, [ref] $parsedNextHop) -or
+            $parsedNextHop.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or
+            [uint32] $saved.InterfaceIndex -eq 0 -or [uint16] $saved.RouteMetric -ne 1) { return $null }
+        return [pscustomobject]@{
+            DestinationPrefix = "$address/32"
+            InterfaceIndex = [uint32] $saved.InterfaceIndex
+            NextHop = $parsedNextHop.IPAddressToString
+            RouteMetric = [uint16] $saved.RouteMetric
+        }
+    } catch { return $null }
+}
+
+function Remove-OwnedEndpointRoute {
+    $hadState = Test-Path -LiteralPath $endpointState -PathType Leaf
+    $saved = Read-OwnedEndpointRouteState
+    if ($hadState -and -not $saved) {
+        Write-Output 'Ignored legacy or invalid endpoint-route state; no route was removed.'
+    }
+    if ($saved) {
+        Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $saved.DestinationPrefix `
+            -InterfaceIndex $saved.InterfaceIndex -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+            Where-Object { Test-ProgramSplitEndpointRouteOwnership -Route $_ -State $saved } |
+            Remove-NetRoute -Confirm:$false
+    }
+    if ($hadState) { [IO.File]::Delete($endpointState) }
+}
+
+function Set-OwnedEndpointRouteState($routeState) {
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $endpointState)) | Out-Null
+    $temporary = "$endpointState.$PID.tmp"
+    try {
+        [IO.File]::WriteAllText($temporary, ($routeState | ConvertTo-Json -Compress),
+            [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $endpointState -Force
+    } finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+}
+
 $endpointHost = Assert-Inputs
 if ($Action -eq 'Validate') {
     Write-Output 'PASS: tunnel host and DNS-free Table=off profile are ready.'
@@ -88,26 +135,12 @@ if ($Action -eq 'Stop') {
         $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
     }
     if ($service) { Set-Service -Name $serviceName -StartupType Manual }
-    if (Test-Path -LiteralPath $endpointState -PathType Leaf) {
-        $previousEndpoint = [IO.File]::ReadAllText($endpointState).Trim()
-        $parsedEndpoint = $null
-        if ([Net.IPAddress]::TryParse($previousEndpoint, [ref] $parsedEndpoint) -and
-            $parsedEndpoint.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
-            Get-NetRoute -AddressFamily IPv4 -DestinationPrefix "$previousEndpoint/32" `
-                -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
-                Where-Object { $_.InterfaceAlias -ne $adapterName -and $_.RouteMetric -eq 1 } |
-                Remove-NetRoute -Confirm:$false
-        }
-        [IO.File]::Delete($endpointState)
-    }
+    Remove-OwnedEndpointRoute
     Write-Output 'Tunnel stopped; active-store tunnel routes were removed with the adapter.'
     exit 0
 }
 
-if (Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -PolicyStore ActiveStore `
-    -ErrorAction SilentlyContinue) {
-    throw 'An IPv6 default route is active; this IPv4-only release refuses partial routing.'
-}
+Assert-ProgramSplitNoIpv6DefaultRoute
 if (Get-DnsClientNrptPolicy -Effective | Where-Object { $_.Namespace -contains '.' }) {
     throw 'A foreign catch-all NRPT policy is active; disconnect the other VPN first.'
 }
@@ -120,15 +153,22 @@ if ([Net.IPAddress]::TryParse($endpointHost, [ref]$endpointIp) -and $endpointIp.
     $endpoint = (Resolve-DnsName -Name $endpointHost -Type A -ErrorAction Stop | Select-Object -First 1 -ExpandProperty IPAddress)
 }
 
-if (Test-Path -LiteralPath $endpointState -PathType Leaf) {
-    $previousEndpoint = [IO.File]::ReadAllText($endpointState).Trim()
-    if ($previousEndpoint -match '^\d{1,3}(\.\d{1,3}){3}$' -and $previousEndpoint -ne $endpoint) {
-        Get-NetRoute -AddressFamily IPv4 -DestinationPrefix "$previousEndpoint/32" `
-            -InterfaceIndex $physical.InterfaceIndex -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
-            Where-Object { $_.NextHop -eq $physical.NextHop -and $_.RouteMetric -eq 1 } |
-            Remove-NetRoute -Confirm:$false
-    }
+$routeState = [ordered]@{
+    Schema = 1
+    DestinationPrefix = "$endpoint/32"
+    InterfaceIndex = [uint32] $physical.InterfaceIndex
+    NextHop = [string] $physical.NextHop
+    RouteMetric = 1
 }
+$savedRouteState = Read-OwnedEndpointRouteState
+$ownedEndpointRoute = if ($savedRouteState -and
+    (Test-ProgramSplitEndpointRouteOwnership -Route $routeState -State $savedRouteState)) {
+    Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $savedRouteState.DestinationPrefix `
+        -InterfaceIndex $savedRouteState.InterfaceIndex -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+        Where-Object { Test-ProgramSplitEndpointRouteOwnership -Route $_ -State $savedRouteState } |
+        Select-Object -First 1
+}
+if (-not $ownedEndpointRoute) { Remove-OwnedEndpointRoute }
 
 $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
 $expectedCommand = '{0} /service {1}' -f $hostExe, $config
@@ -143,9 +183,22 @@ if (-not $service) {
 
 Set-Service -Name $serviceName -StartupType Automatic
 
-Add-ActiveRoute -prefix "$endpoint/32" -index $physical.InterfaceIndex -nextHop $physical.NextHop -metric 1
-[IO.Directory]::CreateDirectory((Split-Path -Parent $endpointState)) | Out-Null
-[IO.File]::WriteAllText($endpointState, $endpoint)
+$existingEndpointRoute = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix "$endpoint/32" `
+    -InterfaceIndex $physical.InterfaceIndex -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+    Where-Object { $_.NextHop -eq $physical.NextHop } | Select-Object -First 1
+if (-not $existingEndpointRoute) {
+    Set-OwnedEndpointRouteState $routeState
+    try {
+        New-NetRoute -AddressFamily IPv4 -DestinationPrefix $routeState.DestinationPrefix `
+            -InterfaceIndex $routeState.InterfaceIndex -NextHop $routeState.NextHop `
+            -RouteMetric $routeState.RouteMetric -PolicyStore ActiveStore | Out-Null
+    } catch {
+        $failure = $_
+        try { [IO.File]::Delete($endpointState) }
+        catch { throw "$($failure.Exception.Message) Endpoint-route ownership state cleanup also failed: $($_.Exception.Message)" }
+        throw $failure
+    }
+}
 $serviceState = Get-Service -Name $serviceName
 if ($serviceState.Status -eq 'Stopped') { Start-Service -Name $serviceName }
 $serviceState.WaitForStatus('Running', [TimeSpan]::FromSeconds(20))

@@ -1,6 +1,6 @@
 # Limitations
 
-- IPv4 only. A host with working IPv6 can leak selected-process IPv6 on the physical path. Do not deploy until the host has no usable IPv6 default route, or add separately audited per-application IPv6 blocking.
+- IPv4 only. A host with working IPv6 can leak selected-process IPv6 on the physical path. Startup rejects an IPv6 default route and health checks stop the stack if one later appears, but up to one health interval can elapse. Do not deploy until the host has no usable IPv6 default route, or add separately audited per-application IPv6 blocking.
 - Ordinary Windows DNS only. Application-owned DoH, DoT, DoQ, raw DNS sockets, and hard-coded IP addresses are payload traffic; they are not rewritten to the profile DNS.
 - Exact executable paths only. Child, helper, service, launcher, and updater processes require their own entries.
 - Existing sockets keep their route until closed.

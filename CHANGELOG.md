@@ -10,6 +10,7 @@
 - Reject duplicate WireGuard sections/required fields, invalid keys, and invalid endpoint ports.
 - Preserve raw ETW performance-counter timestamps and flush actionable DNS failure diagnostics.
 - Serialize installs and remove exact-owned profile staging left by interrupted runs.
+- Serialize the dispatcher readiness message, detect late IPv6 defaults, and remove only exact-owned endpoint routes.
 
 ## 0.1.0 - 2026-09-02
 
