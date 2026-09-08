@@ -119,7 +119,7 @@ std::wstring processPath(DWORD pid) {
     std::wstring path = canonicalPath(std::wstring(buffer.data(), size));
     {
         std::lock_guard lock(gProcessCacheMutex);
-        // ponytail: a bounded reset is enough; use lifecycle notifications only if this host
+        // a bounded reset is enough; use lifecycle notifications only if this host
         // ever sustains thousands of distinct processes between dispatcher restarts.
         if (gProcessCache.size() >= 2048) gProcessCache.clear();
         gProcessCache[pid] = CachedProcess{createdValue.QuadPart, path};
