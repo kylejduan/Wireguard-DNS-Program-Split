@@ -56,6 +56,16 @@ CPP
     native_fixture=$(mktemp -d "$repo/build/linux/path-fixture.XXXXXX")
     trap 'rm -rf -- "$native_fixture"' EXIT
     "$repo/build/linux/path-key-test" "$native_fixture" "$probe"
+    cc -O2 -std=c11 -Wall -Wextra -Werror \
+        "$repo/tests/linux/probe_exec.c" -o "$repo/build/linux/probe_exec"
+    "$repo/build/linux/probe_exec" "$probe" > "$native_fixture/exec.txt"
+    python3 - "$native_fixture/exec.txt" <<'PY'
+import pathlib, re, sys
+output = pathlib.Path(sys.argv[1]).read_text()
+assert re.findall(r'mark=(0x[0-9a-f]+)', output) == ['0x00000000'] * 3, output
+assert 'launcher_before' in output and 'launcher_after' in output and 'exe=' in output
+print('PASS: native launcher observes its own and execed helper sockets without setting marks')
+PY
     python3 - "$probe" <<'PY'
 import socket, subprocess, sys, threading
 with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as receiver, \
@@ -308,6 +318,31 @@ char LICENSE[] SEC("license") = "GPL";
     # coverage. A static fixture avoids any dynamic-loader dependencies in jail.
     static = evidence/'static-probe'
     command(['cc','-static','-O2','-pthread',repo/'tests/linux/probe_socket.c','-o',static])
+    probe(static,expected='0x00000000'); add(static); probe(static)
+    for mode, server in (('tcp',servers[0]), ('udp',servers[1]), ('udp-connected',servers[1])):
+        output = probe(static,mode,('127.0.0.1',str(server.getsockname()[1])))
+        (evidence/f'static-{mode}.txt').write_text(output)
+    delete(static); probe(static,expected='0x00000000')
+    passed('static ELF independent inclusion and first TCP/UDP/connected-UDP traffic')
+
+    launcher, helper = evidence/'launcher', evidence/'helper'
+    command(['cc','-O2','-std=c11','-Wall','-Wextra','-Werror',
+             repo/'tests/linux/probe_exec.c','-o',launcher])
+    shutil.copy2(direct,helper)
+    helper_rows=[]
+    for action, parent_mark, helper_mark in (
+            (None,'0x00000000','0x00000000'),
+            (lambda:add(launcher),mark,'0x00000000'),
+            (lambda:add(helper),mark,mark),
+            (lambda:delete(launcher),'0x00000000',mark),
+            (lambda:delete(helper),'0x00000000','0x00000000')):
+        if action: action()
+        output=command([launcher,helper],scoped=True).stdout
+        assert re.findall(r'mark=(0x[0-9a-f]+)',output)==[parent_mark,helper_mark,parent_mark],output
+        assert 'exe='+str(helper) in output,output
+        helper_rows.append(output)
+    (evidence/'helper-launches.txt').write_text(''.join(helper_rows))
+    passed('fork-exec helper needs its own entry; parent and helper enrollment remain independent')
     jail=evidence/'jail'; jail.mkdir()
     jail_image=jail/str(included).lstrip('/'); jail_image.parent.mkdir(parents=True)
     shutil.copy2(static,jail_image)
