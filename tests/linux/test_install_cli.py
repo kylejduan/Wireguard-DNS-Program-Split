@@ -43,6 +43,39 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(set(result['removed']), ALLOWED)
         self.assertEqual((self.root / 'etc/wg-program-split/profile.conf').read_text(), self.profile)
 
+    def test_include_list_reads_stored_keys_inactive_without_runtime_side_effects(self):
+        from wg_program_split import cli
+        from wg_program_split.controller import Controller, Paths
+        self.deploy()
+        config = self.root / 'etc/wg-program-split'
+        keys = ['/missing/program', '/raw-byte-\udcff']
+        (config / 'settings.json').write_text(json.dumps({'schema_version': 1, 'included_executables': keys}))
+        (config / 'profile.conf').unlink()  # Listing configured paths does not need a VPN profile.
+        state = self.root / 'run/wg-program-split'
+        controller = Controller(paths=Paths(config=config, state=state, pins=self.root / 'pins'),
+                                owner_uid=os.getuid())
+        before = {str(p): (p.lstat().st_ino, p.lstat().st_mtime_ns) for p in self.root.rglob('*')}
+        with mock.patch('wg_program_split.controller.Controller', return_value=controller), \
+                mock.patch.object(cli.subprocess, 'run', side_effect=AssertionError('listing must not launch services')), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cli.main(['include', 'list']), 0)
+        self.assertEqual(json.loads(output.getvalue()), {'mode': 'include', 'source': 'configured',
+            'live_enforcement': 'not_checked', 'included_executables': keys})
+        self.assertEqual(before, {str(p): (p.lstat().st_ino, p.lstat().st_mtime_ns) for p in self.root.rglob('*')})
+        self.assertFalse(state.exists())
+
+    def test_include_list_rejects_untrusted_settings_without_creating_state(self):
+        from wg_program_split.controller import Controller, Paths
+        self.deploy()
+        config, state = self.root / 'etc/wg-program-split', self.root / 'run/wg-program-split'
+        controller = Controller(paths=Paths(config=config, state=state), owner_uid=os.getuid())
+        settings = config / 'settings.json'
+        settings.unlink()
+        settings.symlink_to(config / 'profile.conf')
+        with self.assertRaises(RuntimeError):
+            controller.include_list()
+        self.assertFalse(state.exists())
+
     def test_modified_and_replaced_files_are_retained(self):
         self.deploy()
         path = self.root / 'usr/lib/wg-program-split/bpf-loader'
