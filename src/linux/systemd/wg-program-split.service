@@ -1,0 +1,20 @@
+[Unit]
+Description=WireGuard executable include-mode controller
+Requires=wg-program-split-guard.service
+After=wg-program-split-guard.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/wg-program-split daemon
+Restart=on-failure
+RestartSec=5
+UMask=0077
+RuntimeDirectory=wg-program-split
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+TimeoutStopSec=40
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
