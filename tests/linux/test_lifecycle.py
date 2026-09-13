@@ -316,6 +316,48 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.controller.check()['state'], 'ready')
         self.assertNotIn('state-blocked', self.kernel.events)
 
+    def test_empty_restart_details_need_no_scan_and_preserve_sticky_uncertainty(self):
+        for unresolved in (False, True):
+            with self.subTest(unresolved=unresolved):
+                self.processes = []
+                self.controller.activate()
+                path = self.paths.state / 'controller.json'
+                journal = json.loads(path.read_text())
+                journal['restart_boundary_unresolved'] = unresolved
+                path.write_text(json.dumps(journal))
+                with patch.object(self.controller, 'processes', side_effect=RuntimeError('scan not required')):
+                    result = self.controller.check()
+                self.assertEqual(result['state'], 'ready')
+                self.assertEqual(result['restart_boundary_unresolved'], unresolved)
+                self.assertEqual(result['protection_verified'], not unresolved)
+
+    def test_guard_state_change_during_live_probe_cannot_pass_ready_readback(self):
+        self.processes = []
+        self.controller.activate()
+        def probe(*_):
+            self.kernel.state = 'blocked'
+            return {'dns': True, 'handshake_recent': True}
+        self.controller.probe = probe
+        result = self.controller.check()
+        self.assertEqual(result['state'], 'degraded')
+        self.assertEqual(self.kernel.state, 'blocked')
+
+    def test_network_change_during_live_probe_is_rechecked_before_ready(self):
+        self.controller.activate()
+        def probe(*_):
+            self.network.changed = True
+            return {'dns': True, 'handshake_recent': True}
+        self.controller.probe = probe
+        self.assertEqual(self.controller.check()['state'], 'degraded')
+        self.assertEqual(self.kernel.state, 'blocked')
+
+    def test_ready_mutation_requires_a_fresh_kernel_readback(self):
+        original = self.kernel.set_state
+        self.kernel.set_state = lambda state: original(state) if state != 'ready' else None
+        with self.assertRaises(ControllerError):
+            self.controller.activate()
+        self.assertEqual(self.kernel.state, 'blocked')
+
     def test_disabled_intent_is_not_reversed_by_guard_or_daemon_restart(self):
         self.controller.activate()
         self.controller.disable()
@@ -463,6 +505,21 @@ class LifecycleTests(unittest.TestCase):
 
 
 class PreflightTests(unittest.TestCase):
+    def test_native_snapshot_uses_one_coherent_locked_policy_observation(self):
+        native = NativeGuard('/usr/lib/wg-program-split', '/sys/fs/bpf/wg_program_split')
+        data = {'abi': 2, 'ready': True, 'mask': ALLOCATION.mask, 'mark': ALLOCATION.mark,
+                'maps': {'paths': 101}, 'links': {'link': {'id': 100}},
+                'paths': ['/missing/image', '/invalid-\udcff']}
+        def observation(operation, _pins):
+            if operation != 'snapshot':
+                raise ControllerError('separate policy observation can cross a mutation')
+            return json.dumps(data)
+        with patch.object(native, '_run', side_effect=observation):
+            result = native.snapshot()
+        self.assertEqual(result['paths'], data['paths'])
+        self.assertEqual(result['state'], 'ready')
+        self.assertEqual(result['pins'], {'maps': data['maps'], 'links': data['links']})
+
     def test_native_probe_must_return_boolean_evidence(self):
         native = NativeGuard('/usr/lib/wg-program-split', '/sys/fs/bpf/wg_program_split')
         with patch.object(native, '_run', return_value='{"dns":1}'):

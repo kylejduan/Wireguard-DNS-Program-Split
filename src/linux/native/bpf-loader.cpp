@@ -484,7 +484,7 @@ void policy_json(const fs::path &dir) {
     if (errno!=ENOENT) fail("read policy keys");
     std::cout<<'['; bool comma=false;
     for (const auto &entry:entries) { if (comma) std::cout<<','; comma=true; std::cout<<json_string(entry); }
-    std::cout<<"]\n";
+    std::cout<<']';
 }
 void snapshot_json(const fs::path &dir) {
     auto cfg=configuration(dir);
@@ -507,7 +507,9 @@ void snapshot_json(const fs::path &dir) {
         if (spec.cgroup) std::cout<<",\"cgroup_id\":"<<info.cgroup.cgroup_id;
         std::cout<<'}';
     }
-    std::cout<<"}}\n";
+    std::cout<<"},\"paths\":";
+    policy_json(dir); // Same shared ownership lock as configuration and IDs.
+    std::cout<<"}\n";
 }
 void probe_dns(const fs::path &dir) {
     auto cfg=configuration(dir);
@@ -557,7 +559,8 @@ int main(int argc, char **argv) {
         if (argc==3 && (std::string(argv[1])=="policy" || std::string(argv[1])=="snapshot")) {
             Fd lock(open(argv[2],O_RDONLY|O_DIRECTORY|O_CLOEXEC));
             check(flock(lock.value,LOCK_SH)==0,"lock policy readback"); verify_owner(argv[2]);
-            if (std::string(argv[1])=="policy") policy_json(argv[2]); else snapshot_json(argv[2]);
+            if (std::string(argv[1])=="policy") { policy_json(argv[2]); std::cout<<'\n'; }
+            else snapshot_json(argv[2]);
             return 0;
         }
         if (argc < 3) fail("commands: capabilities | load | load-policy | load-policy-stdin | path-add | path-add-policy | path-del | guard-slot | state | status | policy | snapshot | probe-dns | remove");
