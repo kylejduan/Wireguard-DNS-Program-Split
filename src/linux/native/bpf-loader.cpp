@@ -547,6 +547,7 @@ void capabilities() {
     std::unique_ptr<btf, decltype(&btf__free)> types(btf__load_vmlinux_btf(), btf__free);
     if (!types) fail("kernel BTF unavailable");
     for (const char *symbol : {"bpf_get_task_exe_file", "bpf_put_file", "bpf_path_d_path",
+                               "bpf_preempt_disable", "bpf_preempt_enable",
                               "bpf_lsm_socket_post_create"})
         std::cout << symbol << "_btf=" << btf__find_by_name_kind(types.get(), symbol, BTF_KIND_FUNC) << '\n';
 }
