@@ -2,24 +2,34 @@
 
 > **For agentic workers:** Use `superpowers:executing-plans` task by task.
 > Read the linked design first, preserve the current branch and verify
-> every phase. A completed peer assessment is pending.
+> every phase. The requested Claude assessment did not complete; do not claim it did.
 
 **Goal:** Automatically route included executable paths' new connections
 and ordinary DNS through WireGuard, regardless of their launch method.
 
 **Architecture:** Synchronous kernel executable-path classification and
 socket marking select an owned VPN routing table. Included DNS is
-translated before the host resolver. The early proof compares direct
-kernel translation with a private tunnel-only forwarder and chooses one.
+translated before the host resolver. The VM comparison selected direct kernel
+translation; the private forwarder remains test-only.
 
 **Tech Stack:** C eBPF, native C++/libbpf loader, Python standard library,
-WireGuard/iproute2/nftables, optional private dnsmasq-base instance, systemd.
+WireGuard/iproute2/nftables and systemd. dnsmasq-base is a comparison-test dependency only.
 
 **Spec:** [Automatic executable-path design](../specs/2026-09-12-linux-include-mode-design.md).
 
-**Status:** Proposed plan awaiting completed peer review. Kernel and DNS
-proof gates precede productization. No runtime proof, implementation or
-joint review acceptance is claimed at this stage.
+**Status:** Repository implementation and native VM acceptance completed on
+September 13, 2026, following user authorization. The final combined VM suite
+passes classifier, resolver guard, ordinary/large DNS, actual distro NSS/cache,
+network repair, persistent payload and installed-service gates. Separate actual
+positive/failing-guard reboot tests pass with exact cleanup. All 131 Linux unit
+checks, native parsing/probes and the existing Windows suite pass. Scoped
+independent reviews drove regression fixes. No Claude joint approval or TV
+deployment is claimed. Measurements show nonzero overhead; TV/bot latency and
+CPU acceptance remain open and are documented in the operating guide.
+
+The checklist below records the original acceptance targets. A broad unchecked
+target is not implied complete by a narrower passing mechanism test. See
+[current operating behavior](../../linux.md) and [migration](../../linux-migration.md).
 
 ## Global constraints
 
@@ -27,9 +37,9 @@ joint review acceptance is claimed at this stage.
   kernel BTF and BPF LSM enabled. Verify exact helper/attachment support.
 - Include full native executable paths automatically. No wrapper/UID/name
   substitution and no asynchronous first-packet classification claim.
-- Include mode only. Minimum latency/compute overhead is a release gate
-  before controller work; neither zero overhead nor universal application
-  compatibility is established by this proposal.
+- Include mode only. Minimum latency/compute overhead remains a deployment
+  acceptance gate. The user authorized controller work after the VM transport
+  comparison; no numerical TV budget or universal compatibility is inferred.
 - Initial payload: IPv4 TCP/UDP. Block included IPv6; leave host IPv6 alone.
 - Helpers need their own paths. Reject script-only and unsupported
   container/namespace enrollment. Already-running selected programs need
@@ -39,8 +49,9 @@ joint review acceptance is claimed at this stage.
   services and listeners. Never flush/replace unrelated networking.
 - Keep profiles, keys, actual paths/users, private audits and logs out of Git.
 - Target 500 lines per source/test file; phases touch at most five files.
-- All source paths, interfaces and commands below describe planned work.
-  They are not available commands or passing tests in the current repo.
+- Original phase boundaries were split into groups of at most five files.
+  Current source and the operating guide establish implemented APIs; the
+  remaining acceptance targets below do not manufacture passing results.
 
 ## Phase 1: Prove full-path classification before first socket use
 
@@ -119,7 +130,7 @@ I/O. Test keys and addresses belong to the disposable fixture, not TV.
 **Create:**
 
 - `src/linux/bpf/resolver_guard.bpf.c`: selected-process resolver IPC/cache guards.
-- `src/linux/wg_program_split/dns.py`: private dnsmasq configuration renderer.
+- `src/linux/bpf/policy.bpf.h`: shared exact policy and guard ABI.
 - `src/linux/wg_program_split/firewall.py`: owned mark/DNS rules renderer.
 - `tests/linux/test_dns_paths.py`: controlled responders and lookup clients.
 - `tests/linux/test_resolver_ipc.py`: cache, Varlink, D-Bus and alias fixtures.
@@ -140,7 +151,8 @@ other instances of the same dnsmasq executable remain direct.
   `wgps0` only, with inbound conntrack restrictions preventing unrelated
   loopback-service access. Preserve host `all`/`default` settings; verify
   source/device binds, reverse-path filtering and reverse translation.
-  This candidate is not a proven configuration.
+  The final VM gates prove this selected kernel configuration within the
+  documented host/application scope.
 - [ ] Start a private dnsmasq listener on an unused loopback port with one
   numeric VPN DNS upstream and no default config/resolv/hosts files.
   Syntax-check with `dnsmasq --test` against the generated config.
@@ -195,25 +207,22 @@ other instances of the same dnsmasq executable remain direct.
 - `src/linux/wg_program_split/ownership.py`: serialized acquisition/rollback.
 - `tests/linux/test_config_network.py`: validation and injected failures.
 
-Private interfaces: `parse_profile(text: str) -> Profile`,
-`parse_settings(text: str) -> Settings`,
-`network_plan(profile: Profile, allocation: Allocation) -> list[Operation]`.
-`Operation` keeps secret stdin/file-descriptor input separate from its
-argument vector. No privileged command uses a shell.
+Implemented interfaces include `parse_profile`, `parse_settings`, persisted-key
+`parse_policy`, `inspect`, `allocate`, and `Network.prepare/health/repair_missing/disable`.
+Commands use fixed argv and private temporary configuration files; no privileged
+command uses a shell or puts private keys in its argument vector.
 
-Proposed settings shape for the forwarder candidate; omit its listener
-field if phase 2 selects direct DNS translation:
+Implemented settings shape:
 
 ```json
 {
   "schema_version": 1,
-  "included_executables": [],
-  "dns_listen_port": 53053
+  "included_executables": []
 }
 ```
 
 Runtime allocation records the owned mark mask/classes, routing table,
-rule priorities, firewall table, listener, service UID and BPF object IDs.
+rule priorities, firewall table, conntrack zone and BPF object IDs.
 These are selected after collision checks; do not repurpose Tailscale or
 another VPN's marks, priorities or tables.
 
@@ -246,7 +255,7 @@ another VPN's marks, priorities or tables.
 - `src/linux/wg_program_split/controller.py`: activation/recovery state machine.
 - `src/linux/systemd/wg-program-split-guard.service`: early pinned protection.
 - `src/linux/systemd/wg-program-split.service`: networking controller.
-- `src/linux/systemd/wg-program-split-dns.service`: private DNS instance.
+- `src/linux/wg_program_split/preflight.py`: native host and real readiness checks.
 - `tests/linux/test_lifecycle.py`: staged and real systemd lifecycle cases.
 
 The state machine has `blocked`, `preparing`, `ready` and `degraded`
@@ -258,8 +267,8 @@ Atomically publish a complete policy generation; pin the active objects.
   security services. Generate and validate complete units using
   `systemd-analyze verify` on the supported VM.
 - [ ] Load included-path protection in blocking state first. Install
-  routing/firewall state, configure WG and launch the restricted DNS
-  forwarder, then probe both tunnel and forwarded DNS before readiness.
+  routing/firewall state and configure WG, then probe the actual marked kernel
+  DNS path and observe a recent tunnel handshake before readiness.
 - [ ] Keep pinned links/maps and fail-closed rules across controller exit,
   management-service stop and network failure. Recovery verifies real
   owned state before reuse. Distinguish connectivity failure from lost
@@ -286,12 +295,13 @@ Atomically publish a complete policy generation; pin the active objects.
 - `config/linux-settings.example.json`: generic settings example.
 - `tests/linux/test_install_cli.py`: staging-root install and exact ownership.
 
-Proposed CLI, all commands still unavailable in the current source:
+Implemented CLI:
 
 ```text
 wg-program-split validate --profile PATH --settings PATH
 wg-program-split plan --profile PATH --settings PATH
 wg-program-split install --profile PATH --settings PATH
+wg-program-split activate
 wg-program-split include add ABSOLUTE_EXECUTABLE
 wg-program-split include remove ABSOLUTE_EXECUTABLE
 wg-program-split status
@@ -311,7 +321,7 @@ files by default. Neither operation kills arbitrary matching processes.
 - [ ] Install private config under `/etc/wg-program-split/`, transient
   state under `/run/wg-program-split/`, and the BPF pins under an owned
   bpffs subtree. Validate parent permissions and symlink handling.
-- [ ] Install the private service account and units without activating
+- [ ] Install the isolated runtime and units without activating
   another VPN, changing kernel boot options or converting applications.
   Refuse unsupported effective BPF-LSM state with a precise preflight
   result, not a promise based on `CONFIG_BPF_LSM=y` alone.

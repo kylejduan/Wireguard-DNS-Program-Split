@@ -1,8 +1,12 @@
 # Automatic Linux executable-path VPN and DNS inclusion
 
-Status: proposed architecture, September 12, 2026. A completed peer review
-is pending. Linux is not implemented and no runtime or deployment success
-is claimed.
+Status: implemented with combined native VM and two-reboot validation, September 13, 2026.
+The combined socket hook, kernel DNS transport and resolver guards are
+implemented; the operator guide is [Linux include mode](../../linux.md).
+The requested Claude Max review did not complete and no Claude approval is
+claimed. The user authorized implementation; independent scoped code reviews
+have driven regression fixes. TV deployment and its performance/boot gates
+remain separate.
 
 ## Required behavior
 
@@ -39,11 +43,11 @@ there is no network-namespace relocation of applications.
 
 ## Decision and alternatives
 
-Recommend a native eBPF classifier, a dedicated WireGuard routing table
-and owned nftables rules. The early DNS experiment compares direct kernel
-DNS translation with a dedicated tunnel-only dnsmasq instance. Choose one
-from correctness and measured overhead before building its controller;
-do not ship two runtime backends merely because both were investigated.
+The implemented backend uses a native eBPF classifier, a dedicated WireGuard
+routing table and owned nftables rules. The VM comparison selected direct
+kernel DNS translation over an uncached private dnsmasq forwarder. The latter
+remains a test-only comparison; there is no runtime DNS service, listener,
+service account or forwarder configuration.
 These are separate Linux components in this repository. The Windows
 components keep their existing architecture.
 
@@ -63,7 +67,7 @@ not a benchmark or a completed third-party security audit.
 
 ## Synchronous executable classification
 
-Preferred proof candidate: attach a `BPF_PROG_TYPE_LSM` program with
+The verified combined program attaches a `BPF_PROG_TYPE_LSM` program with
 `BPF_LSM_CGROUP` attachment at `socket_post_create` to the root cgroup.
 Resolve the current task's actual executable using
 `bpf_get_task_exe_file`, `bpf_path_d_path` and `bpf_put_file`; compare its
@@ -147,57 +151,27 @@ IP forwarding or introduce a universal userspace payload proxy.
 
 ## DNS selection before the shared resolver
 
-Both candidates select only included UDP/TCP port-53 traffic before the
-shared host resolver receives it. Both must preserve original response
-peer tuples, keep failures off the router path and pass the same IPC/cache
-tests. Lower component count does not by itself prove lower DNS latency.
+Direct kernel translation selects included UDP/TCP port-53 traffic before
+the shared host resolver. Real tests verify original response peer tuples,
+separate included/unlisted responder origins and tunnel-loss blocking.
+The comparison harness retains an uncached forwarder for measurements only.
 
 ```mermaid
 flowchart LR
     A[Included executable socket] --> M[Kernel path classifier and mark]
     M -->|TCP and UDP payload| W[WireGuard routing table]
     M -->|Ordinary port 53 DNS| N[Owned nftables output translation]
-    N -->|Candidate A: direct profile DNS| W
-    N -->|Candidate B| D[Dedicated local DNS forwarder]
-    D -->|Profile DNS through WireGuard| W
+    N -->|Profile DNS; separate conntrack zone| W
     B[Unlisted application] --> H[Existing host resolver and router route]
 ```
 
-First test direct output DNAT to the literal VPN DNS address with scoped
-source NAT to the tunnel address. Queries aimed at a loopback stub can
-already have a loopback source; output rerouting can reject that source
-before postrouting SNAT runs. The disposable-VM candidate may enable
-`route_localnet` on owned `wgps0` only, together with strict inbound rules
-admitting the intended conntrack replies and preventing access to unrelated
-host loopback listeners. Never change the host `all` or `default` setting.
-Prove both outgoing and reverse-translated incoming routing, source/device
-binds and reverse-path filtering. These are unverified experiments, not
-installation instructions or a proven replacement for the forwarder.
-
-For the forwarder candidate, redirect only included UDP/TCP port-53
-traffic to an owned IPv4 loopback listener on a nonstandard port. This
-includes queries aimed at the host's
-loopback resolver stub. They are selected before systemd-resolved receives
-them; no shared-resolver process attribution or name/timing heuristic is
-needed. Conntrack must restore the original peer tuple for both connected
-UDP and TCP clients. Prove this behavior with packet captures and peer
-address assertions before committing to the final translation rules.
-
-This candidate uses a private dnsmasq instance from the distribution's `dnsmasq-base`
-package. Give it an explicit private config, only the chosen listener,
-`no-resolv`, `no-hosts`, no DHCP/TFTP/RA, no query logging and one literal
-profile DNS upstream. Bind upstream queries to `wgps0` using its documented
-server interface option. Do not load `/etc/dnsmasq.conf` or host snippets.
-A dedicated service UID plus executable identity receives a separate
-DNS-upstream mark, so its traffic cannot re-enter application DNS
-translation. Other dnsmasq instances are not included.
-
-The DNS service's firewall policy permits upstream DNS only to the
-profile resolver through `wgps0`, plus necessary replies to its local
-clients. It must reject fallback to the host resolver or physical egress.
-Check capabilities, interface binding and marking from the first upstream
-socket, including TCP-worker children. Reserve/check listener ownership;
-a port collision fails startup without disturbing another resolver.
+Output DNAT selects the literal VPN resolver; scoped SNAT supplies the tunnel
+source. Loopback-stub queries require `route_localnet` on owned `wgps0` only.
+Incoming loopback-addressed traffic is limited to expected conntrack DNS replies;
+host `all` and `default` settings remain unchanged. A dedicated conntrack zone
+fixes the demonstrated crossover when identical UDP tuples are reused by direct
+and included clients. Egress enforcement runs after routing/translation in
+POSTROUTING, where the effective interface is available.
 
 Unlisted DNS continues directly to the host's existing resolver, whose
 ordinary upstream is the router after the old full tunnel is retired.
@@ -249,16 +223,16 @@ keys never enter command arguments, environment, logs or Git.
 
 Pin BPF links and maps so controller exit does not remove classification.
 Start in a selected-app blocking state, install table/guards, start the
-VPN and DNS forwarder, validate them, then atomically publish readiness.
+VPN, probe real marked DNS and observe its handshake, then publish readiness.
 Unlisted traffic is unchanged by these phases. Controller or DNS failure
 retains guards; loss of VPN connectivity never selects a direct fallback.
 Distinguish policy-ready, tunnel handshake and independently tested DNS/IP
 health. Recovery adopts only verified owned state.
 
-DNS service, listener, service UID and upstream-mark requirements apply
-only if the forwarder wins the early experiment. If direct translation
-wins, remove those components and their configuration fields from the
-remaining plan; readiness checks exercise actual DNS through that path.
+Early allocation scans do not require configured underlay routes; activation
+performs transport/MTU checks later. Safe repair can recreate an owned missing
+interface/preferred route while exact safety anchors remain intact. Ambiguous
+births and foreign replacements are retained for inspection.
 
 Attach protection before ordinary boot-time network/application startup;
 prove this with an early-start test application. No protection claim
@@ -269,8 +243,10 @@ requirement. Installation does not silently alter an existing bot unit.
 
 Policy edits apply to new sockets. Track affected running processes at
 activation/enrollment and report their restart requirement independently
-of socket counts; retain that requirement for descendants carrying old
-resolver state. Keep per-application readiness separate from installed
+of socket counts. Keep a sticky unresolved boundary when old processes were
+observed: snapshots cannot prove every fork/reparent lineage has ended.
+Audit initial attachment and include-add completion as well as their earlier
+snapshots. Keep per-application readiness separate from installed
 policy readiness. Stopping the management service retains
 protection; an explicit disable/uninstall operation releases it after
 reporting affected running applications. Never kill arbitrary matching
@@ -350,9 +326,10 @@ under the current requirement, alongside routing/DNS separation failures.
 The implementation plan starts with three mandatory proofs: exact-path
 classification and marking before first traffic; reversible UDP/TCP DNS
 translation to the tunnel-only resolver; and resolver IPC/cache isolation.
-All must pass together with the performance gate before productizing the
-controller or changing TV. Select and document the measured DNS transport
-before committing to a DNS service or its privileged runtime components.
+The three mechanism gates passed in the native VM. Controller implementation
+proceeded after the kernel/forwarder comparison; numerical TV performance
+acceptance remains open rather than being inferred from microbenchmarks.
+Actual deployment still requires its latency and boot acceptance.
 
 Subsequent tests cover executable replacement, aliases, helpers, immediate
 connect, same-name DNS concurrency, IPv6, pinned-loader failure, removed
