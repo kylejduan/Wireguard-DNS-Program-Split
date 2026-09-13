@@ -57,6 +57,8 @@ struct {
 extern struct file *bpf_get_task_exe_file(struct task_struct *task) __ksym;
 extern void bpf_put_file(struct file *file) __ksym;
 extern int bpf_path_d_path(const struct path *path, char *buf, size_t size) __ksym;
+extern void bpf_preempt_disable(void) __ksym;
+extern void bpf_preempt_enable(void) __ksym;
 
 static __always_inline int result(__u32 reason, int allow)
 {
@@ -74,6 +76,33 @@ static __always_inline bool linked_file(struct file *file)
     return inode && BPF_CORE_READ(inode, i_nlink) &&
            BPF_CORE_READ(dentry, d_hash.pprev) &&
            (!ops || !BPF_CORE_READ(ops, d_dname));
+}
+
+/* Caller holds preemption disabled throughout the shared per-CPU buffer use.
+ * Only path/probe/map operations run here; file release stays outside to avoid
+ * release-side callbacks. These helpers do not invoke our task-context hooks. */
+static __always_inline int resolve_policy(struct file *exe)
+{
+    __u32 zero = 0;
+    struct path_scratch *work = bpf_map_lookup_elem(&scratch, &zero);
+    if (!work) return PATH_ERROR;
+    /* No cross-socket cache: every creation resolves the current path. */
+    /* clang's BPF backend does not lower a 4096-byte builtin memset. */
+#pragma clang loop unroll(full)
+    for (int i = 0; i < PATH_BYTES / 8; i++)
+        ((volatile __u64 *)&work->key)[i] = 0;
+    int len = bpf_path_d_path(&exe->f_path, work->resolved, sizeof(work->resolved));
+    bool linked = linked_file(exe);
+    if (!linked) return UNLINKED_IMAGE;
+    if (len <= 1 || len > PATH_BYTES || work->resolved[0] != '/')
+        return PATH_ERROR;
+    /* d_path initially writes at the end, then memmoves: its tail is NOT zero.
+     * Copy only the terminated string into the zero-padded hash key. */
+    if (bpf_probe_read_kernel_str(work->key.pathname, PATH_BYTES, work->resolved) != len)
+        return PATH_ERROR;
+    __u32 *selected = bpf_map_lookup_elem(&paths, &work->key);
+    if (!selected) return DIRECT;
+    return INCLUDED;
 }
 
 static __always_inline int policy_select(void)
@@ -94,29 +123,15 @@ static __always_inline int policy_select(void)
         bpf_put_file(exe);
         return UNLINKED_IMAGE;
     }
-    struct path_scratch *work = bpf_map_lookup_elem(&scratch, &zero);
-    if (!work) {
-        bpf_put_file(exe);
-        return PATH_ERROR;
-    }
-    /* No cross-socket cache: every creation resolves the current path. */
-    /* clang's BPF backend does not lower a 4096-byte builtin memset. */
-#pragma clang loop unroll(full)
-    for (int i = 0; i < PATH_BYTES / 8; i++)
-        ((volatile __u64 *)&work->key)[i] = 0;
-    int len = bpf_path_d_path(&exe->f_path, work->resolved, sizeof(work->resolved));
-    bool linked = linked_file(exe);
+    /* BPF LSM execution pins the CPU but permits task preemption. Another
+     * task's classifier or resolver guard could otherwise overwrite scratch
+     * between resolution and lookup, silently treating an included path as
+     * direct. No sleeping helpers or nested LSM operations run in this region. */
+    bpf_preempt_disable();
+    int selection = resolve_policy(exe);
+    bpf_preempt_enable();
     bpf_put_file(exe);
-    if (!linked) return UNLINKED_IMAGE;
-    if (len <= 1 || len > PATH_BYTES || work->resolved[0] != '/')
-        return PATH_ERROR;
-    /* d_path initially writes at the end, then memmoves: its tail is NOT zero.
-     * Copy only the terminated string into the zero-padded hash key. */
-    if (bpf_probe_read_kernel_str(work->key.pathname, PATH_BYTES, work->resolved) != len)
-        return PATH_ERROR;
-    __u32 *selected = bpf_map_lookup_elem(&paths, &work->key);
-    if (!selected) return DIRECT;
-    return INCLUDED;
+    return selection;
 }
 #endif
 #endif
