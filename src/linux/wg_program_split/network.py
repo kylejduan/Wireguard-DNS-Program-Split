@@ -1,5 +1,6 @@
 """Explicit owned Linux networking operations; controller owns BPF readiness."""
 from dataclasses import asdict, dataclass, replace
+import base64
 import hashlib
 import json
 import os
@@ -56,6 +57,65 @@ def _u32(value):
     if type(number) is not int or not 0 <= number <= 0xffffffff:
         raise NetworkError('unparseable network integer')
     return number
+
+
+def _wireguard_state(raw):
+    """Normalize an owned-interface dump to the existing nonsecret receipt fields."""
+    rows = [line.split('\t') for line in raw.splitlines()]
+    del raw
+    malformed = not rows
+    for index, row in enumerate(rows):
+        malformed |= len(row) != (4 if index == 0 else 8)
+        # Drop private key / PSK before any parsing, hashing or returned state.
+        secret_column = 0 if index == 0 else 1
+        del row[secret_column:secret_column + 1]
+    if malformed:
+        rows.clear()
+        raise NetworkError('malformed owned WireGuard state')
+
+    def integer(value, maximum):
+        if not re.fullmatch(r'[0-9]{1,20}', value) or int(value) > maximum:
+            raise NetworkError('malformed owned WireGuard state')
+        return int(value)
+
+    def key(value):
+        if (not re.fullmatch(r'[A-Za-z0-9+/]{43}=', value) or
+                base64.b64encode(base64.b64decode(value)).decode() != value):
+            raise NetworkError('malformed owned WireGuard state')
+
+    public, listen_port, mark = rows[0]
+    if public != '(none)':
+        key(public)
+    integer(listen_port, 65535)
+    if mark == 'off':
+        fwmark = 0
+    elif re.fullmatch(r'0x[0-9a-f]{1,8}', mark):
+        fwmark = int(mark, 16)
+    else:
+        raise NetworkError('malformed owned WireGuard state')
+    result = {'public_key_sha256': hashlib.sha256(public.encode()).hexdigest(),
+              'fwmark': fwmark, 'peers': [], 'endpoints': [], 'allowed-ips': [],
+              'persistent-keepalive': []}
+    seen = set()
+    for public, endpoint, allowed, handshake, received, sent, keepalive in rows[1:]:
+        key(public)
+        if public in seen or any(not x or re.search(r'\s', x) for x in (endpoint, allowed)):
+            raise NetworkError('malformed owned WireGuard state')
+        seen.add(public)
+        for value in (handshake, received, sent):
+            integer(value, 0xffffffffffffffff)
+        if keepalive != 'off':
+            integer(keepalive, 65535)
+        allowed = allowed.split(',')
+        if not all(allowed):
+            raise NetworkError('malformed owned WireGuard state')
+        result['peers'].append([public])
+        result['endpoints'].append([public, endpoint])
+        result['allowed-ips'].append([public, *allowed])
+        result['persistent-keepalive'].append([public, keepalive])
+    for field in ('peers', 'endpoints', 'allowed-ips', 'persistent-keepalive'):
+        result[field].sort()
+    return result
 
 
 def _table(value):
@@ -484,20 +544,16 @@ class Network:
             result = {'ifindex': link['ifindex'], 'kind': link.get('linkinfo', {}).get('info_kind'),
                       'alias': link.get('ifalias', ''), 'mtu': link.get('mtu'),
                       'up': 'UP' in link.get('flags', [])}
-            if result['kind'] != 'wireguard':
+            if (result['kind'] != 'wireguard' or resource.identity and any(
+                    result[field] != resource.identity.get(field) for field in ('ifindex', 'alias'))):
+                # Never request key-bearing output for a known replacement.
                 return result
             addresses = _json(self.runner, 'ip', '-j', '-4', 'address', 'show', 'dev', a.interface)
             result['addresses'] = sorted(f"{x['local']}/{x['prefixlen']}" for dev in addresses
                                          for x in dev.get('addr_info', []) if x.get('family') == 'inet')
             result['prefix_route_flags'] = sorted(bool(x.get('noprefixroute', False)) for dev in addresses
                                                   for x in dev.get('addr_info', []) if x.get('family') == 'inet')
-            public = self._run('wg', 'show', a.interface, 'public-key').strip()
-            result['public_key_sha256'] = hashlib.sha256(public.encode()).hexdigest()
-            fwmark = self._run('wg', 'show', a.interface, 'fwmark').strip()
-            result['fwmark'] = 0 if fwmark == 'off' else _u32(fwmark)
-            for field in ('peers', 'endpoints', 'allowed-ips', 'persistent-keepalive'):
-                result[field] = sorted(line.split() for line in self._run(
-                    'wg', 'show', a.interface, field).strip().splitlines())
+            result.update(_wireguard_state(self._run('wg', 'show', a.interface, 'dump')))
             return result
         if kind in ('private_file', 'private_directory'):
             path = Path(resource.identity['path'])
