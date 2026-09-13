@@ -28,7 +28,8 @@ joint review acceptance is claimed at this stage.
   substitution and no asynchronous first-packet classification claim.
 - Initial payload: IPv4 TCP/UDP. Block included IPv6; leave host IPv6 alone.
 - Helpers need their own paths. Reject script-only and unsupported
-  container/namespace enrollment; report existing/inherited connections.
+  container/namespace enrollment. Already-running selected programs need
+  restart after activation/enrollment, including retained resolver state.
 - Keep unlisted host routing and resolver configuration effective.
 - Own specific interfaces, routing rules, nftables tables, BPF links,
   services and listeners. Never flush/replace unrelated networking.
@@ -72,10 +73,18 @@ successful attachment, and an attached program is not traffic proof.
   than matching an unrelated container's identical pathname. Inject
   pathname lookup errors/truncation and require explicit socket errors,
   never direct fallback; check ordinary unlisted sockets remain healthy.
-- [ ] Replace the included binary atomically at its configured path and
-  repeat without updating an inode map. Test hard links, symlinks, renamed
-  running binaries, multiple threads, helpers and policy changes. Reject
-  unsupported script/namespace cases with an explicit reason.
+- [ ] Replace the included binary atomically at its configured path:
+  newly launched copies remain included without updating an inode map;
+  new sockets from the old unlinked image must error until restart.
+  Deleted/synthetic paths never become known-unlisted through a map miss.
+  Test actual file/dentry state and genuine filenames ending in
+  ` (deleted)`; do not strip a textual suffix and assume identity.
+- [ ] Assert that a still-linked rename changes the canonical path used
+  for subsequent sockets. Enrolling the destination before the move keeps
+  inclusion; moving to an unlisted destination makes new sockets direct.
+  Existing socket marks retain their class. Test symlink canonicalization,
+  distinct hard links, multiple threads, helpers and policy changes.
+  Reject unsupported script/namespace cases with an explicit reason.
 - [ ] Inspect loader-crash behavior and pin/link ownership. Record kernel,
   effective LSMs, helper/attach results and packet/classification evidence
   under ignored `local/validation/`. Commit only source/tests after the
@@ -130,10 +139,15 @@ other instances of the same dnsmasq executable remain direct.
   arrangement and `files dns`. Unsupported NSS backends fail preflight.
   Do not claim `nss-resolve` compatibility unless a test demonstrates
   successful included DNS and zero host-daemon lookup activity.
-- [ ] Warm host caches, then query the same unique and repeated names
-  concurrently from included/unlisted fixture paths. Give the two DNS
+- [ ] Warm host caches, then start fresh included/unlisted fixtures and
+  query the same unique and repeated names concurrently. Give the two DNS
   responders different answers and require their per-query ledgers to
   show exact origin separation. Capture network destinations as well.
+- [ ] Separately enroll an already-running fixture that mapped the shared
+  hosts cache before policy activation. New access guards cannot revoke
+  its mapping: require an explicit restart-needed result, then verify DNS
+  separation after restart. Include inherited mappings in descendants;
+  zero open network sockets must not imply per-application DNS readiness.
 - [ ] Stop if DNS or IPC protection is not demonstrable; do not continue
   by redirecting all host DNS or weakening origin classification.
   Review the evidence and commit the scoped phase after it passes.
@@ -218,7 +232,9 @@ Atomically publish a complete policy generation; pin the active objects.
   protection and never advertise one as the other.
 - [ ] Preserve unlisted DNS, routes and existing cgroup BPF programs while
   faulting every startup/recovery phase. Test early-boot immediate-connect
-  fixtures, interface deletion and existing sockets at activation.
+  fixtures, interface deletion, existing sockets and retained resolver
+  state at activation. Track affected processes independently of socket
+  inventories and keep restart requirements across controller recovery.
 - [ ] Identify the actual deployment bot's ordering needs so it cannot
   start before the guard. Runtime automatic inclusion must still work
   from all normal launch methods; do not require a wrapper to hide a
@@ -268,7 +284,8 @@ files by default. Neither operation kills arbitrary matching processes.
 - [ ] Ensure `plan` does not mutate network state. Never print private
   keys, raw profiles, credentials or secret-bearing subprocess arguments.
 - [ ] Stage include-list changes atomically; preserve policy generation
-  and pinned protection on errors. Report connection-restart requirements.
+  and pinned protection on errors. Report already-running selected
+  programs needing restart for connections or retained resolver state.
 - [ ] Remove only exact owned rules/pins/interfaces/units/files. Retain
   foreign or locally edited resources and report any remaining listeners.
   Run staging-root tests, full unit tests and the kernel/DNS gates; commit.
@@ -306,7 +323,8 @@ files by default. Neither operation kills arbitrary matching processes.
 **Create:** `docs/linux.md`, `docs/linux-migration.md`.
 
 - [ ] Document tested kernel requirements, BPF LSM enablement, automatic
-  path semantics, helpers/scripts, DNS APIs, connection boundaries,
+  path semantics including rename/replacement behavior, helpers/scripts,
+  DNS APIs, connection and resolver-state restart boundaries,
   pinned fail-closed behavior, localhost/LAN behavior and removal.
 - [ ] Explain that kernel enablement and retirement of an old full tunnel
   are separate operator-specific migration operations. Give an audit and
