@@ -41,6 +41,7 @@ def _parser():
     for name in ('activate', 'status', 'check', 'disable', 'uninstall', 'guard', 'daemon'):
         commands.add_parser(name)
     include = commands.add_parser('include').add_subparsers(dest='operation', required=True)
+    include.add_parser('list')
     for name in ('add', 'remove'):
         include.add_parser(name).add_argument('path')
     return parser
@@ -69,8 +70,8 @@ def main(argv=None):
             from .controller import Controller
             controller = Controller()
             if args.command == 'include':
-                method = controller.include_add if args.operation == 'add' else controller.include_remove
-                result = method(args.path)
+                method = getattr(controller, 'include_' + args.operation)
+                result = method() if args.operation == 'list' else method(args.path)
             elif args.command == 'daemon':
                 controller.watch()
                 return 0

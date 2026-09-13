@@ -366,6 +366,86 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.controller.check()['state'], 'disabled')
         self.assertEqual(self.controller.activate()['state'], 'ready')
 
+    def test_healthy_daemon_restart_checks_live_state_without_blocking(self):
+        self.controller.activate()
+        self.kernel.events.clear()
+        stop = threading.Event()
+        stop.set()
+        self.new_controller().watch(stop=stop)
+        self.assertEqual(self.kernel.events, ['probe'])
+        self.assertEqual(self.kernel.state, 'ready')
+
+    def test_daemon_restart_recovers_pending_preparing_and_missing_network(self):
+        for condition in ('pending', 'preparing', 'missing-network'):
+            with self.subTest(condition=condition):
+                self.setUp()
+                self.controller.activate()
+                path = self.paths.state / 'controller.json'
+                journal = json.loads(path.read_text())
+                if condition == 'pending':
+                    journal['pending'] = {'action': 'add', 'path': '/pending/helper', 'generation': 2,
+                                          'policy': sorted([*journal['policy'], '/pending/helper'])}
+                elif condition == 'preparing':
+                    journal['state'] = 'preparing'
+                else:
+                    self.network.missing = self.network.repairable = True
+                path.write_text(json.dumps(journal))
+                self.kernel.events.clear()
+                stop = threading.Event()
+                stop.set()
+                self.new_controller().watch(stop=stop)
+                self.assertIn('state-blocked', self.kernel.events)
+                self.assertEqual(self.kernel.state, 'ready')
+                if condition == 'pending':
+                    self.assertIn('/pending/helper', self.kernel.paths)
+                    self.assertIsNone(json.loads(path.read_text())['pending'])
+                elif condition == 'missing-network':
+                    self.assertIn('network-repair', self.kernel.events)
+
+    def test_daemon_restart_rejects_changed_profile_network_and_pin_identity(self):
+        for condition in ('profile', 'network', 'pins'):
+            with self.subTest(condition=condition):
+                self.setUp()
+                self.controller.activate()
+                if condition == 'profile':
+                    (self.paths.config / 'profile.conf').write_text(PROFILE.replace('10.20.0.1', '10.20.0.3'))
+                elif condition == 'network':
+                    self.network.changed = True
+                else:
+                    self.kernel.ids['link'] += 1
+                self.kernel.events.clear()
+                stop = threading.Event()
+                stop.set()
+                with self.assertRaises(ControllerError):
+                    self.new_controller().watch(stop=stop)
+                self.assertEqual(self.kernel.state, 'ready' if condition == 'pins' else 'blocked')
+                if condition == 'pins':
+                    self.assertEqual(self.kernel.events, [])
+
+    def test_daemon_restart_keeps_explicit_disabled_intent(self):
+        self.controller.activate()
+        self.controller.disable()
+        self.kernel.events.clear()
+        stop = threading.Event()
+        stop.set()
+        self.new_controller().watch(stop=stop)
+        self.assertEqual(self.kernel.events, [])
+        self.assertFalse(self.kernel.exists())
+
+    def test_disable_between_startup_snapshot_and_check_is_not_reactivated(self):
+        self.controller.activate()
+        restarted = self.new_controller()
+        check = restarted.check
+        def disable_then_check():
+            self.controller.disable()
+            return check()
+        stop = threading.Event()
+        stop.set()
+        with patch.object(restarted, 'check', side_effect=disable_then_check):
+            restarted.watch(stop=stop)
+        self.assertFalse(self.kernel.exists())
+        self.assertEqual(restarted.status()['state'], 'disabled')
+
     def test_missing_network_receipt_cannot_leave_status_ready(self):
         self.controller.activate()
         (self.paths.state / 'receipt.json').unlink()
@@ -442,6 +522,59 @@ class LifecycleTests(unittest.TestCase):
     def test_active_enrollment_edit_restores_ready_after_live_probe(self):
         self.controller.activate()
         self.assertEqual(self.controller.include_remove('/missing/selected')['state'], 'ready')
+
+    def test_healthy_idempotent_edits_reprobe_without_blocking_or_new_generation(self):
+        executable = str(Path('/usr/bin/true').resolve())
+        (self.paths.config / 'settings.json').write_text(json.dumps({
+            'schema_version': 1, 'included_executables': [executable]}))
+        self.controller.activate()
+        for operation in (lambda: self.controller.include_add(executable),
+                          lambda: self.controller.include_remove('/absent/helper')):
+            self.kernel.events.clear()
+            result = operation()
+            self.assertEqual((result['state'], result['generation']), ('ready', 1))
+            self.assertEqual(self.kernel.events, ['probe'])
+
+    def test_idempotent_edit_failures_block_known_pins_and_never_report_ready(self):
+        for failure in ('profile', 'settings', 'invalid-settings', 'kernel-policy', 'host', 'probe', 'pins'):
+            with self.subTest(failure=failure):
+                self.setUp()
+                self.controller.activate()
+                if failure == 'profile':
+                    (self.paths.config / 'profile.conf').write_text(PROFILE.replace('10.20.0.1', '10.20.0.3'))
+                elif failure in ('settings', 'invalid-settings'):
+                    (self.paths.config / 'settings.json').write_text('{}' if failure == 'invalid-settings' else
+                        '{"schema_version":1,"included_executables":[]}')
+                elif failure == 'kernel-policy':
+                    self.kernel.paths.append('/unexpected/path')
+                elif failure == 'host':
+                    self.controller.host_check = lambda: (_ for _ in ()).throw(ControllerError('NSS changed'))
+                elif failure == 'probe':
+                    self.probe_ok = False
+                else:
+                    self.kernel.ids['link'] += 1
+                self.kernel.events.clear()
+                with self.assertRaises(ControllerError):
+                    self.controller.include_remove('/absent/helper')
+                journal = json.loads((self.paths.state / 'controller.json').read_text())
+                self.assertEqual(journal['state'], 'degraded')
+                self.assertEqual(self.kernel.state, 'ready' if failure == 'pins' else 'blocked')
+                if failure == 'pins':
+                    self.assertEqual(self.kernel.events, [])
+
+    def test_idempotent_request_still_recovers_pending_policy_before_readiness(self):
+        self.controller.activate()
+        path = self.paths.state / 'controller.json'
+        journal = json.loads(path.read_text())
+        journal['pending'] = {'action': 'add', 'path': '/pending/helper', 'generation': 2,
+                              'policy': sorted([*journal['policy'], '/pending/helper'])}
+        path.write_text(json.dumps(journal))
+        self.kernel.events.clear()
+        result = self.controller.include_remove('/absent/helper')
+        self.assertEqual((result['state'], result['generation']), ('ready', 2))
+        self.assertIn('state-blocked', self.kernel.events)
+        self.assertIn('/pending/helper', self.kernel.paths)
+        self.assertIsNone(json.loads(path.read_text())['pending'])
 
     def test_full_policy_rejects_add_before_recording_unreplayable_intent(self):
         policy = {'schema_version': 1, 'included_executables': [f'/program/{i}' for i in range(1024)]}

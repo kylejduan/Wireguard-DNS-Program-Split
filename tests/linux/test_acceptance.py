@@ -255,9 +255,18 @@ class Acceptance:
         errors = []
         if self.installed and CLI.exists():
             try:
-                self.cli('disable', timeout=70)
+                state_absent = not STATE.exists()
+                disabled = self.cli('disable', timeout=70)
+                assert disabled['state'] == 'disabled'
                 try:
-                    self.retired_state()
+                    if state_absent and STATE.exists():
+                        # Disabling an inactive installation creates only its
+                        # owned lock. No application journal has existed yet.
+                        assert not PINS.exists() and {p.name for p in STATE.iterdir()} == {'.lock'}
+                        self.remember_directories()
+                        self.files[STATE / '.lock'] = identity(STATE / '.lock')
+                    else:
+                        self.retired_state()
                 except Exception:
                     errors.append('disabled state identity was not established; retaining its files')
                 result = self.cli('uninstall', timeout=70)
@@ -344,6 +353,14 @@ def main():
                                for link in json.loads(execute(*command).stdout) for address in link['addr_info'])
                 wait_for(addresses_ready, 'fixture IPv6 address initialization', timeout=5)
                 test.install(peer, (evidence / 'selected-dns', evidence / 'selected-ip'))
+                listing_network = snapshot()
+                listing = test.cli('include', 'list')
+                assert listing['source'] == 'configured' and listing['live_enforcement'] == 'not_checked'
+                assert listing['included_executables'] == sorted(map(str, (
+                    evidence / 'selected-dns', evidence / 'selected-ip')))
+                assert not STATE.exists() and not PINS.exists(), 'listing activated runtime state'
+                assert snapshot() == listing_network, 'listing changed host networking'
+                test.passed('installed include list reports configured keys without activating protection')
                 result = test.cli('activate', timeout=90)
                 assert result['state'] == 'ready', result
                 test.remember_directories()
@@ -388,6 +405,32 @@ def main():
                     test.run('unshare', '--mount', '--propagation', 'private', 'sh', '-c', mount,
                              'acceptance-libc', resolver, nss, evidence / name, 'libc', 'wgps.invalid', answer)
                 test.passed('installed activation marks first sockets and separates actual DNS/IP traffic')
+                enrollment_before = counts()
+                traffic_log = (evidence / 'enrollment-dns.txt').open('x')
+                traffic = subprocess.Popen([str(evidence / 'selected-dns'), 'udp', '127.0.0.60',
+                    '198.51.100.7', hex(mark), '20000'], stdout=traffic_log, stderr=subprocess.PIPE, text=True)
+                try:
+                    wait_for(lambda: counts()[0] >= enrollment_before[0] + 10 or traffic.poll() is not None,
+                             'live enrollment traffic')
+                    assert traffic.poll() is None, 'traffic ended before repeated enrollment'
+                    enrollment_started = counts()[0]
+                    for operation, path in (('add', evidence / 'selected-dns'),
+                                            ('remove', evidence / 'never-enrolled'),
+                                            ('add', evidence / 'selected-ip')):
+                        result = test.cli('include', operation, path)
+                        assert result['enforcement_state'] == 'ready' and result['protection_verified']
+                    enrollment_during = counts()
+                    assert enrollment_started < enrollment_during[0] < enrollment_before[0] + 20000
+                    assert enrollment_during[1] == enrollment_before[1], 'selected queries reached direct DNS'
+                    _, stderr = traffic.communicate(timeout=30)
+                    assert traffic.returncode == 0 and not stderr
+                    assert len((evidence / 'enrollment-dns.txt').read_text().splitlines()) == 20000
+                finally:
+                    if traffic.poll() is None:
+                        traffic.kill()
+                        traffic.wait(timeout=5)
+                    traffic_log.close()
+                test.passed('repeated enrollment preserves live selected DNS and clean restart status')
                 def service_resources():
                     fields = execute('systemctl', 'show', UNITS[1], '-p', 'CPUUsageNSec', '-p', 'MemoryCurrent').stdout
                     return {k: int(v) for line in fields.splitlines() for k, v in [line.split('=', 1)]}
@@ -400,11 +443,15 @@ def main():
                     'memory_current_bytes': after['MemoryCurrent'],
                     'note': 'VM observation including service children; no TV latency or CPU budget verdict.'}, indent=2))
                 old_pid = int(unit_state(UNITS[1])['MainPID']); assert old_pid > 0, 'daemon exited before SIGKILL gate'
+                restart_after = time.time()
                 test.service('kill', '--kill-whom=main', '--signal=SIGKILL', UNITS[1])
                 assert test.native()['links'] == first['links'] and test.native()['maps'] == first['maps']
                 dns(blocked=True); dns(False); ip_probe(blocked=True)
-                wait_for(lambda: int(unit_state(UNITS[1]).get('MainPID', '0')) not in (0, old_pid) and test.ready(),
-                         'systemd restarted killed controller')
+                def restarted():
+                    if int(unit_state(UNITS[1]).get('MainPID', '0')) in (0, old_pid): return False
+                    status = test.cli('status')
+                    return status.get('state') == 'ready' and (status.get('dns_last_checked') or 0) > restart_after
+                wait_for(restarted, 'new controller completed a fresh readiness check')
                 dns(); ip_probe()
                 test.passed('SIGKILL retains pinned traffic protection and systemd restart recovers readiness')
                 before_stop = snapshot()

@@ -398,8 +398,26 @@ class Controller:
     def _edit(self, action, path):
         try:
             with self._locked() as (state, config):
-                previous, _ = self._journal(state)
+                previous, identity = self._journal(state)
                 was_ready = previous is not None and previous['state'] == 'ready'
+                if (was_ready and previous['pending'] is None and
+                        (action == 'add') == (path in previous['policy'])):
+                    try:
+                        self.host_check()
+                        profile, digest, policy, _ = self._inputs(config)
+                        if digest != previous['profile_digest'] or sorted(policy) != sorted(previous['policy']):
+                            raise ControllerError('configuration needs guarded recovery')
+                        # _ready verifies current kernel identity/policy and real
+                        # network/DNS health before retaining an already-ready state.
+                        return self._ready(state, profile, previous, identity)
+                    except (OSError, ValueError, RuntimeError):
+                        try:
+                            self._block(previous, policy=False)
+                        except (OSError, ValueError, RuntimeError, KeyError):
+                            pass  # Changed pin identities must never be adopted.
+                        _, identity = self._journal(state)
+                        self._degrade(state, previous, identity)
+                        raise
                 profile, journal, identity = self._guard(state, config)
                 if journal['state'] == 'disabled':
                     raise ControllerError('activate the guard before changing enrolled policy')
@@ -429,6 +447,16 @@ class Controller:
                     raise
         except (OSError, ValueError, RuntimeError):
             raise ControllerError('policy edit is blocked; its durable intent is retained for recovery') from None
+
+    def include_list(self):
+        directory = own.open_private_dir(self.paths.config, owner_uid=self.owner_uid)
+        try:
+            text, _ = read_private(directory, 'settings.json', 32 * 1024 * 1024)
+            paths = list(parse_policy(text).included_executables)
+        finally:
+            os.close(directory)
+        return {'mode': 'include', 'source': 'configured', 'live_enforcement': 'not_checked',
+                'included_executables': paths}
 
     def include_add(self, path):
         key = canonical_executable(path)
@@ -499,8 +527,16 @@ class Controller:
             with self._locked() as (state, _):
                 journal, _ = self._journal(state)
                 disabled = journal is not None and journal['state'] in ('disabled', 'disabling')
+                ready = journal is not None and journal['state'] == 'ready' and journal['pending'] is None
             if not disabled:
-                self.activate()
+                checked = None
+                if ready:
+                    try:
+                        checked = self.check()['state']
+                    except (OSError, ValueError, RuntimeError):
+                        pass  # Uncertain startup still requires guarded activation.
+                if checked not in ('ready', 'disabled', 'disabling'):
+                    self.activate()
             while not event.wait(interval):
                 self.check()
         finally:
