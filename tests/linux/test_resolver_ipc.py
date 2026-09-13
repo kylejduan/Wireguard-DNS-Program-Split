@@ -258,6 +258,7 @@ char LICENSE[] SEC("license")="GPL";
         expected=sorted(map(str,(included,future,redirected)))
         assert json.loads(control('policy',pins).stdout)==expected
         snapshot=json.loads(control('snapshot',pins).stdout)
+        assert snapshot['paths']==expected, 'snapshot must include policy under the same ownership lock'
         assert snapshot['abi']==2 and snapshot['ready'] is False
         assert len(snapshot['maps'])==12 and len(snapshot['links'])==12
         assert snapshot['mask']==0x00ff0000 and snapshot['mark']==0x00010000
@@ -272,6 +273,7 @@ char LICENSE[] SEC("license")="GPL";
         redirected.unlink(); shutil.copy2(direct,redirected); check(redirected,'stream',server_path)
         control('path-del',pins,redirected)
         assert json.loads(control('policy',pins).stdout)==sorted(map(str,(included,future)))
+        assert json.loads(control('snapshot',pins).stdout)['paths']==sorted(map(str,(included,future)))
         pending=work/'pending-image'
         control('path-add-policy',pins,pending)
         assert str(pending) in json.loads(control('policy',pins).stdout)

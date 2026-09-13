@@ -131,9 +131,8 @@ class NativeGuard:
     def snapshot(self):
         try:
             data = json.loads(self._run('snapshot', self.pins))
-            paths = json.loads(self._run('policy', self.pins))
             return {'abi': data['abi'], 'state': 'ready' if data['ready'] else 'blocked',
-                    'mask': data['mask'], 'mark': data['mark'], 'paths': paths,
+                    'mask': data['mask'], 'mark': data['mark'], 'paths': data['paths'],
                     'pins': {'maps': data['maps'], 'links': data['links']}}
         except (ValueError, KeyError, TypeError):
             raise ControllerError('native guard returned an invalid observation') from None

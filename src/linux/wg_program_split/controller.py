@@ -182,6 +182,8 @@ class Controller:
                                     allocation=Allocation(**journal['allocation']), receipt=receipt)
 
     def _audit(self, journal, paths=()):
+        if not paths and not journal['restart_required']:
+            return  # No enrollment or retained lineage to inspect; sticky flag stays intact.
         observed = restart_audit(paths, self.processes(), journal['restart_required'])
         if observed:
             journal['restart_boundary_unresolved'] = True
@@ -304,10 +306,11 @@ class Controller:
         health = network.health()
         if not health.ready or health.changed or health.missing:
             raise ControllerError('owned network changed during readiness probe')
-        self._observed(journal)
+        observed = self._observed(journal)
         if not was_ready:
             self.kernel.set_state('ready')
-        if self._observed(journal)['state'] != 'ready':
+            observed = self._observed(journal)
+        if observed['state'] != 'ready':
             raise ControllerError('ready state readback failed')
         journal.update(state='ready', reason=None, probe_at=time.time())
         self._audit(journal)
