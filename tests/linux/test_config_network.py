@@ -1,6 +1,6 @@
 """Strict configuration and real filesystem ownership boundaries; no network I/O."""
 import base64
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 import hashlib
 import json
 import os
@@ -377,6 +377,27 @@ class OwnershipTests(TemporaryFiles):
                 ownership.write_receipt(fd, replace(receipt, resources=(resource,)))
             self.assertNotIn(KEY, str(error.exception))
         self.assertFalse((self.state / 'receipt.json').exists())
+
+    def test_private_wireguard_birth_identities_roundtrip_without_file_contents(self):
+        fd = self.opened()
+        receipt = ownership.new_receipt(boot_id=BOOT)
+        private = ownership.create_owned_file(fd, 'wg.conf', b'placeholder only')
+        resources = (
+            ownership.ResourceIdentity('private_directory', 'configuration',
+                {'path': '/etc/wireguard/wgps-' + receipt.attempt_id,
+                 'device': 1, 'inode': 2, 'owner_uid': 0, 'mode': 448}),
+            ownership.ResourceIdentity('private_file', 'configuration',
+                {'directory_device': 1, 'directory_inode': 2,
+                 'file': asdict(private)}),
+        )
+        stored = replace(receipt, resources=resources)
+        ownership.write_receipt(fd, stored)
+        self.assertEqual(ownership.read_receipt(fd), stored)
+        for kind in ('private_file', 'private_directory'):
+            bad = replace(stored, resources=(ownership.ResourceIdentity(kind, 'configuration',
+                          {'PrivateKey': KEY}),))
+            with self.assertRaises(ownership.OwnershipError):
+                ownership.write_receipt(fd, bad, expected=stored)
 
     def test_failure_after_receipt_publication_requires_readback_not_automatic_rollback(self):
         fd = self.opened()

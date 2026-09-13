@@ -25,7 +25,8 @@ _RECEIPT = 'receipt.json'
 _LOCK = '.lock'
 _MAX_RECEIPT = 1024 * 1024
 _RESOURCE_KINDS = {'interface', 'route', 'rule', 'nft_table', 'conntrack_zone',
-                   'bpf_link', 'bpf_map', 'process', 'sysctl'}
+                   'bpf_link', 'bpf_map', 'process', 'sysctl',
+                   'private_file', 'private_directory'}
 
 
 class OwnershipError(RuntimeError):
