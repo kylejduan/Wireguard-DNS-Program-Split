@@ -64,6 +64,10 @@ See [Installation](docs/installation.md), [Architecture](docs/architecture.md), 
 
 `./tests/run.sh` cross-compiles with warnings as errors, runs native self-tests, parses every PowerShell script, tests profile transformation and rollback, verifies resource-ownership checks, and tests the non-mutating installation plan.
 
+## Linux proposal
+
+Automatic executable-path inclusion for Linux is described in the [proposed design](docs/superpowers/specs/2026-09-12-linux-include-mode-design.md) and [implementation plan](docs/superpowers/plans/2026-09-12-linux-include-mode.md). Peer review and kernel/DNS validation are pending; Linux support is not yet implemented.
+
 Contributions are welcome under [GPL-3.0-or-later](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 This project is independent and is not affiliated with or endorsed by WireGuard, Proton AG, or Private Internet Access.

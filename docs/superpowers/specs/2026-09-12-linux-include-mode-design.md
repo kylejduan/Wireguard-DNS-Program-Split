@@ -1,0 +1,297 @@
+# Automatic Linux executable-path VPN and DNS inclusion
+
+Status: proposed architecture, September 12, 2026. A completed peer review
+is pending. Linux is not implemented and no runtime or deployment success
+is claimed.
+
+## Required behavior
+
+An included native executable uses WireGuard for new IPv4 Internet
+connections and the VPN profile resolver for ordinary DNS, however it is
+started: shell, desktop, cron, system service or user service. A wrapper,
+special launcher, UID-only rule or process-name match does not satisfy
+this contract. Unlisted programs retain their normal IP and host/router
+DNS path. Preserve intentional Tailscale DNS domains for unlisted clients.
+
+The first target is native Ubuntu 26.04 with its 7.0 kernel, systemd,
+cgroup v2, kernel BTF and enabled BPF LSM. Probe required helpers and
+attachment behavior; a version string alone is insufficient. Other kernel
+or distribution combinations receive support only after equivalent tests.
+The native Rust bot fits the executable model; its final deployment path
+and launch environment still require a fresh enrollment audit.
+
+Initial scope is IPv4 TCP/UDP and ordinary UDP/TCP DNS. Block included
+IPv6 and unsupported raw/packet socket access without changing host IPv6.
+Helpers are included by their own executable paths, as on Windows.
+Interpreted scripts identify their interpreter; listing a script alone
+must be rejected rather than silently include every Python/bash program.
+Existing or inherited connections require restart and must not be
+presented as newly classified connections. Other network namespaces,
+different filesystem roots and arbitrary network-delegating IPC are
+outside initial support. This is not a security boundary against hostile
+applications or host administrators. Host localhost remains available;
+there is no network-namespace relocation of applications.
+
+## Decision and alternatives
+
+Recommend a native eBPF classifier, a dedicated WireGuard routing table,
+owned nftables rules and a dedicated tunnel-only dnsmasq instance. These
+are separate Linux components in this repository. The Windows components
+keep their existing architecture.
+
+| Option | Assessment |
+|---|---|
+| eBPF LSM path classification before socket use | Recommended; supports normal launches and synchronous matching, but requires BPF LSM and a verifier/behavior proof before implementation can be accepted. |
+| vopono or a plain WireGuard application namespace | Good launcher-based mechanisms; fail the explicit automatic-path requirement. |
+| Userspace exec monitoring plus PID/cgroup marking | Useful precedent in existing VPN clients; an asynchronous update must not be represented as protecting the first socket without a synchronous admission mechanism. |
+| NFQUEUE classification of all new host flows | Could hold packets during attribution, but adds availability and connection-latency costs for unlisted applications; not selected. |
+
+Proton's published Linux daemon provides source-level evidence for socket
+marking and userspace process monitoring. It does not by itself prove this
+project's required first-socket and per-application DNS contract. No
+existing project examined has been established as a drop-in solution for
+the complete requirement. This is a recommendation from source inspection,
+not a benchmark or a completed third-party security audit.
+
+## Synchronous executable classification
+
+Preferred proof candidate: attach a `BPF_PROG_TYPE_LSM` program with
+`BPF_LSM_CGROUP` attachment at `socket_post_create` to the root cgroup.
+Resolve the current task's actual executable using
+`bpf_get_task_exe_file`, `bpf_path_d_path` and `bpf_put_file`; compare its
+canonical absolute path against the configured map. For included IPv4
+sockets, set the reserved socket mark with the permitted
+`bpf_setsockopt(SO_MARK)` helper before userspace can connect or send.
+
+This distinction matters: the filesystem kfuncs are registered for LSM
+programs, and the socket-option helper is limited to particular cgroup
+LSM hooks. Do not call a pathname helper from a generic cgroup socket
+program and assume the verifier will allow it. The first development
+phase must load and exercise the exact combined program.
+
+A second acceptable implementation, if the combined hook is rejected,
+is an LSM `socket_create` classifier followed synchronously by a cgroup
+socket-create marker, with a verified task-local decision handoff. This
+is the only planned fallback; it must pass the same first-socket tests.
+If both fail, stop and revise the architecture before building a controller.
+
+Use full canonical paths, not basename, `comm`, PID-only decisions or a
+static device/inode allowlist. Binary replacement at the same registered
+path must be covered synchronously. Distinct hard-link paths must not be
+silently treated as equivalent. Specify symlink canonicalization, renamed
+or deleted running executables and policy reload behavior in executable
+fixtures. A cache, if used, must be invalidated by executable identity and
+policy generation without a userspace first-packet race.
+
+Check the filesystem-root and network-namespace identity as well as the
+path; a coincident pathname inside a container is not an enrolled host
+executable. A systemd private mount namespace that preserves the host root
+must be covered by the normal-service fixtures. Unknown, unreadable or
+truncated userspace paths return a socket error and a diagnostic, never an
+assumed direct classification. Report this possible affected-request
+failure separately from known-unlisted traffic passing normally.
+
+Preserve unrelated socket-mark bits and inspect existing effective cgroup
+attachments before choosing an owned mask. Do not override another BPF
+program, systemd firewall or Tailscale mark. Global LSM guards preserve
+prior deny results; cgroup LSM return semantics and composition require
+separate tests. Ordinary kernel-created transport sockets are explicitly
+outside application classification.
+
+## Payload routing
+
+Create `wgps0` in the host with no global default route. Import a validated
+profile using native `wg` operations, without executing `wg-quick` hooks.
+An owned mark rule selects a dedicated routing table for application and
+VPN-DNS upstream marks. The WireGuard encrypted transport uses a separate
+class/mark that follows the physical host route and never recurses into
+its own table.
+
+Keep a terminal unreachable/blackhole route in the VPN table, plus an
+owned output guard that rejects marked nonlocal traffic unless it leaves
+through `wgps0`. Removing the interface must not allow policy lookup to
+fall through to the host default. Test initial TCP SYN routing, UDP,
+explicit source/interface binds, return traffic, reverse-path filtering
+and conntrack. Source-address selection must be proven before adding any
+SNAT; if needed, SNAT is restricted to the owned marks and tunnel output.
+
+Leave the host's local routing rule intact for localhost. Selected DNS
+has an explicit interception rule before any loopback exemption. Do not
+add an automatic LAN/Tailscale bypass for selected applications. Unlisted
+applications retain existing LAN, Tailscale and physical routes.
+
+This design necessarily adds scoped host policy rules and firewall chains.
+It does not replace the host default route, flush firewall tables, enable
+IP forwarding or introduce a universal userspace payload proxy.
+
+## DNS selection before the shared resolver
+
+```mermaid
+flowchart LR
+    A[Included executable socket] --> M[Kernel path classifier and mark]
+    M -->|TCP and UDP payload| W[WireGuard routing table]
+    M -->|Ordinary port 53 DNS| N[Owned nftables output translation]
+    N --> D[Dedicated local DNS forwarder]
+    D -->|Only profile DNS through WireGuard| W
+    B[Unlisted application] --> H[Existing host resolver and router route]
+```
+
+Redirect only included UDP/TCP port-53 traffic to an owned IPv4 loopback
+listener on a nonstandard port. This includes queries aimed at the host's
+loopback resolver stub. They are selected before systemd-resolved receives
+them; no shared-resolver process attribution or name/timing heuristic is
+needed. Conntrack must restore the original peer tuple for both connected
+UDP and TCP clients. Prove this behavior with packet captures and peer
+address assertions before committing to the final translation rules.
+
+Use a private dnsmasq instance from the distribution's `dnsmasq-base`
+package. Give it an explicit private config, only the chosen listener,
+`no-resolv`, `no-hosts`, no DHCP/TFTP/RA, no query logging and one literal
+profile DNS upstream. Bind upstream queries to `wgps0` using its documented
+server interface option. Do not load `/etc/dnsmasq.conf` or host snippets.
+A dedicated service UID plus executable identity receives a separate
+DNS-upstream mark, so its traffic cannot re-enter application DNS
+translation. Other dnsmasq instances are not included.
+
+The DNS service's firewall policy permits upstream DNS only to the
+profile resolver through `wgps0`, plus necessary replies to its local
+clients. It must reject fallback to the host resolver or physical egress.
+Check capabilities, interface binding and marking from the first upstream
+socket, including TCP-worker children. Reserve/check listener ownership;
+a port collision fails startup without disturbing another resolver.
+
+Unlisted DNS continues directly to the host's existing resolver, whose
+ordinary upstream is the router after the old full tunnel is retired.
+No catch-all host DNS rule, TTL changes or global cache flush is required.
+App-owned DoH/DoT/DoQ uses the VPN as payload, but is not rewritten to
+profile DNS. This distinction matches the existing Windows contract.
+
+### Resolver IPC boundary
+
+Packet classification cannot attribute DNS delegated through filesystem
+Unix sockets or shared caches. Add synchronous, selected-process LSM
+restrictions for known resolver IPC: resolved Varlink, system/user D-Bus,
+Avahi and nscd sockets and shared hosts-cache files. File/socket identity
+and alias handling must be tested, not just textual prefix guesses.
+Preserve unrelated host processes' access. Do not globally edit NSS.
+
+Supported initial ordinary lookup uses libc's `dns` NSS path and the
+existing resolver stub, as observed on the reference host. Preflight must
+reject an unsupported NSS/cache arrangement and refuse a protection-ready
+status. If `nss-resolve` fallback is later claimed, prove both successful
+fallback to marked DNS and zero host-daemon queries. Direct use of a
+blocked resolver IPC API may fail; it must never silently resolve directly.
+
+Test late-created sockets, warm shared caches, inherited descriptors and
+both UDP/TCP lookups. Applications delegating networking to an existing
+host helper cannot be accepted merely because their main executable is
+listed. Exclude untested IPC integrations from supported enrollment.
+
+## Configuration, control and failure behavior
+
+Configuration consists of one private profile, a list of canonical included
+executable paths, and versioned Linux routing/DNS policy. No per-app user,
+argument or launcher registration is required. Profile parsing accepts
+one IPv4 address, DNS server and full-tunnel peer with a literal IPv4
+endpoint; validates key encodings/ports/MTU; and rejects IPv6, duplicates,
+unknown fields, `Table`, `FwMark`, shell hooks and `SaveConfig`.
+
+Use a small native libbpf loader/controller boundary and Python standard
+library for strict configuration, orchestration and ownership. The
+installed Python control path runs isolated from caller imports. All
+privileged executables, policy maps and manifests are root-owned. Private
+keys never enter command arguments, environment, logs or Git.
+
+Pin BPF links and maps so controller exit does not remove classification.
+Start in a selected-app blocking state, install table/guards, start the
+VPN and DNS forwarder, validate them, then atomically publish readiness.
+Unlisted traffic is unchanged by these phases. Controller or DNS failure
+retains guards; loss of VPN connectivity never selects a direct fallback.
+Distinguish policy-ready, tunnel handshake and independently tested DNS/IP
+health. Recovery adopts only verified owned state.
+
+Attach protection before ordinary boot-time network/application startup;
+prove this with an early-start test application. No protection claim
+covers execution before the early guard is installed. A failed boot guard
+must be reported, and the actual bot's service ordering must prevent its
+unguarded start without turning normal runtime inclusion into a launcher
+requirement. Installation does not silently alter an existing bot unit.
+
+Policy edits apply to new sockets. Document and detect existing selected
+connections that require restart. Stopping the management service retains
+protection; an explicit disable/uninstall operation releases it after
+reporting affected running applications. Never kill arbitrary matching
+processes as cleanup. Own and track every added rule, BPF pin, interface,
+service, listener and file; retain foreign/modified resources. Keep all
+keys and private live observations beneath ignored local/runtime roots.
+
+## Reference-host migration
+
+Read-only inspection found an existing full-tunnel VPN, catch-all VPN DNS,
+a repair daemon that would restart that VPN, active collectors, and
+Tailscale routing/DNS exceptions. BPF LSM is compiled into the kernel but
+absent from the enabled LSM list. The plan therefore has two distinct host
+gates: enable the required kernel hook on a coordinated reboot, and retire
+the old full-tunnel ownership during a protected-capture-aware cutover.
+
+1. Validate the complete implementation in a disposable matching VM first.
+2. Prepare an exact boot-parameter change that appends BPF LSM while
+   preserving the effective existing LSM order. Verify Secure Boot and
+   lockdown compatibility. Do not remove AppArmor or other protections.
+   Obtain a maintenance window and test the effective post-reboot state.
+3. Inventory the actual old VPN owners, repair settings and route/DNS
+   hooks; prepare rollback and verify independent LAN access. Do not
+   stop protected captures or inspect their outcomes.
+4. Retire only the repair daemon's old VPN responsibility, preserve its
+   LAN/Tailscale duties, then stop/disable the old full tunnel through its
+   owner. Do not run old/new tunnels with the same provider identity
+   concurrently because peer endpoint roaming can interrupt the old one.
+5. Prove host public routes and DNS go to the router. Router-to-Cloudflare
+   DoH requires separate router evidence; TV-to-router DNS is not that
+   evidence. Preserve intentional Tailscale-specific DNS behavior.
+6. Prove harmless included/unlisted executables' TCP/UDP/DNS paths and
+   failures before enrolling the actual bot. Verify collectors, LAN,
+   Tailscale, local metrics and durable startup afterward.
+
+Live migration is separate from adding this reusable Linux implementation.
+The installer does not automatically change kernel boot options or disable
+another VPN. Private deployment values do not enter these public docs.
+
+## Acceptance gates
+
+The implementation plan starts with three mandatory proofs: exact-path
+classification and marking before first traffic; reversible UDP/TCP DNS
+translation to the tunnel-only resolver; and resolver IPC/cache isolation.
+All must pass before productizing the controller or changing TV.
+
+Subsequent tests cover executable replacement, aliases, helpers, immediate
+connect, same-name DNS concurrency, IPv6, pinned-loader failure, removed
+interfaces, restart/boot ordering, rule conflicts, DNS outages and complete
+owned cleanup. Measure new-connection latency and sustained unlisted
+throughput. Keep configuration inspection, peer/model agreement, test
+success and live deployment acceptance as distinct claims.
+
+See the [implementation plan](../plans/2026-09-12-linux-include-mode.md).
+
+## Primary sources
+
+- [Linux VFS BPF kfunc implementation](https://github.com/torvalds/linux/blob/v7.0/fs/bpf_fs_kfuncs.c):
+  executable file/path APIs and LSM-only registration.
+- [Linux BPF LSM helper restrictions](https://github.com/torvalds/linux/blob/v7.0/kernel/bpf/bpf_lsm.c):
+  cgroup LSM socket-option availability and supported hooks.
+- [Linux socket creation](https://github.com/torvalds/linux/blob/v7.0/net/socket.c):
+  post-create security checks occur before returning the socket.
+- [BPF LSM documentation](https://docs.kernel.org/bpf/prog_lsm.html):
+  attachment and security-hook model.
+- [Proton socket monitor](https://github.com/ProtonVPN/proton-vpn-daemon/blob/stable/proton/vpn/daemon/split_tunneling/apps/socket_monitor.py)
+  and [process monitor](https://github.com/ProtonVPN/proton-vpn-daemon/blob/stable/proton/vpn/daemon/split_tunneling/apps/process_monitor.py):
+  existing socket-marking and asynchronous tracking mechanisms.
+- [dnsmasq manual](https://thekelleys.org.uk/dnsmasq/docs/dnsmasq-man.html):
+  isolated configuration, resolver forwarding and upstream interface binding.
+- [ip rule manual](https://man7.org/linux/man-pages/man8/ip-rule.8.html):
+  marked policy routing and terminal failure rules.
+- [nss-resolve documentation](https://github.com/systemd/systemd/blob/main/man/nss-resolve.xml):
+  filesystem Unix-socket resolver delegation.
+- [vopono](https://github.com/jamesmcm/vopono) and
+  [WireGuard namespaces](https://www.wireguard.com/netns/):
+  the launcher-based alternatives considered.
