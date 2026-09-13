@@ -70,6 +70,8 @@ The experimental [Linux implementation](docs/linux.md) automatically selects nat
 
 The tested kernel target is native Ubuntu 26.04 with Linux 7.0 and active BPF LSM. Read the [Linux operating limits](docs/linux.md) and [migration procedure](docs/linux-migration.md), especially existing sockets/cache mappings, early boot, helpers and application-owned encrypted DNS. TV deployment and its latency acceptance are separate from the repository implementation.
 
+Bot agents can manage their own entries using the [application enrollment workflow](docs/linux-agents.md). It covers native programs, Python, Node, Java, .NET and shell applications through their actual runtime/helper executables, with guidance for dedicated runtimes and shared interpreters.
+
 Contributions are welcome under [GPL-3.0-or-later](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 This project is independent and is not affiliated with or endorsed by WireGuard, Proton AG, or Private Internet Access.
