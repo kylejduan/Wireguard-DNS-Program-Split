@@ -64,9 +64,11 @@ See [Installation](docs/installation.md), [Architecture](docs/architecture.md), 
 
 `./tests/run.sh` cross-compiles with warnings as errors, runs native self-tests, parses every PowerShell script, tests profile transformation and rollback, verifies resource-ownership checks, and tests the non-mutating installation plan.
 
-## Linux proposal
+## Linux include mode
 
-Automatic executable-path inclusion for Linux is described in the [proposed design](docs/superpowers/specs/2026-09-12-linux-include-mode-design.md) and [implementation plan](docs/superpowers/plans/2026-09-12-linux-include-mode.md). Peer review and kernel/DNS validation are pending; Linux support is not yet implemented.
+The experimental [Linux implementation](docs/linux.md) automatically selects native executable paths at socket creation. Included IPv4 TCP/UDP uses kernel WireGuard, ordinary included DNS uses the profile resolver through that tunnel, and unlisted programs retain host routing and DNS. No launcher or packet proxy is required. Linux supports include mode only.
+
+The tested kernel target is native Ubuntu 26.04 with Linux 7.0 and active BPF LSM. Read the [Linux operating limits](docs/linux.md) and [migration procedure](docs/linux-migration.md), especially existing sockets/cache mappings, early boot, helpers and application-owned encrypted DNS. TV deployment and its latency acceptance are separate from the repository implementation.
 
 Contributions are welcome under [GPL-3.0-or-later](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
