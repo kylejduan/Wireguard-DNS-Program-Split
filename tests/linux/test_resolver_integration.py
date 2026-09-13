@@ -1,4 +1,5 @@
 """Real distro resolver integration; privileged work requires explicit --vm."""
+from contextlib import contextmanager
 import json
 import hashlib
 import os
@@ -7,6 +8,7 @@ import select
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -19,6 +21,64 @@ import uuid
 
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+@contextmanager
+def runtime_arena(evidence, *, parent=Path('/var/lib')):
+    """Keep live Unix paths short; archive only after verified namespace cleanup."""
+    work = Path(tempfile.mkdtemp(prefix='wgps-ri-', dir=parent))
+    original = work.lstat()
+    cleaned = False
+
+    def complete():
+        nonlocal cleaned
+        cleaned = True
+
+    def retained():
+        (evidence / 'retained-runtime.json').write_text(json.dumps({
+            'path': str(work), 'dev': original.st_dev, 'ino': original.st_ino,
+            'cleanup_complete': cleaned}, indent=2) + '\n')
+        print('Retained runtime arena:', work, flush=True)
+
+    def verify():
+        current = work.lstat()
+        if (current.st_dev, current.st_ino, current.st_mode, current.st_uid) != (
+                original.st_dev, original.st_ino, original.st_mode, original.st_uid):
+            raise RuntimeError('resolver runtime arena identity changed; retaining paths')
+
+    try:
+        yield work, complete
+    finally:
+        if not cleaned:
+            retained()  # Never move paths still referenced by an uncertain namespace.
+        else:
+            try:
+                verify()
+                entries = []
+                for path in sorted(work.rglob('*')):
+                    info = path.lstat()
+                    entries.append({'path': str(path.relative_to(work)), 'mode': info.st_mode,
+                                    'dev': info.st_dev, 'ino': info.st_ino, 'uid': info.st_uid,
+                                    'gid': info.st_gid, 'size': info.st_size,
+                                    'mtime_ns': info.st_mtime_ns})
+
+                def skip_special(directory, names):
+                    return [name for name in names if not any(predicate(
+                        (Path(directory) / name).lstat().st_mode)
+                        for predicate in (stat.S_ISREG, stat.S_ISDIR, stat.S_ISLNK))]
+
+                # Socket contents cannot be copied. Their identity is preserved
+                # in metadata; regular nscd cache files remain binary evidence.
+                shutil.copytree(work, evidence, symlinks=True, ignore=skip_special,
+                                dirs_exist_ok=True)
+                (evidence / 'runtime-metadata.json').write_text(json.dumps({
+                    'path': str(work), 'dev': original.st_dev, 'ino': original.st_ino,
+                    'cleanup_complete': True, 'entries': entries}, indent=2) + '\n')
+                verify()
+                shutil.rmtree(work)
+            except BaseException:
+                retained()
+                raise
 
 
 def read_line(process, timeout=12):
@@ -114,7 +174,7 @@ def configure(work, mdns):
         'publish-hinfo=no\npublish-workstation=no\n[reflector]\nenable-reflector=no\n')
 
 
-def run_variant(work, mdns, state, loader, obj):
+def run_variant(work, mdns, state, loader, obj, *, cleanup_complete):
     from fixtures import run
     configure(work, mdns)
     ordinary, included, session = work / 'ordinary', work / 'included', work / 'retained'
@@ -275,6 +335,7 @@ def run_variant(work, mdns, state, loader, obj):
         stderr.close()
         if failures:
             raise RuntimeError('resolver integration cleanup failed: ' + '; '.join(failures))
+        cleanup_complete()
 
 
 def vm_tests():
@@ -294,9 +355,10 @@ def vm_tests():
         with vpn_fixture() as state:
             try:
                 for mdns in (False, True):
-                    work = evidence / ('mdns' if mdns else 'files-dns')
-                    work.mkdir()
-                    run_variant(work, mdns, state, loader, obj)
+                    archive = evidence / ('mdns' if mdns else 'files-dns')
+                    archive.mkdir()
+                    with runtime_arena(archive) as (work, complete):
+                        run_variant(work, mdns, state, loader, obj, cleanup_complete=complete)
             finally:
                 for ledger in ('direct.jsonl', 'vpn.jsonl'):
                     if (state / ledger).exists():
