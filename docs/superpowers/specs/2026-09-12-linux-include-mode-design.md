@@ -12,6 +12,9 @@ started: shell, desktop, cron, system service or user service. A wrapper,
 special launcher, UID-only rule or process-name match does not satisfy
 this contract. Unlisted programs retain their normal IP and host/router
 DNS path. Preserve intentional Tailscale DNS domains for unlisted clients.
+Linux is include-mode only: no exclude list or host-wide VPN default mode.
+Minimal added latency and compute overhead are release requirements;
+automatic operation and routing correctness alone are insufficient.
 
 The first target is native Ubuntu 26.04 with its 7.0 kernel, systemd,
 cgroup v2, kernel BTF and enabled BPF LSM. Probe required helpers and
@@ -36,10 +39,13 @@ there is no network-namespace relocation of applications.
 
 ## Decision and alternatives
 
-Recommend a native eBPF classifier, a dedicated WireGuard routing table,
-owned nftables rules and a dedicated tunnel-only dnsmasq instance. These
-are separate Linux components in this repository. The Windows components
-keep their existing architecture.
+Recommend a native eBPF classifier, a dedicated WireGuard routing table
+and owned nftables rules. The early DNS experiment compares direct kernel
+DNS translation with a dedicated tunnel-only dnsmasq instance. Choose one
+from correctness and measured overhead before building its controller;
+do not ship two runtime backends merely because both were investigated.
+These are separate Linux components in this repository. The Windows
+components keep their existing architecture.
 
 | Option | Assessment |
 |---|---|
@@ -91,9 +97,12 @@ remain included without updating an inode map. The old unlinked running
 image's new sockets return an error requiring restart. Deleted or synthetic
 executable paths must never become known-unlisted through a map miss.
 Check file/dentry state rather than stripping the ambiguous ` (deleted)`
-text suffix; exercise real filenames with that suffix too. A cache, if
-used, must be invalidated by executable identity and policy generation
-without a userspace first-packet race. Fixtures assert these exact outcomes.
+text suffix; exercise real filenames with that suffix too. Start the proof
+without classification caching across sockets. Executable identity and
+policy generation alone do not notice a renamed executable or ancestor
+directory. Add a cache only after synchronous invalidation for every
+supported path/root/mount change is proved. Fixtures assert these exact
+outcomes, including rename contention and immediate first traffic.
 
 Check the filesystem-root and network-namespace identity as well as the
 path; a coincident pathname inside a container is not an enrolled host
@@ -138,25 +147,43 @@ IP forwarding or introduce a universal userspace payload proxy.
 
 ## DNS selection before the shared resolver
 
+Both candidates select only included UDP/TCP port-53 traffic before the
+shared host resolver receives it. Both must preserve original response
+peer tuples, keep failures off the router path and pass the same IPC/cache
+tests. Lower component count does not by itself prove lower DNS latency.
+
 ```mermaid
 flowchart LR
     A[Included executable socket] --> M[Kernel path classifier and mark]
     M -->|TCP and UDP payload| W[WireGuard routing table]
     M -->|Ordinary port 53 DNS| N[Owned nftables output translation]
-    N --> D[Dedicated local DNS forwarder]
-    D -->|Only profile DNS through WireGuard| W
+    N -->|Candidate A: direct profile DNS| W
+    N -->|Candidate B| D[Dedicated local DNS forwarder]
+    D -->|Profile DNS through WireGuard| W
     B[Unlisted application] --> H[Existing host resolver and router route]
 ```
 
-Redirect only included UDP/TCP port-53 traffic to an owned IPv4 loopback
-listener on a nonstandard port. This includes queries aimed at the host's
+First test direct output DNAT to the literal VPN DNS address with scoped
+source NAT to the tunnel address. Queries aimed at a loopback stub can
+already have a loopback source; output rerouting can reject that source
+before postrouting SNAT runs. The disposable-VM candidate may enable
+`route_localnet` on owned `wgps0` only, together with strict inbound rules
+admitting the intended conntrack replies and preventing access to unrelated
+host loopback listeners. Never change the host `all` or `default` setting.
+Prove both outgoing and reverse-translated incoming routing, source/device
+binds and reverse-path filtering. These are unverified experiments, not
+installation instructions or a proven replacement for the forwarder.
+
+For the forwarder candidate, redirect only included UDP/TCP port-53
+traffic to an owned IPv4 loopback listener on a nonstandard port. This
+includes queries aimed at the host's
 loopback resolver stub. They are selected before systemd-resolved receives
 them; no shared-resolver process attribution or name/timing heuristic is
 needed. Conntrack must restore the original peer tuple for both connected
 UDP and TCP clients. Prove this behavior with packet captures and peer
 address assertions before committing to the final translation rules.
 
-Use a private dnsmasq instance from the distribution's `dnsmasq-base`
+This candidate uses a private dnsmasq instance from the distribution's `dnsmasq-base`
 package. Give it an explicit private config, only the chosen listener,
 `no-resolv`, `no-hosts`, no DHCP/TFTP/RA, no query logging and one literal
 profile DNS upstream. Bind upstream queries to `wgps0` using its documented
@@ -228,6 +255,11 @@ retains guards; loss of VPN connectivity never selects a direct fallback.
 Distinguish policy-ready, tunnel handshake and independently tested DNS/IP
 health. Recovery adopts only verified owned state.
 
+DNS service, listener, service UID and upstream-mark requirements apply
+only if the forwarder wins the early experiment. If direct translation
+wins, remove those components and their configuration fields from the
+remaining plan; readiness checks exercise actual DNS through that path.
+
 Attach protection before ordinary boot-time network/application startup;
 prove this with an early-start test application. No protection claim
 covers execution before the early guard is installed. A failed boot guard
@@ -278,18 +310,54 @@ Live migration is separate from adding this reusable Linux implementation.
 The installer does not automatically change kernel boot options or disable
 another VPN. Private deployment values do not enter these public docs.
 
+## Performance acceptance
+
+There is no zero-overhead guarantee. Root-cgroup classification adds work
+to included and unlisted socket creation. Output mark checks run on packets,
+policy routing adds route-lookup work, and DNS NAT can activate conntrack
+for traffic beyond the matching rule. Resolver guards may add file/Unix-IPC
+hook work. A userspace DNS forwarder adds scheduling and forwarding work.
+Measure these costs separately from WireGuard encryption and the VPN's
+external route. Never infer performance from kernel placement alone.
+
+Keep established payload in the kernel, with no per-packet executable-path
+lookup, userspace packet queue, process-discovery delay or per-operation
+logging. Resolver guards should reject irrelevant target objects cheaply
+before expensive executable lookup when object/alias correctness permits.
+Do not add blanket `notrack` rules or weaken classification to win a test.
+
+Benchmark before productizing: baseline security configuration; BPF LSM
+enabled without project hooks; classifier; resolver guards; complete
+networking with an empty include list; then included workloads against
+plain WireGuard using the same peer, destination, DNS upstream and MTU.
+Compare both DNS candidates under equivalent warm/miss/cache conditions.
+
+Record p50/p95/p99 latency, CPU per completed operation/packet, context
+switches, memory and conntrack pressure. Cover socket churn, long-lived
+TCP, small-packet UDP, DNS hits/misses/TCP fallback, file/IPC-heavy unlisted
+workloads and representative bot request/deadline tails under concurrent
+background load. Repeat with production instrumentation settings and on
+target hardware before making a production latency claim.
+
+Report deltas, measurement resolution and confidence bounds. No numerical
+slowdown allowance has been accepted; do not invent one or equate an
+inconclusive difference with equivalence. Observed application slowdowns,
+new deadline misses or attributable loss/errors remain release blockers
+under the current requirement, alongside routing/DNS separation failures.
+
 ## Acceptance gates
 
 The implementation plan starts with three mandatory proofs: exact-path
 classification and marking before first traffic; reversible UDP/TCP DNS
 translation to the tunnel-only resolver; and resolver IPC/cache isolation.
-All must pass before productizing the controller or changing TV.
+All must pass together with the performance gate before productizing the
+controller or changing TV. Select and document the measured DNS transport
+before committing to a DNS service or its privileged runtime components.
 
 Subsequent tests cover executable replacement, aliases, helpers, immediate
 connect, same-name DNS concurrency, IPv6, pinned-loader failure, removed
 interfaces, restart/boot ordering, rule conflicts, DNS outages and complete
-owned cleanup. Measure new-connection latency and sustained unlisted
-throughput. Keep configuration inspection, peer/model agreement, test
+owned cleanup. Keep configuration inspection, peer/model agreement, test
 success and live deployment acceptance as distinct claims.
 
 See the [implementation plan](../plans/2026-09-12-linux-include-mode.md).
@@ -304,6 +372,11 @@ See the [implementation plan](../plans/2026-09-12-linux-include-mode.md).
   post-create security checks occur before returning the socket.
 - [Linux pathname reconstruction](https://github.com/torvalds/linux/blob/v7.0/fs/d_path.c):
   current executable paths and deleted/synthetic path handling.
+- [Linux NAT expressions](https://github.com/torvalds/linux/blob/v7.0/net/netfilter/nft_nat.c)
+  and [IPv4 output routing](https://github.com/torvalds/linux/blob/v7.0/net/ipv4/route.c):
+  conntrack acquisition, NAT hook restrictions and loopback-source routing.
+- [IPv4 netfilter rerouting](https://github.com/torvalds/linux/blob/v7.0/net/ipv4/netfilter.c):
+  preserved source/mark during output destination changes.
 - [BPF LSM documentation](https://docs.kernel.org/bpf/prog_lsm.html):
   attachment and security-hook model.
 - [Proton socket monitor](https://github.com/ProtonVPN/proton-vpn-daemon/blob/stable/proton/vpn/daemon/split_tunneling/apps/socket_monitor.py)

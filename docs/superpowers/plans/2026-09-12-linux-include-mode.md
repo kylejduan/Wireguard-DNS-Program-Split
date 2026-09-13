@@ -9,10 +9,11 @@ and ordinary DNS through WireGuard, regardless of their launch method.
 
 **Architecture:** Synchronous kernel executable-path classification and
 socket marking select an owned VPN routing table. Included DNS is
-translated to a private tunnel-only forwarder before the host resolver.
+translated before the host resolver. The early proof compares direct
+kernel translation with a private tunnel-only forwarder and chooses one.
 
 **Tech Stack:** C eBPF, native C++/libbpf loader, Python standard library,
-WireGuard/iproute2/nftables, private dnsmasq-base instance, systemd.
+WireGuard/iproute2/nftables, optional private dnsmasq-base instance, systemd.
 
 **Spec:** [Automatic executable-path design](../specs/2026-09-12-linux-include-mode-design.md).
 
@@ -26,6 +27,9 @@ joint review acceptance is claimed at this stage.
   kernel BTF and BPF LSM enabled. Verify exact helper/attachment support.
 - Include full native executable paths automatically. No wrapper/UID/name
   substitution and no asynchronous first-packet classification claim.
+- Include mode only. Minimum latency/compute overhead is a release gate
+  before controller work; neither zero overhead nor universal application
+  compatibility is established by this proposal.
 - Initial payload: IPv4 TCP/UDP. Block included IPv6; leave host IPv6 alone.
 - Helpers need their own paths. Reject script-only and unsupported
   container/namespace enrollment. Already-running selected programs need
@@ -51,6 +55,7 @@ joint review acceptance is claimed at this stage.
 Build only in a disposable VM with matching kernel and security settings.
 Record verifier output and active hooks. A successful compile is not a
 successful attachment, and an attached program is not traffic proof.
+Record the baseline and BPF-LSM-only timings before project attachment.
 
 - [ ] Build a minimal `lsm_cgroup/socket_post_create` program using the
   actual executable-file/path kfuncs and `bpf_setsockopt(SO_MARK)`. Use a
@@ -85,6 +90,13 @@ successful attachment, and an attached program is not traffic proof.
   Existing socket marks retain their class. Test symlink canonicalization,
   distinct hard links, multiple threads, helpers and policy changes.
   Reject unsupported script/namespace cases with an explicit reason.
+- [ ] Use no classification cache across sockets in the first proof.
+  Any later cache must handle executable and ancestor-directory renames,
+  policy updates and supported root/mount changes synchronously; identity
+  and policy generation alone are insufficient invalidation keys.
+- [ ] Measure socket-creation and first-response latency independently
+  for included/unlisted paths, concurrent churn and rename contention.
+  Record distributions and CPU cost; no unmeasured constant-time claim.
 - [ ] Inspect loader-crash behavior and pin/link ownership. Record kernel,
   effective LSMs, helper/attach results and packet/classification evidence
   under ignored `local/validation/`. Commit only source/tests after the
@@ -112,11 +124,23 @@ I/O. Test keys and addresses belong to the disposable fixture, not TV.
 - `tests/linux/test_dns_paths.py`: controlled responders and lookup clients.
 - `tests/linux/test_resolver_ipc.py`: cache, Varlink, D-Bus and alias fixtures.
 
-Consume the classifier ABI from phase 1. The policy distinguishes direct,
+Consume the classifier ABI from phase 1. First compare direct DNS DNAT
+against the private forwarder below. Both must pass the same routing,
+peer-tuple, failure and IPC/cache proofs. Select one from measured results
+before phase 3; remove the unused runtime path from the remaining plan.
+
+For the forwarder candidate, the policy distinguishes direct,
 included-application and internal DNS-forwarder sockets. The internal
 class uses the dedicated service UID and executable identity together;
 other instances of the same dnsmasq executable remain direct.
 
+- [ ] In the disposable VM, first test selected output DNAT directly to
+  numeric VPN DNS with strictly scoped tunnel-address SNAT. A loopback
+  source can fail rerouting before SNAT. Test `route_localnet` on owned
+  `wgps0` only, with inbound conntrack restrictions preventing unrelated
+  loopback-service access. Preserve host `all`/`default` settings; verify
+  source/device binds, reverse-path filtering and reverse translation.
+  This candidate is not a proven configuration.
 - [ ] Start a private dnsmasq listener on an unused loopback port with one
   numeric VPN DNS upstream and no default config/resolv/hosts files.
   Syntax-check with `dnsmasq --test` against the generated config.
@@ -148,6 +172,15 @@ other instances of the same dnsmasq executable remain direct.
   its mapping: require an explicit restart-needed result, then verify DNS
   separation after restart. Include inherited mappings in descendants;
   zero open network sockets must not imply per-application DNS readiness.
+- [ ] Finish the design's early performance gate: isolate classifier,
+  resolver-guard and networking costs; include an empty-list installation
+  and matched plain-WireGuard baseline. Measure both DNS candidates with
+  identical upstream/cache conditions. Cover latency tails, CPU/query,
+  packet rate, file/IPC-heavy unlisted work and representative bot traffic.
+  Do not turn a noisy result into a passing zero-overhead claim.
+- [ ] Record the selected DNS transport and remove unused forwarder or
+  direct-translation components from subsequent phases. If direct wins,
+  omit dnsmasq, its unit/UID/listener and DNS-forwarder-only settings.
 - [ ] Stop if DNS or IPC protection is not demonstrable; do not continue
   by redirecting all host DNS or weakening origin classification.
   Review the evidence and commit the scoped phase after it passes.
@@ -168,7 +201,8 @@ Private interfaces: `parse_profile(text: str) -> Profile`,
 `Operation` keeps secret stdin/file-descriptor input separate from its
 argument vector. No privileged command uses a shell.
 
-Proposed settings shape:
+Proposed settings shape for the forwarder candidate; omit its listener
+field if phase 2 selects direct DNS translation:
 
 ```json
 {
@@ -306,8 +340,13 @@ files by default. Neither operation kills arbitrary matching processes.
   include application-owned DoH as VPN payload, IPv6 attempts, MTU,
   VPN/DNS failure, loader death, rollback and real reboot ordering.
 - [ ] Measure unlisted new-connection latency and sustained throughput.
-  Require kernel forwarding for established payload; document measured
-  overhead and any regression rather than assuming it is zero.
+  Repeat the full early performance matrix with final components and
+  production instrumentation. Report p50/p95/p99, CPU per operation,
+  context switches, memory/conntrack pressure and bot deadline misses.
+  Require kernel forwarding for established payload; no per-packet path
+  lookup, userspace queue or operation-by-operation logging. No numerical
+  slowdown budget has been accepted; preserve regressions as blockers
+  rather than invent a tolerance or call inconclusive results equivalent.
 - [ ] Assert pre/post host resolver/default route invariants and inventory
   owned additions separately from pre-existing firewall/BPF objects.
   Drain only test-owned processes, ports, mounts, links and artifacts.
