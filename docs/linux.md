@@ -25,6 +25,10 @@ the kernel creates a socket. It sets the selected socket's routing mark before
 userspace receives the socket. Exact path matching is synchronous; there is no
 process polling window, wrapper, process-name match, UID substitution or cached
 classification shared between sockets.
+The temporary per-CPU pathname buffer is protected against task preemption
+through resolution and lookup; executable references are released afterward.
+The [forced-preemption regression](linux-performance.md#correctness-prerequisite)
+records the early implementation defect and verifies the correction.
 
 An owned routing table and nftables rules steer selected traffic through
 WireGuard. Port-53 DNS uses kernel destination/source translation, preserving the
@@ -41,33 +45,18 @@ endpoints. Ordinary IP sends and ordinary file operations do not repeat the
 guard's executable-path lookup. The controller checks health every five seconds;
 successful health checks do not briefly block new sockets.
 
-The final component comparison on September 13, 2026 measured nonzero overhead:
+The optimized controller shares a coherent guard snapshot and reads the owned
+WireGuard interface once per network observation. Ordinary-file and IP resolver
+guard paths reject irrelevant objects with fewer helper calls. Path identity,
+ownership verification, real DNS probes and the five-second health interval are
+retained.
 
-| DNS condition | Median batch p50 (us) | Median batch p99 (us) |
-|---|---:|---:|
-| Unlisted, project hooks absent | 33.2 | 316.4 |
-| Unlisted, hooks with empty policy | 37.0 | 334.3 |
-| Unlisted, full kernel rules and one included path | 46.3 | 389.7 |
-| Plain WireGuard | 151.1 | 979.0 |
-| Included, kernel DNS translation | 202.6 | 1383.4 |
-| Included, uncached forwarder comparison | 317.2 | 1300.1 |
-
-Each condition used five batches of 2,000 queries in a fixed order. Results varied
-substantially between VM runs. These are descriptive observations, not confidence
-bounds or a passing TV/bot latency budget. The DNS comparison exercises the final
-kernel components without the controller daemon. A separate controller-service
-sample used 0.275 CPU-seconds over 11.01 seconds (about 2.5% of one VM core) and
-15.3 MB current controller-cgroup memory, including service children and two
-health intervals. This memory sample excludes the separate early guard cgroup.
-That short sample does not establish sustained production resource use.
-
-Persistent TCP/UDP echo tests separately validated every payload byte, peer/source
-and lookup-counter window. Accepted windows performed no additional executable
-path lookups after socket creation. Background Unix-IPC counter activity was
-recorded separately and retried under a bounded rule; the retained timing samples
-are conditional on quiet windows. The harness reports RTT tails, client/guest CPU
-and echo throughput, with no zero-overhead or line-rate claim. TV release-build
-bot measurements remain necessary before deployment.
+The target is added local p99 overhead below 1 ms where practical, with minimal
+CPU cost. See the [performance comparison](linux-performance.md) for the controlled
+three-condition experiment, uncertainty and reproduction command. It measures
+the running controller alongside concurrent included and unlisted workloads.
+There is no zero-overhead, worst-case delay or Internet RTT guarantee. TV
+release-build bot measurements remain necessary before deployment.
 
 ## Supported host and applications
 
@@ -148,6 +137,7 @@ regardless of its normal launcher or system/user service.
 
 ```sh
 sudo wg-program-split include add /absolute/path/to/native-program
+sudo wg-program-split include list
 sudo wg-program-split activate
 sudo wg-program-split status
 sudo wg-program-split check
@@ -160,6 +150,14 @@ query and a recent observed WireGuard handshake are required before ready state.
 Profile changes require explicit disable/reactivation. Include edits use a
 durable pending operation and exact-key readback; deleting an entry still works
 after its file disappears or becomes a symlink. There is no bulk live reload.
+
+`include list` reads configured canonical paths without activating protection;
+use `check` for actual readiness. Repeating an already-effective inclusion or
+removing an absent key checks health without deliberately blocking healthy new
+sockets. Healthy controller restart likewise verifies and retains ready state.
+New enrollments and uncertain recovery still establish blocking protection first.
+See the [bot-agent workflow](linux-agents.md) for common language runtimes,
+helper enrollment, concurrent agents and application service dependencies.
 
 Already-open sockets and pre-existing mapped resolver caches cannot be revoked
 by enrollment. Status lists up to 1,024 observed processes needing restart (with an 8-MiB
