@@ -75,8 +75,7 @@ static __always_inline int dentry_role(struct dentry *dentry)
                     key.name[3]=='t' && key.name[4]=='s' && !key.name[5]) ||
                    (key.name[0]=='d' && key.name[1]=='b' && key.name[2] &&
                     key.name[7] && !key.name[8]);
-    __u32 parent_role=directory_role(parent);
-    if (cache_name && (parent_role&ROLE_CACHE_DIR)) role|=ROLE_CACHE;
+    if (cache_name && (directory_role(parent)&ROLE_CACHE_DIR)) role|=ROLE_CACHE;
     if (cache_name && !(role&ROLE_CACHE)) {
         char name[5]={};
         bpf_probe_read_kernel_str(name,sizeof(name),BPF_CORE_READ(parent,d_name.name));
@@ -235,11 +234,16 @@ int BPF_PROG(guard_datagram,struct socket *sock,struct socket *other,int ret)
     guard_count(GUARD_OBJECTS);
     return guard_selected();
 }
-static __always_inline int cache_guard(struct file *file)
+static __always_inline int stream_guard(struct socket *sock);
+static __always_inline int file_guard(struct file *file,bool check_stream)
 {
     if (!file) return 0;
     struct inode *inode=file->f_inode;
-    if ((BPF_CORE_READ(inode,i_mode)&0170000)!=0100000) return 0;
+    /* Typed CO-RE reads avoid a probe helper on each ordinary file operation.
+     * Regular files cannot be sockets; dispatch once, retaining splice checks
+     * for nonregular files on permission/descriptor-receive hooks. */
+    if (!inode || (inode->i_mode&0170000)!=0100000)
+        return check_stream ? stream_guard(bpf_sock_from_file(file)) : 0;
     int role=object_role(file->f_path.dentry,inode);
     if (role<0) return -EACCES;
     if (!(role&ROLE_CACHE)) return 0;
@@ -251,7 +255,7 @@ static __always_inline int stream_guard(struct socket *sock)
     if (!sock) return 0;
     struct sock *sk=sock->sk;
     if (!sk) return 0;
-    if (BPF_CORE_READ(sk,__sk_common.skc_family)!=AF_UNIX ||
+    if (sk->__sk_common.skc_family!=AF_UNIX ||
         (BPF_CORE_READ(sk,sk_type)!=SOCK_STREAM && BPF_CORE_READ(sk,sk_type)!=SOCK_SEQPACKET))
         return 0; /* No executable lookup on any IP payload path. */
     struct stream_label *role=bpf_sk_storage_get(&stream_roles,sk,0,0);
@@ -277,7 +281,7 @@ int BPF_PROG(guard_bind,struct socket *sock,struct sockaddr *address,int length,
     (void)ctx; (void)address; (void)length;
     if (ret) return ret;
     struct sock *sk=sock->sk;
-    if (!sk || BPF_CORE_READ(sk,__sk_common.skc_family)!=AF_UNIX ||
+    if (!sk || sk->__sk_common.skc_family!=AF_UNIX ||
         (BPF_CORE_READ(sk,sk_type)!=SOCK_STREAM && BPF_CORE_READ(sk,sk_type)!=SOCK_SEQPACKET)) return 0;
     struct stream_label *role=bpf_sk_storage_get(&stream_roles,sk,0,0);
     if (!role || role->role!=STREAM_SAFE) return 0;
@@ -291,27 +295,25 @@ int BPF_PROG(guard_bind,struct socket *sock,struct sockaddr *address,int length,
 }
 SEC("lsm/file_open")
 int BPF_PROG(guard_open,struct file *file,int ret)
-{ (void)ctx; return ret ? ret : cache_guard(file); }
+{ (void)ctx; return ret ? ret : file_guard(file,false); }
 SEC("lsm/mmap_file")
 int BPF_PROG(guard_mmap,struct file *file,unsigned long reqprot,unsigned long prot,unsigned long flags,int ret)
-{ (void)ctx; (void)reqprot; (void)prot; (void)flags; return ret ? ret : cache_guard(file); }
+{ (void)ctx; (void)reqprot; (void)prot; (void)flags; return ret ? ret : file_guard(file,false); }
 SEC("lsm/file_permission")
 int BPF_PROG(guard_read,struct file *file,int mask,int ret)
 {
     (void)ctx;
     if (ret || !(mask&MAY_READ)) return ret;
-    int result=cache_guard(file);
     /* splice(socket, pipe) performs file permission checks but does not call
      * socket_recvmsg. Apply the same stream role gate before exposing bytes. */
-    return result ? result : stream_guard(bpf_sock_from_file(file));
+    return file_guard(file,true);
 }
 SEC("lsm/file_receive")
 int BPF_PROG(guard_receive,struct file *file,int ret)
 {
     (void)ctx;
     if (ret) return ret;
-    int result=cache_guard(file);
-    return result ? result : stream_guard(bpf_sock_from_file(file));
+    return file_guard(file,true);
 }
 SEC("lsm/socket_sendmsg")
 int BPF_PROG(guard_send,struct socket *sock,struct msghdr *msg,int size,int ret)
