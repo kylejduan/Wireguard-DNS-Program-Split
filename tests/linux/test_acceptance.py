@@ -443,8 +443,13 @@ def main():
                     'memory_current_bytes': after['MemoryCurrent'],
                     'note': 'VM observation including service children; no TV latency or CPU budget verdict.'}, indent=2))
                 old_pid = int(unit_state(UNITS[1])['MainPID']); assert old_pid > 0, 'daemon exited before SIGKILL gate'
-                restart_after = time.time()
-                test.service('kill', '--kill-whom=main', '--signal=SIGKILL', UNITS[1])
+                old_process = os.pidfd_open(old_pid, 0)
+                try:
+                    test.service('kill', '--kill-whom=main', '--signal=SIGKILL', UNITS[1])
+                    assert select.select([old_process], [], [], 5)[0], 'old controller did not exit'
+                    restart_after = time.time()  # The old process can no longer publish readiness.
+                finally:
+                    os.close(old_process)
                 assert test.native()['links'] == first['links'] and test.native()['maps'] == first['maps']
                 dns(blocked=True); dns(False); ip_probe(blocked=True)
                 def restarted():
