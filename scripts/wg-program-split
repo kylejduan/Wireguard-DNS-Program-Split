@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/python3 -I /usr/lib/wg-program-split/wg-program-split.pyz "$@"
