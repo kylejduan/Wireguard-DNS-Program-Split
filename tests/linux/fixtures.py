@@ -117,6 +117,31 @@ def clear_owned_zone(zone):
         raise RuntimeError('could not clear owned test conntrack zone')
 
 
+def wait_ipv6_ready(device, *, namespace=None, timeout=5):
+    """Wait only for this acquired veth's DAD and local-route publication."""
+    prefix = ('ip', '-n', namespace) if namespace else ('ip',)
+    command = ('ip', 'netns', 'exec', namespace) if namespace else ()
+    disabled = run(*command, 'sysctl', '-n', f'net.ipv6.conf.{device}.disable_ipv6').stdout.strip()
+    if disabled == '1': return  # Respect an existing disabled-IPv6 fixture default.
+    assert disabled == '0', 'unexpected IPv6 interface configuration'
+    birth = json.loads(run(*prefix, '-j', 'link', 'show', 'dev', device).stdout)[0]['ifindex']
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        links = json.loads(run(*prefix, '-j', '-6', 'address', 'show', 'dev', device).stdout)
+        if links:
+            assert len(links) == 1 and links[0]['ifindex'] == birth, 'owned IPv6 fixture link changed'
+            addresses = [a for a in links[0]['addr_info'] if a['family'] == 'inet6']
+            def flagged(address, flag): return address.get(flag) or flag in address.get('flags', [])
+            if any(flagged(a, 'dadfailed') for a in addresses):
+                raise RuntimeError('owned fixture IPv6 duplicate address detection failed')
+            if addresses and not any(flagged(a, 'tentative') for a in addresses):
+                routes = json.loads(run(*prefix, '-j', '-6', 'route', 'show', 'table', 'local', 'dev', device).stdout)
+                local = {r.get('dst', '').split('/')[0] for r in routes if r.get('type') == 'local'}
+                if all(a['local'] in local for a in addresses): return
+        time.sleep(.02)
+    raise RuntimeError('owned fixture IPv6 initialization did not finish')
+
+
 @contextlib.contextmanager
 def vpn_fixture(extra_zones=(), *, owned_host=True):
     assert os.geteuid() == 0
@@ -194,6 +219,8 @@ def vpn_fixture(extra_zones=(), *, owned_host=True):
                 time.sleep(0.02)
         else:
             raise RuntimeError('controlled DNS responder did not start')
+        wait_ipv6_ready('wgps-underlay')
+        wait_ipv6_ready('wgps-remote', namespace='wgps-peer')
         yield root
     finally:
         cleanup_errors = []
