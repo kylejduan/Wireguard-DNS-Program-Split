@@ -69,9 +69,16 @@ def parse_profile(text: str) -> Profile:
 
     MTU is restricted to 576..65535. Keepalive defaults to WireGuard's disabled
     value 0, rather than introducing periodic traffic absent from the profile.
+    Input must fit the runtime reader's 65536-byte UTF-8 limit.
     """
     if not isinstance(text, str) or len(text) > 65536 or '\x00' in text:
         raise ConfigError('invalid profile input')
+    try:
+        encoded_size = len(text.encode('utf-8'))
+    except UnicodeError:
+        raise ConfigError('profile input must be valid UTF-8') from None
+    if encoded_size > 65536:
+        raise ConfigError('profile input exceeds the byte limit')
     allowed = {'Interface': {'PrivateKey', 'Address', 'DNS', 'MTU'},
                'Peer': {'PublicKey', 'PresharedKey', 'AllowedIPs', 'Endpoint', 'PersistentKeepalive'}}
     sections: dict[str, dict[str, str]] = {}
