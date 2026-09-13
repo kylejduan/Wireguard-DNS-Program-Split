@@ -1,6 +1,7 @@
 """Network adapter contract tests; an argv-aware kernel fixture performs no I/O."""
 import base64
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ BOOT = '11111111-2222-4333-8444-555555555555'
 PRIVATE = base64.b64encode(b'a' * 32).decode()
 PUBLIC = base64.b64encode(b'b' * 32).decode()
 LOCAL_PUBLIC = base64.b64encode(b'c' * 32).decode()
+PRESHARED = base64.b64encode(b'd' * 32).decode()
 PROFILE = parse_profile(f'''[Interface]
 PrivateKey = {PRIVATE}
 Address = 10.20.0.2/32
@@ -41,6 +43,7 @@ class Kernel:
         self.routes = [{'dst': 'default', 'gateway': '192.0.2.1', 'dev': 'eth0', 'table': 'main'}]
         self.nft = {'nftables': []}
         self.wgmarks = ''
+        self.dump = None
         self.legacy = ''
         self.conntrack = ''
         self.calls = []
@@ -50,6 +53,12 @@ class Kernel:
         self.addresses = []
         self.nft_script = ''
         self.next_ifindex = 7
+
+    def wireguard_dump(self):
+        if not self.configured:
+            return '(none)\t(none)\t0\toff\n'
+        return (f'{PRIVATE}\t{LOCAL_PUBLIC}\t51821\t0x2000000\n'
+                f'{PUBLIC}\t{PRESHARED}\t192.0.2.8:51820\t0.0.0.0/0\t0\t10\t20\toff\n')
 
     def __call__(self, argv, *, input=None):
         argv = tuple(argv)
@@ -76,15 +85,8 @@ class Kernel:
             return self.legacy
         if argv == ('ip', '-j', '-4', 'address', 'show', 'dev', 'wgps0'):
             return json.dumps([{'addr_info': self.addresses}])
-        if argv[:4] == ('wg', 'show', 'wgps0', 'public-key'):
-            return LOCAL_PUBLIC if self.configured else '(none)'
-        if argv[:3] == ('wg', 'show', 'wgps0'):
-            values = {'fwmark': '0x2000000' if self.configured else 'off',
-                      'peers': PUBLIC if self.configured else '',
-                      'endpoints': PUBLIC + '\t192.0.2.8:51820' if self.configured else '',
-                      'allowed-ips': PUBLIC + '\t0.0.0.0/0' if self.configured else '',
-                      'persistent-keepalive': PUBLIC + '\toff' if self.configured else ''}
-            return values[argv[3]]
+        if argv == ('wg', 'show', 'wgps0', 'dump'):
+            return self.dump if self.dump is not None else self.wireguard_dump()
         if argv[:3] == ('ip', '-4', 'route') and argv[3] in ('add', 'delete'):
             args = list(argv[4:])
             state = {'dst': 'default', 'table': int(args[args.index('table') + 1]),
@@ -360,10 +362,84 @@ class NetworkTests(unittest.TestCase):
         counter.update(packets=1000, bytes=50000)
         self.assertEqual(self.net.health().changed, ())
 
+    def test_dump_preserves_receipt_fields_without_secrets_or_repeated_getters(self):
+        receipt = self.net.prepare(guard_blocked=True)
+        identity = next(r.identity for r in receipt.resources if r.kind == 'interface')
+        expected = {'public_key_sha256': hashlib.sha256(LOCAL_PUBLIC.encode()).hexdigest(),
+                    'fwmark': 0x2000000, 'peers': [[PUBLIC]],
+                    'endpoints': [[PUBLIC, '192.0.2.8:51820']],
+                    'allowed-ips': [[PUBLIC, '0.0.0.0/0']],
+                    'persistent-keepalive': [[PUBLIC, 'off']]}
+        self.assertEqual({k: identity[k] for k in expected}, expected)
+        self.kernel.calls.clear()
+        self.assertTrue(self.net.health().ready)
+        self.assertEqual([c for c in self.kernel.calls if c[:3] == ('wg', 'show', 'wgps0')],
+                         [('wg', 'show', 'wgps0', 'dump')])
+        self.assertIn(('wg', 'show', 'all', 'fwmark'), self.kernel.calls)
+        self.kernel.dump = (self.kernel.wireguard_dump().replace(PRESHARED, '(none)')
+                            .replace('\t51821\t', '\t51822\t')
+                            .replace('\t0\t10\t20\t', '\t12345\t1000\t2000\t'))
+        self.assertTrue(self.net.health().ready)  # Volatile dump fields are not receipt identities.
+        for secret in (PRIVATE, PRESHARED):
+            self.assertNotIn(secret, (self.state / 'receipt.json').read_text())
+            self.assertNotIn(secret, str(self.kernel.calls))
+
+    def test_dump_changes_to_each_owned_configuration_field_fail_health(self):
+        self.net.prepare(guard_blocked=True)
+        original = self.kernel.wireguard_dump()
+        for old, new in ((LOCAL_PUBLIC, PUBLIC), ('0x2000000', 'off'),
+                         (PUBLIC, LOCAL_PUBLIC), ('192.0.2.8:51820', '(none)'),
+                         ('0.0.0.0/0', '192.0.2.0/24,2001:db8::/32'),
+                         ('\t20\toff', '\t20\t25')):
+            with self.subTest(field=old):
+                self.kernel.dump = original.replace(old, new)
+                health = self.net.health()
+                self.assertFalse(health.ready)
+                self.assertIn('interface:wgps0', health.changed)
+
+    def test_malformed_dump_never_allows_readiness_or_discloses_output(self):
+        self.net.prepare(guard_blocked=True)
+        original = self.kernel.wireguard_dump()
+        header, peer = original.splitlines()
+        for value in ('', header + '\n\n' + peer, 'wgps0\t' + original,
+                      original + peer + '\n', original.replace('\t10\t', '\tbad\t'),
+                      original.replace('\t51821\t', '\t65536\t'),
+                      original.replace('0x2000000', '0x100000000'),
+                      original.replace('\t20\toff', '\t20\t65536'),
+                      original.replace(LOCAL_PUBLIC, 'invalid-key'),
+                      header + '\n' + peer + '\textra\n'):
+            with self.subTest(case=len(value)):
+                self.kernel.dump = value
+                with self.assertRaises(network.NetworkError) as caught:
+                    self.net.health()
+                for secret in (PRIVATE, PRESHARED):
+                    self.assertNotIn(secret, str(caught.exception))
+        self.assertEqual(ownership.read_receipt(self.fd), self.net.receipt)
+
+    def test_dump_empty_interface_and_peer_none_normalize_like_individual_getters(self):
+        self.net.prepare(guard_blocked=True)
+        resource = next(r for r in self.net.receipt.resources if r.kind == 'interface')
+        self.kernel.dump = '(none)\t(none)\t0\toff\n'
+        observed = self.net._observe(resource, self.net._snapshot())
+        self.assertEqual(observed['public_key_sha256'], hashlib.sha256(b'(none)').hexdigest())
+        self.assertEqual(observed['fwmark'], 0)
+        for field in ('peers', 'endpoints', 'allowed-ips', 'persistent-keepalive'):
+            self.assertEqual(observed[field], [])
+        self.kernel.dump += f'{PUBLIC}\t(none)\t(none)\t(none)\t0\t0\t0\toff\n'
+        observed = self.net._observe(resource, self.net._snapshot())
+        self.assertEqual(observed['endpoints'], [[PUBLIC, '(none)']])
+        self.assertEqual(observed['allowed-ips'], [[PUBLIC, '(none)']])
+        self.assertEqual(observed['persistent-keepalive'], [[PUBLIC, 'off']])
+        self.kernel.dump = self.kernel.wireguard_dump().replace('0.0.0.0/0', '192.0.2.0/24,2001:db8::/32')
+        observed = self.net._observe(resource, self.net._snapshot())
+        self.assertEqual(observed['allowed-ips'], [[PUBLIC, '192.0.2.0/24', '2001:db8::/32']])
+
     def test_identity_swap_blocks_every_destructive_command(self):
         self.net.prepare(guard_blocked=True)
         next(x for x in self.kernel.links if x['ifname'] == 'wgps0')['ifindex'] = 77
+        self.kernel.calls.clear()
         self.assertIn('interface:wgps0', self.net.health().changed)
+        self.assertNotIn(('wg', 'show', 'wgps0', 'dump'), self.kernel.calls)
         before = len(self.kernel.calls)
         with self.assertRaises(network.NetworkError):
             self.net.disable(guard_blocked=True)
