@@ -53,6 +53,8 @@ def main():
         client = clients / 'dns_client'
         run('cc', '-O2', '-std=c11', '-Wall', '-Wextra', '-Werror',
             str(repo / 'tests/linux/dns_client.c'), '-o', str(client))
+        direct_client = clients / 'direct_dns_client'
+        shutil.copy2(client, direct_client)
         pins = '/sys/fs/bpf/' + clients.name
         loader = str(repo / 'build/linux/bpf-loader')
         obj = str(repo / 'build/linux/classifier.bpf.o')
@@ -60,7 +62,7 @@ def main():
         assert subprocess.run(['pgrep', '-u', uid], capture_output=True).returncode == 1
         assert not any(r.get('priority') == 5702 for r in json.loads(run('ip', '-j', 'rule').stdout))
         prefix = ('setpriv', '--reuid', uid, '--regid', uid, '--clear-groups')
-        rows = {name: [] for name in ('unlisted-baseline', 'unlisted-empty-policy',
+        rows = {name: [] for name in ('unlisted-baseline', 'unlisted-empty-policy', 'unlisted-full-policy',
                                       'plain-wireguard', 'kernel-dns', 'uncached-proxy-dns')}
         loaded = rule = False
         proxy = None
@@ -94,6 +96,7 @@ def main():
                     rows['unlisted-empty-policy'].append(measure(client, '127.0.0.60', '203.0.113.7', '0'))
                     run(loader, 'path-add', pins, str(client))
                     replace(normal)
+                    rows['unlisted-full-policy'].append(measure(direct_client, '127.0.0.60', '203.0.113.7', '0'))
                     rows['kernel-dns'].append(measure(client, '127.0.0.53', '198.51.100.7', '0x10000'))
                     run(loader, 'path-del', pins, str(client))
                     run(loader, 'remove', pins)
