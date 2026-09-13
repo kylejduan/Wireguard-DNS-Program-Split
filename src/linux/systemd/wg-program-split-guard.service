@@ -1,0 +1,19 @@
+[Unit]
+Description=Early executable-path WireGuard protection
+DefaultDependencies=no
+After=local-fs.target systemd-remount-fs.service
+Before=sysinit.target network-pre.target
+RequiresMountsFor=/etc/wg-program-split /usr/lib/wg-program-split /sys/fs/bpf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/wg-program-split guard
+RemainAfterExit=yes
+UMask=0077
+RuntimeDirectory=wg-program-split
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+TimeoutStartSec=90
+
+[Install]
+WantedBy=sysinit.target
