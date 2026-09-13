@@ -12,7 +12,7 @@ fi
 
 for path in "${files[@]}"; do
   case "${path,,}" in
-    *.conf|*.dll|*.exe|*.sys|*.cat|*.zip|*.dpapi)
+    *.conf|*.dll|*.exe|*.sys|*.cat|*.zip|*.dpapi|*.pyc|*.pyo|*.pyz|*.o|*.pcap|*.pcapng)
       echo "FAIL: private or binary artifact is public: $path" >&2
       exit 1
       ;;
@@ -34,6 +34,6 @@ while IFS= read -r -d '' path; do
     echo "FAIL: source file exceeds 1000 lines: $path ($lines)" >&2
     exit 1
   fi
-done < <(find src -type f \( -name '*.cpp' -o -name '*.ps1' \) -print0)
+done < <(find src tests -type f \( -name '*.cpp' -o -name '*.ps1' -o -name '*.py' -o -name '*.c' -o -name '*.h' \) -print0)
 
 echo 'PASS: public tree contains no private artifacts, literal user paths, or oversized sources.'

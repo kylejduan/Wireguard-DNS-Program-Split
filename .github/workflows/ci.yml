@@ -3,11 +3,32 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      privileged_linux:
+        description: Run on an operator-provisioned disposable Ubuntu 26.04 kernel 7.0 VM
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  linux-unit:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native test dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++ libbpf-dev libelf-dev zlib1g-dev
+      - name: Run Linux unit and native parsing checks
+        run: ./tests/run-linux.sh
+  linux-privileged:
+    if: github.event_name == 'workflow_dispatch' && inputs.privileged_linux
+    runs-on: [self-hosted, linux, wgps-disposable-vm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run real kernel and network acceptance
+        run: sudo env WG_CLASSIFIER_DISPOSABLE_VM=1 ./tests/run-linux.sh --vm
   test:
     runs-on: windows-2022
     steps:

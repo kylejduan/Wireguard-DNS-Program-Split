@@ -11,3 +11,8 @@
 /config/settings.json
 /profiles/
 /state/
+__pycache__/
+*.py[cod]
+*.pyz
+*.o
+.pytest_cache/
