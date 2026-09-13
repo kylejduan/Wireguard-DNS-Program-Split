@@ -98,6 +98,58 @@ int main() {
     print('PASS native JSON preserves valid UTF-8 and surrogateescape filesystem bytes')
 
 
+def late_standard(repo, work, included):
+    """Fresh standard parent objects, without changing package-owned directories."""
+    assert os.stat('/proc/self/ns/mnt').st_ino != os.stat('/proc/1/ns/mnt').st_ino
+    for component in ('root', 'ns/net', 'ns/user', 'ns/pid'):
+        a, b = os.stat('/proc/self/' + component), os.stat('/proc/1/' + component)
+        assert (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+    run(['mount','--make-rprivate','/'])
+    for path in ('/run', '/var/cache'):
+        run(['mount','-t','tmpfs','-o','mode=0755','tmpfs',path])
+    Path('/run/systemd').mkdir(); Path('/run/user').mkdir()
+    directories=('/run/nscd','/run/avahi-daemon','/var/cache/nscd','/run/user/99996')
+    assert all(not Path(path).exists() for path in directories)
+    loader=repo/'build/linux/bpf-loader'; script=Path(__file__).resolve()
+    pins=Path('/sys/fs/bpf')/(work.name+'-late'); group=Path('/sys/fs/cgroup')/(work.name+'-late')
+    sockets=[]; descriptors=[]; loaded=False
+    native_env={key:value for key,value in os.environ.items() if key!='WG_CLASSIFIER_DISPOSABLE_VM'}
+    def control(*args): return run([loader,*args],env=native_env)
+    def check(executable, operation, target, expected, pass_fds=()):
+        result=run([executable,script,'--client',operation,target],pass_fds=pass_fds)
+        assert json.loads(result.stdout).get('errno')==expected,result.stdout
+    assert not pins.exists() and not group.exists()
+    try:
+        group.mkdir()
+        result=control('load',repo/'build/linux/classifier.bpf.o',pins,group,'0x00ff0000','0x00010000',included)
+        loaded=True; (work/'late-verifier.log').write_text(result.stderr)
+        # Creation follows attachment; no custom guard-slot enrollment occurs.
+        for directory in directories: Path(directory).mkdir()
+        os.chown('/run/user/99996',99996,99996)
+        run(['mount','-t','tmpfs','-o','mode=0700,uid=99996,gid=99996','tmpfs','/run/user/99996'])
+        for path in ('/run/nscd/socket','/run/avahi-daemon/socket','/run/user/99996/bus'):
+            sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); sockets.append(sock)
+            sock.bind(path); sock.listen(8)
+            check(included,'stream',path,errno.EACCES)
+            check(work/'direct-python','stream',path,0)
+        dynamic=Path('/var/cache/nscd/dbXYZ123'); dynamic.write_bytes(b'd'*4096)
+        fd=os.open(dynamic,os.O_RDONLY); descriptors.append(fd); dynamic.unlink()
+        check(included,'mmap',fd,errno.EACCES,pass_fds=(fd,))
+        check(work/'direct-python','mmap',fd,0,pass_fds=(fd,))
+        (work/'late-namespace.json').write_text(json.dumps({'mount_namespace':os.stat('/proc/self/ns/mnt').st_ino,
+            'late_directories':directories,'created_after_attachment':True,'custom_slots':False}))
+    finally:
+        failures=[]
+        for action in [*(lambda fd=fd: os.close(fd) for fd in descriptors),
+                       *(sock.close for sock in sockets),
+                       *([lambda: control('remove',pins)] if loaded else []),
+                       *([group.rmdir] if group.exists() else [])]:
+            try: action()
+            except Exception as error: failures.append(str(error))
+        # All mounts are private and disappear with this synchronous child.
+        if failures: raise RuntimeError('late-standard cleanup failed: '+'; '.join(failures))
+
+
 def main():
     parser = argparse.ArgumentParser()
     modes=parser.add_mutually_exclusive_group(required=True)
@@ -105,14 +157,17 @@ def main():
     modes.add_argument('--baseline', action='store_true')
     modes.add_argument('--native', action='store_true')
     modes.add_argument('--vm', action='store_true')
+    modes.add_argument('--late-standard', nargs=2, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.client: return client(*args.client)
     repo = Path(__file__).resolve().parents[2]
     if args.native: return native_json_test(repo)
-    if args.vm and (os.geteuid()!=0 or os.environ.get('WG_CLASSIFIER_DISPOSABLE_VM')!='1' or
+    if (args.vm or args.late_standard) and (os.geteuid()!=0 or os.environ.get('WG_CLASSIFIER_DISPOSABLE_VM')!='1' or
                    'microsoft' in os.uname().release.lower() or os.uname().nodename=='TV' or
                    not Path('/var/lib/wgps-vm-provisioned').is_file()):
         raise SystemExit('VM mode requires root, explicit disposable VM flag, marker, and native non-TV host')
+    if args.late_standard:
+        return late_standard(repo,Path(args.late_standard[0]),Path(args.late_standard[1]))
     work = repo / 'local/validation' / ('resolver-' + uuid.uuid4().hex[:10])
     work.mkdir(parents=True)
     included, direct = work/'included-python', work/'direct-python'
@@ -127,7 +182,7 @@ def main():
     loader=repo/'build/linux/bpf-loader'
     pins=Path('/sys/fs/bpf')/work.name
     group=Path('/sys/fs/cgroup')/work.name
-    sockets=[]; descriptors=[]; mounts=[]; host_dirs=[]; active=False; results=[]; mapped_client=None
+    sockets=[]; descriptors=[]; mounts=[]; active=False; results=[]; mapped_client=None
     prior_pin=Path('/sys/fs/bpf')/(work.name+'-prior')
     script=Path(__file__).resolve()
     native_env={k:v for k,v in os.environ.items() if k!='WG_CLASSIFIER_DISPOSABLE_VM'}
@@ -325,19 +380,6 @@ char LICENSE[] SEC("license")="GPL";
             assert Path(path).exists(),f'reference VM endpoint absent: {path}'
             check(included,'stream',path); check(direct,'stream',path,0)
         passed('real resolved Varlink, system bus and user bus connects selected-denied/unlisted-allowed')
-        for directory in ('/run/nscd','/run/avahi-daemon','/var/cache/nscd','/run/user/99996'):
-            directory=Path(directory)
-            assert not directory.exists(),f'requires absent test-owned standard directory: {directory}'
-            directory.mkdir(); host_dirs.append(directory)
-        os.chown('/run/user/99996',99996,99996)
-        run(['mount','-t','tmpfs','-o','mode=0700,uid=99996,gid=99996','tmpfs','/run/user/99996'])
-        mounts.append(Path('/run/user/99996'))
-        for path in ('/run/nscd/socket','/run/avahi-daemon/socket','/run/user/99996/bus'):
-            listen(path); check(included,'stream',path); check(direct,'stream',path,0)
-        dynamic=Path('/var/cache/nscd/dbXYZ123'); dynamic.write_bytes(b'd'*4096)
-        dynamicfd=os.open(dynamic,os.O_RDONLY); descriptors.append(dynamicfd); dynamic.unlink()
-        check(included,'mmap',dynamicfd,pass_fds=(dynamicfd,))
-        passed('late standard nscd/Avahi/user bus directories and unlinked cache covered by ancestor rules')
         abstract='@'+work.name
         abstract_server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
         abstract_server.bind('\0'+abstract[1:]); abstract_server.listen(8); sockets.append(abstract_server)
@@ -378,15 +420,45 @@ char LICENSE[] SEC("license")="GPL";
         for fd in descriptors: os.close(fd)
         for sock in sockets: sock.close()
         for mount in reversed(mounts): run(['umount',mount])
-        for directory in reversed(host_dirs):
-            for path in directory.iterdir(): path.unlink()
-            directory.rmdir()
         if active: control('remove',pins)
         if prior_pin.exists(): prior_pin.unlink()
         if group.exists(): group.rmdir()
         (work/'results.json').write_text(json.dumps(results,indent=2))
         (work/'links-after.json').write_text(run(['bpftool','-j','link','show']).stdout)
         print('Evidence:',work,flush=True)
+    # Existing real endpoints were tested above in their original host view.
+    # A separate namespace permits genuine late creation even after apt/nscd.
+    def directory_identity():
+        result={}
+        for name in ('/run/nscd','/run/avahi-daemon','/var/cache/nscd','/run/user/99996'):
+            path=Path(name)
+            if path.exists():
+                st=path.stat()
+                result[name]=[st.st_dev,st.st_ino,st.st_mode,st.st_uid,st.st_gid,st.st_mtime_ns,
+                              sorted(item.name for item in path.iterdir())]
+            else: result[name]=None
+        return result
+    before=directory_identity()
+    late_pins=Path('/sys/fs/bpf')/(work.name+'-late')
+    late_group=Path('/sys/fs/cgroup')/(work.name+'-late')
+    assert not late_pins.exists() and not late_group.exists()
+    try:
+        run(['unshare','--mount','--propagation','private',sys.executable,script,
+             '--late-standard',work,included])
+    finally:
+        failures=[]
+        # The child normally removes these. Also fence a killed/timed-out child;
+        # native removal verifies map/link ownership before removing any pins.
+        for action in [*([lambda: control('remove',late_pins)] if late_pins.exists() else []),
+                       *([late_group.rmdir] if late_group.exists() else [])]:
+            try: action()
+            except Exception as error: failures.append(str(error))
+        if directory_identity()!=before: failures.append('host package/runtime directories changed')
+        (work/'host-directories.json').write_text(json.dumps(before,indent=2))
+        if failures: raise RuntimeError('late-standard supervisor cleanup failed: '+'; '.join(failures))
+    passed('late standard nscd/Avahi/user bus directories and unlinked cache covered by ancestor rules')
+    (work/'results.json').write_text(json.dumps(results,indent=2))
+    (work/'links-after.json').write_text(run(['bpftool','-j','link','show']).stdout)
 
 
 if __name__ == '__main__': main()
