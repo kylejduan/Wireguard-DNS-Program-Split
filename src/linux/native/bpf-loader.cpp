@@ -168,6 +168,27 @@ PathKey path_key(const std::string &input, bool adding) {
     std::memcpy(key.pathname, text.c_str(), text.size() + 1);
     return key;
 }
+std::vector<PathKey> read_policy_stdin(std::istream &input) {
+    std::vector<PathKey> keys;
+    std::set<std::string> unique;
+    std::string current;
+    size_t total = 0;
+    char byte;
+    while (input.get(byte)) {
+        if (++total > 1024 * sizeof(PathKey)) fail("policy stdin exceeds capacity");
+        if (byte) {
+            if (current.size() >= sizeof(PathKey)-1) fail("policy stdin key exceeds capacity");
+            current += byte;
+        } else {
+            if (keys.size() >= 1024 || current.empty() || current.back()=='/' ||
+                !unique.insert(current).second) fail("invalid policy stdin record/count");
+            keys.push_back(path_key(current, false));
+            current.clear();
+        }
+    }
+    if (!input.eof() || !current.empty()) fail("policy stdin read failed or final NUL missing");
+    return keys;
+}
 int map_fd(const fs::path &dir, const char *name, uint32_t key_size,
            uint32_t value_size, uint32_t type, uint32_t entries) {
     int fd = bpf_obj_get((dir / name).c_str());
@@ -338,6 +359,11 @@ void ready_preflight() {
 }
 void load(int argc, char **argv) {
     if (argc < 7) fail("load OBJECT PIN_DIR CGROUP MASK MARK [PATH...]");
+    bool bulk = std::string(argv[1]) == "load-policy-stdin";
+    if ((bulk && argc != 7) || argc > 7+1024) fail("invalid policy arguments/count");
+    std::vector<PathKey> keys;
+    if (bulk) keys = read_policy_stdin(std::cin);
+    else for (int i=7; i<argc; i++) keys.push_back(path_key(argv[i],std::string(argv[1])=="load"));
     fs::path dir = fs::absolute(argv[3]), group = fs::canonical(argv[4]);
     struct statfs bpffs{}, cgfs{};
     check(statfs(dir.parent_path().c_str(), &bpffs) == 0 && bpffs.f_type == BPF_FS_MAGIC,
@@ -353,8 +379,6 @@ void load(int argc, char **argv) {
         root.st_ino, static_cast<uint32_t>(stat_path("/proc/self/ns/net").st_ino),
         static_cast<uint32_t>(stat_path("/proc/self/ns/user").st_ino)};
     if (!cfg.mask || !cfg.mark || (cfg.mark & ~cfg.mask)) fail("MARK must be nonzero and contained in MASK");
-    std::vector<PathKey> keys;
-    for (int i = 7; i < argc; i++) keys.push_back(path_key(argv[i], std::string(argv[1])=="load"));
     std::vector<char> log(4 * 1024 * 1024);
     bpf_object_open_opts opts{};
     opts.sz = sizeof(opts);
@@ -536,10 +560,10 @@ int main(int argc, char **argv) {
             if (std::string(argv[1])=="policy") policy_json(argv[2]); else snapshot_json(argv[2]);
             return 0;
         }
-        if (argc < 3) fail("commands: capabilities | load | load-policy | path-add | path-add-policy | path-del | guard-slot | state | status | policy | snapshot | probe-dns | remove");
+        if (argc < 3) fail("commands: capabilities | load | load-policy | load-policy-stdin | path-add | path-add-policy | path-del | guard-slot | state | status | policy | snapshot | probe-dns | remove");
         require_mutation_host();
         std::string command = argv[1];
-        if (command == "load" || command == "load-policy") { load(argc, argv); return 0; }
+        if (command == "load" || command == "load-policy" || command == "load-policy-stdin") { load(argc, argv); return 0; }
         fs::path dir = argv[2];
         Fd owner_lock(open(dir.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC));
         check(flock(owner_lock.value,LOCK_EX)==0,"lock owned pin directory for mutation");
