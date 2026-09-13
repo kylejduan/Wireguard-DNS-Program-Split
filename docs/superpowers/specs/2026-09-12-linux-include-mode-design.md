@@ -3,6 +3,8 @@
 Status: implemented with combined native VM and two-reboot validation, September 13, 2026.
 The combined socket hook, kernel DNS transport and resolver guards are
 implemented; the operator guide is [Linux include mode](../../linux.md).
+The full native VM and Linux unit/native suites passed again after the scratch
+preemption correction in `75e9b6c`.
 The requested Claude Max review did not complete and no Claude approval is
 claimed. The user authorized implementation; independent scoped code reviews
 have driven regression fixes. TV deployment and its performance/boot gates
@@ -17,15 +19,19 @@ special launcher, UID-only rule or process-name match does not satisfy
 this contract. Unlisted programs retain their normal IP and host/router
 DNS path. Preserve intentional Tailscale DNS domains for unlisted clients.
 Linux is include-mode only: no exclude list or host-wide VPN default mode.
-Minimal added latency and compute overhead are release requirements;
-automatic operation and routing correctness alone are insufficient.
+Minimal added latency and compute are requirements, with an ideal target of
+less than 1 ms added local p99 latency. This is not a zero-overhead or total
+VPN/Internet round-trip guarantee; target-workload acceptance remains separate.
 
 The first target is native Ubuntu 26.04 with its 7.0 kernel, systemd,
 cgroup v2, kernel BTF and enabled BPF LSM. Probe required helpers and
 attachment behavior; a version string alone is insufficient. Other kernel
 or distribution combinations receive support only after equivalent tests.
-The native Rust bot fits the executable model; its final deployment path
-and launch environment still require a fresh enrollment audit.
+Common native applications and Python, Node, Java, .NET and shell workloads
+use this executable model through their native runtimes and network helpers.
+A shared runtime selects all applications using that executable. Bot agents
+can enroll their own paths later; no particular bot path is required for the
+reusable implementation. See the [enrollment guide](../../linux-agents.md).
 
 Initial scope is IPv4 TCP/UDP and ordinary UDP/TCP DNS. Block included
 IPv6 and unsupported raw/packet socket access without changing host IPv6.
@@ -36,8 +42,8 @@ Already-running selected programs require restart after activation or
 enrollment, including those retaining resolver mappings/cache state without
 open connections. Existing or inherited connections are not newly
 classified connections. Other network namespaces, different filesystem
-roots and arbitrary network-delegating IPC are
-outside initial support. This is not a security boundary against hostile
+roots, containers, sandbox integrations and arbitrary network-delegating IPC
+are outside support. This is not a security boundary against hostile
 applications or host administrators. Host localhost remains available;
 there is no network-namespace relocation of applications.
 
@@ -53,7 +59,7 @@ components keep their existing architecture.
 
 | Option | Assessment |
 |---|---|
-| eBPF LSM path classification before socket use | Recommended; supports normal launches and synchronous matching, but requires BPF LSM and a verifier/behavior proof before implementation can be accepted. |
+| eBPF LSM path classification before socket use | Selected and verified on the supported native VM; supports normal launches and synchronous matching, and requires effective BPF LSM. |
 | vopono or a plain WireGuard application namespace | Good launcher-based mechanisms; fail the explicit automatic-path requirement. |
 | Userspace exec monitoring plus PID/cgroup marking | Useful precedent in existing VPN clients; an asynchronous update must not be represented as protecting the first socket without a synchronous admission mechanism. |
 | NFQUEUE classification of all new host flows | Could hold packets during attribution, but adds availability and connection-latency costs for unlisted applications; not selected. |
@@ -62,8 +68,8 @@ Proton's published Linux daemon provides source-level evidence for socket
 marking and userspace process monitoring. It does not by itself prove this
 project's required first-socket and per-application DNS contract. No
 existing project examined has been established as a drop-in solution for
-the complete requirement. This is a recommendation from source inspection,
-not a benchmark or a completed third-party security audit.
+the complete requirement. This original source evaluation explains the
+architecture choice; it is not a completed third-party security audit.
 
 ## Synchronous executable classification
 
@@ -79,13 +85,12 @@ This distinction matters: the filesystem kfuncs are registered for LSM
 programs, and the socket-option helper is limited to particular cgroup
 LSM hooks. Do not call a pathname helper from a generic cgroup socket
 program and assume the verifier will allow it. The first development
-phase must load and exercise the exact combined program.
+phase loaded and exercised this exact combined program before controller work.
 
-A second acceptable implementation, if the combined hook is rejected,
-is an LSM `socket_create` classifier followed synchronously by a cgroup
-socket-create marker, with a verified task-local decision handoff. This
-is the only planned fallback; it must pass the same first-socket tests.
-If both fail, stop and revise the architecture before building a controller.
+The original fallback was an LSM `socket_create` classifier followed
+synchronously by a cgroup socket-create marker with a task-local handoff.
+The combined hook passed, so that fallback was unnecessary and is not
+implemented. An asynchronous exec watcher was never an acceptable substitute.
 
 Use full canonical paths, not basename, `comm`, PID-only decisions or a
 static device/inode allowlist. Canonicalize symlinks at enrollment; distinct
@@ -101,19 +106,31 @@ remain included without updating an inode map. The old unlinked running
 image's new sockets return an error requiring restart. Deleted or synthetic
 executable paths must never become known-unlisted through a map miss.
 Check file/dentry state rather than stripping the ambiguous ` (deleted)`
-text suffix; exercise real filenames with that suffix too. Start the proof
-without classification caching across sockets. Executable identity and
-policy generation alone do not notice a renamed executable or ancestor
-directory. Add a cache only after synchronous invalidation for every
-supported path/root/mount change is proved. Fixtures assert these exact
-outcomes, including rename contention and immediate first traffic.
+text suffix; fixtures exercise real filenames with that suffix too. The
+implementation resolves the executable path freshly for each classified
+socket, without classification caching across sockets. Executable identity
+and policy generation alone do not notice a renamed executable or ancestor
+directory; an optimization must preserve those synchronous semantics. Fixtures
+assert these outcomes, including rename contention and immediate first traffic.
 
-Check the filesystem-root and network-namespace identity as well as the
-path; a coincident pathname inside a container is not an enrolled host
-executable. A systemd private mount namespace that preserves the host root
-must be covered by the normal-service fixtures. Unknown, unreadable or
-truncated userspace paths return a socket error and a diagnostic, never an
-assumed direct classification. Report this possible affected-request
+BPF execution stays on one CPU but can be preempted by another task. The
+shared per-CPU scratch buffer therefore needs explicit exclusion: disable
+preemption from scratch lookup through pathname resolution and policy lookup,
+then re-enable it before releasing the executable reference. This adds no
+classification cache. `test_preemption.py`, included in the standard native/VM
+test runner, reproduced wrong marks and resolver decisions in the old code
+and passed after the fix with selected/unlisted roles reversed on one CPU.
+The [performance report](../../linux-performance.md) retains that correctness
+proof and the rejected initial comparison separately from valid timings.
+
+Check host namespace and filesystem-root identity as well as the path; a
+coincident pathname inside a container is not an enrolled host executable.
+Unsupported contexts remain outside classification, preserving unrelated
+namespace traffic; their matching path is not advertised as protected. Native
+enrollment checks enforce the supported host context. A systemd private mount
+namespace that preserves the host root is covered by normal-service fixtures.
+Unknown, unreadable or truncated userspace paths return a socket error and a
+diagnostic, never an assumed direct classification. Report this possible affected-request
 failure separately from known-unlisted traffic passing normally.
 
 Preserve unrelated socket-mark bits and inspect existing effective cgroup
@@ -127,18 +144,18 @@ outside application classification.
 
 Create `wgps0` in the host with no global default route. Import a validated
 profile using native `wg` operations, without executing `wg-quick` hooks.
-An owned mark rule selects a dedicated routing table for application and
-VPN-DNS upstream marks. The WireGuard encrypted transport uses a separate
+An owned mark rule selects a dedicated routing table for included application
+payload and translated DNS. The WireGuard encrypted transport uses a separate
 class/mark that follows the physical host route and never recurses into
 its own table.
 
 Keep a terminal unreachable/blackhole route in the VPN table, plus an
-owned output guard that rejects marked nonlocal traffic unless it leaves
-through `wgps0`. Removing the interface must not allow policy lookup to
-fall through to the host default. Test initial TCP SYN routing, UDP,
-explicit source/interface binds, return traffic, reverse-path filtering
-and conntrack. Source-address selection must be proven before adding any
-SNAT; if needed, SNAT is restricted to the owned marks and tunnel output.
+owned POSTROUTING guard that drops marked nonlocal traffic unless it leaves
+through `wgps0`. Removing the interface cannot allow policy lookup to fall
+through to the host default. Tests cover initial TCP SYN routing, UDP,
+explicit source binds, return traffic and conntrack. Required SNAT is restricted
+to owned marks and tunnel output. Arbitrary device-binding, reverse-path-filter
+and MTU combinations remain outside the completed compatibility matrix.
 
 Leave the host's local routing rule intact for localhost. Selected DNS
 has an explicit interception rule before any loopback exemption. Do not
@@ -182,28 +199,31 @@ profile DNS. This distinction matches the existing Windows contract.
 ### Resolver IPC boundary
 
 Packet classification cannot attribute DNS delegated through filesystem
-Unix sockets or shared caches. Add synchronous, selected-process LSM
-restrictions for known resolver IPC: resolved Varlink, system/user D-Bus,
+Unix sockets or shared caches. Synchronous selected-process LSM guards
+restrict known resolver IPC: resolved Varlink, system/user D-Bus,
 Avahi and nscd sockets and shared hosts-cache files. File/socket identity
-and alias handling must be tested, not just textual prefix guesses.
-Preserve unrelated host processes' access. Do not globally edit NSS.
+and alias handling are exercised by the native fixtures, including inherited
+streams read through splice. Unrelated host processes retain access; the
+implementation does not globally edit NSS.
 
-Supported initial ordinary lookup uses libc's `dns` NSS path and the
-existing resolver stub, as observed on the reference host. Preflight must
-reject an unsupported NSS/cache arrangement and refuse a protection-ready
-status. If `nss-resolve` fallback is later claimed, prove both successful
-fallback to marked DNS and zero host-daemon queries. Direct use of a
+Supported ordinary lookup uses libc's `dns` NSS path and the existing
+resolver stub. Actual distro tests cover `files dns` and
+`files mdns4_minimal [NOTFOUND=return] dns`, warm nscd hosts caches and Avahi
+fallback. Preflight rejects unsupported NSS/cache arrangements instead of
+claiming protection-ready status. If `nss-resolve` fallback is later claimed,
+prove both successful fallback to marked DNS and zero host-daemon queries. Direct use of a
 blocked resolver IPC API may fail; it must never silently resolve directly.
 
-Test late-created sockets, warm shared caches, inherited descriptors and
-both UDP/TCP lookups. A guard on new file/socket access cannot revoke an
+Fixtures cover late-created sockets, warm shared caches, inherited descriptors
+and both UDP/TCP lookups. A guard on new file/socket access cannot revoke an
 existing shared hosts-cache mapping. Require already-running selected
 programs to restart after activation/enrollment before claiming their DNS
-readiness, even when they have no open network connections. Separately
-test a freshly started selected program against a warm host cache and a
-program that mapped that cache before enrollment; the latter must report
-restart required. Applications delegating networking to an existing host
-helper cannot be accepted merely because their main executable is listed.
+readiness, even when they have no open network connections. Actual cache
+tests distinguish a freshly started selected program from a program that
+mapped the cache before enrollment and its forked descendant. Fresh exec
+restores DNS separation; previously mapped state requires restart. Applications
+delegating networking to an existing host helper cannot be accepted merely
+because their main executable is listed.
 Exclude untested IPC integrations from supported enrollment.
 
 ## Configuration, control and failure behavior
@@ -227,21 +247,30 @@ VPN, probe real marked DNS and observe its handshake, then publish readiness.
 Unlisted traffic is unchanged by these phases. Controller or DNS failure
 retains guards; loss of VPN connectivity never selects a direct fallback.
 Distinguish policy-ready, tunnel handshake and independently tested DNS/IP
-health. Recovery adopts only verified owned state.
+health. Recovery adopts only verified owned state. A healthy daemon restart
+checks host, policy, ownership and live network/DNS readiness before retaining
+ready state, avoiding an unnecessary blocking activation. Failed or uncertain
+checks still enter guarded recovery.
 
 Early allocation scans do not require configured underlay routes; activation
 performs transport/MTU checks later. Safe repair can recreate an owned missing
 interface/preferred route while exact safety anchors remain intact. Ambiguous
 births and foreign replacements are retained for inspection.
 
-Attach protection before ordinary boot-time network/application startup;
-prove this with an early-start test application. No protection claim
-covers execution before the early guard is installed. A failed boot guard
-must be reported, and the actual bot's service ordering must prevent its
-unguarded start without turning normal runtime inclusion into a launcher
-requirement. Installation does not silently alter an existing bot unit.
+The early guard precedes ordinary network startup. Two actual VM reboots
+verified a dependent early-start test application: with a working blocked
+guard its first socket returned EPERM; with a deliberately failed guard the
+dependent service never started. No protection claim covers execution before
+the guard, and no boot-order guarantee covers applications without the required
+dependency. Application agents can add `Requires=` and `After=` dependencies on the guard to their own
+services without a runtime launcher requirement. Installation does not alter
+arbitrary application units.
 
-Policy edits apply to new sockets. Track affected running processes at
+`include list` reads exact configured keys without activating or creating
+runtime state; its output does not certify live enforcement. Healthy repeated
+adds and absent-key removals retain readiness only after full host, journal,
+configuration, kernel and network validation. Actual policy edits enter guarded
+reverification and apply to new sockets. Track affected running processes at
 activation/enrollment and report their restart requirement independently
 of socket counts. Keep a sticky unresolved boundary when old processes were
 observed: snapshots cannot prove every fork/reparent lineage has ended.
@@ -256,12 +285,13 @@ keys and private live observations beneath ignored local/runtime roots.
 
 ## Reference-host migration
 
-Read-only inspection found an existing full-tunnel VPN, catch-all VPN DNS,
-a repair daemon that would restart that VPN, active collectors, and
-Tailscale routing/DNS exceptions. BPF LSM is compiled into the kernel but
-absent from the enabled LSM list. The plan therefore has two distinct host
-gates: enable the required kernel hook on a coordinated reboot, and retire
-the old full-tunnel ownership during a protected-capture-aware cutover.
+The original September 12 planning inspection found an existing full-tunnel
+VPN, catch-all VPN DNS, a repair daemon that would restart that VPN, active
+collectors, and Tailscale routing/DNS exceptions. BPF LSM is compiled into the kernel but
+absent from the enabled LSM list at that inspection. Refresh these live facts
+before any action. TV remains unchanged by repository acceptance, with two
+distinct host gates: enable the required kernel hook on a coordinated reboot,
+and retire the old full-tunnel ownership during a protected-capture-aware cutover.
 
 1. Validate the complete implementation in a disposable matching VM first.
 2. Prepare an exact boot-parameter change that appends BPF LSM while
@@ -279,8 +309,9 @@ the old full-tunnel ownership during a protected-capture-aware cutover.
    DoH requires separate router evidence; TV-to-router DNS is not that
    evidence. Preserve intentional Tailscale-specific DNS behavior.
 6. Prove harmless included/unlisted executables' TCP/UDP/DNS paths and
-   failures before enrolling the actual bot. Verify collectors, LAN,
-   Tailscale, local metrics and durable startup afterward.
+   failures before application agents enroll their own runtimes/helpers.
+   Verify collectors, LAN, Tailscale, local metrics and durable startup
+   afterward; no specific bot path is required by this reusable feature.
 
 Live migration is separate from adding this reusable Linux implementation.
 The installer does not automatically change kernel boot options or disable
@@ -292,7 +323,8 @@ There is no zero-overhead guarantee. Root-cgroup classification adds work
 to included and unlisted socket creation. Output mark checks run on packets,
 policy routing adds route-lookup work, and DNS NAT can activate conntrack
 for traffic beyond the matching rule. Resolver guards may add file/Unix-IPC
-hook work. A userspace DNS forwarder adds scheduling and forwarding work.
+hook work. The comparison-only userspace DNS forwarder adds scheduling
+and forwarding work; it is absent from the installed runtime.
 Measure these costs separately from WireGuard encryption and the VPN's
 external route. Never infer performance from kernel placement alone.
 
@@ -302,11 +334,17 @@ logging. Resolver guards should reject irrelevant target objects cheaply
 before expensive executable lookup when object/alias correctness permits.
 Do not add blanket `notrack` rules or weaken classification to win a test.
 
-Benchmark before productizing: baseline security configuration; BPF LSM
+The measurement matrix separates baseline security configuration; BPF LSM
 enabled without project hooks; classifier; resolver guards; complete
 networking with an empty include list; then included workloads against
 plain WireGuard using the same peer, destination, DNS upstream and MTU.
-Compare both DNS candidates under equivalent warm/miss/cache conditions.
+The initial transport comparison selected kernel DNS. The final optimization
+comparison gives the old baseline the same scratch correctness fix as the
+candidate. Its method, rejected runs and measured results belong in the
+[performance report](../../linux-performance.md); failed classification samples
+never count as successful timings. Only completed error-free comparisons
+support numerical claims, and VM results do not establish target-workload
+latency acceptance.
 
 Record p50/p95/p99 latency, CPU per completed operation/packet, context
 switches, memory and conntrack pressure. Cover socket churn, long-lived
@@ -315,11 +353,12 @@ workloads and representative bot request/deadline tails under concurrent
 background load. Repeat with production instrumentation settings and on
 target hardware before making a production latency claim.
 
-Report deltas, measurement resolution and confidence bounds. No numerical
-slowdown allowance has been accepted; do not invent one or equate an
-inconclusive difference with equivalence. Observed application slowdowns,
-new deadline misses or attributable loss/errors remain release blockers
-under the current requirement, alongside routing/DNS separation failures.
+Report deltas, measurement resolution and confidence bounds. The ideal target
+is below 1 ms added local p99 latency with minimal compute; it does not
+authorize arbitrary regressions or promise an external VPN round-trip budget.
+Do not equate an inconclusive difference with equivalence. Target-workload
+latency, deadline misses, CPU/memory cost and attributable loss/errors require
+explicit assessment alongside routing/DNS separation before deployment.
 
 ## Acceptance gates
 
@@ -331,11 +370,16 @@ proceeded after the kernel/forwarder comparison; numerical TV performance
 acceptance remains open rather than being inferred from microbenchmarks.
 Actual deployment still requires its latency and boot acceptance.
 
-Subsequent tests cover executable replacement, aliases, helpers, immediate
-connect, same-name DNS concurrency, IPv6, pinned-loader failure, removed
-interfaces, restart/boot ordering, rule conflicts, DNS outages and complete
-owned cleanup. Keep configuration inspection, peer/model agreement, test
-success and live deployment acceptance as distinct claims.
+Subsequent tests cover executable replacement, aliases, static/dynamic ELF,
+independent helpers, immediate connect, same-name DNS concurrency, selected
+IPv6 denial, normal loader exit, controller SIGKILL/restart, removed interfaces,
+boot dependencies, conflicts, DNS outages and exact owned cleanup. The
+acquisition model injects before/after each mutating prepare command and receipt
+publication; ambiguous resources remain intact. It does not prove native
+SIGKILL between every pin publication. Dedicated encrypted-DNS client coverage
+and target-application latency remain separate from ordinary DNS and payload
+mechanism tests. Keep configuration inspection, model tests, actual VM tests
+and live deployment acceptance as distinct claims.
 
 See the [implementation plan](../plans/2026-09-12-linux-include-mode.md).
 

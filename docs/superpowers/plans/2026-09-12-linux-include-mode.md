@@ -1,410 +1,158 @@
 # Automatic Linux Include Mode Implementation Plan
 
-> **For agentic workers:** Use `superpowers:executing-plans` task by task.
-> Read the linked design first, preserve the current branch and verify
-> every phase. The requested Claude assessment did not complete; do not claim it did.
+**Status, September 13, 2026:** The seven repository implementation phases are
+complete. Native disposable-VM acceptance, installed-service lifecycle tests,
+and separate positive/failing-guard reboot tests passed. After the scratch
+preemption correction in `75e9b6c`, the full native VM suite, including installed
+lifecycle gates, and the Linux unit/native checks passed again. Existing Windows
+checks also passed. This closes the implementation plan, not the separate TV deployment or target-workload latency
+gates below. The requested Claude assessment never completed; no Claude
+approval is claimed. Independent scoped reviews drove regression fixes.
 
-**Goal:** Automatically route included executable paths' new connections
-and ordinary DNS through WireGuard, regardless of their launch method.
+**Goal:** Automatically select included executables' new IPv4 TCP/UDP sockets
+and ordinary DNS for WireGuard, independently of their normal launch method,
+while preserving unlisted applications' host networking.
 
-**Architecture:** Synchronous kernel executable-path classification and
-socket marking select an owned VPN routing table. Included DNS is
-translated before the host resolver. The VM comparison selected direct kernel
-translation; the private forwarder remains test-only.
+**Implemented architecture:** Synchronous BPF LSM executable-path classification
+and socket marking, owned WireGuard routing/nftables policy, resolver IPC/cache
+guards, a native libbpf loader and a Python/systemd controller. The transport
+comparison selected direct kernel DNS translation. The private forwarder is
+retained only as a test comparator, not a runtime dependency.
 
-**Tech Stack:** C eBPF, native C++/libbpf loader, Python standard library,
-WireGuard/iproute2/nftables and systemd. dnsmasq-base is a comparison-test dependency only.
+Read the [design and original alternatives](../specs/2026-09-12-linux-include-mode-design.md),
+[current operating behavior](../../linux.md),
+[overhead measurements and correctness prerequisite](../../linux-performance.md),
+[application enrollment guide](../../linux-agents.md) and
+[host migration procedure](../../linux-migration.md).
 
-**Spec:** [Automatic executable-path design](../specs/2026-09-12-linux-include-mode-design.md).
+## Completed implementation and gate matrix
 
-**Status:** Repository implementation and native VM acceptance completed on
-September 13, 2026, following user authorization. The final combined VM suite
-passes classifier, resolver guard, ordinary/large DNS, actual distro NSS/cache,
-network repair, persistent payload and installed-service gates. Separate actual
-positive/failing-guard reboot tests pass with exact cleanup. All 131 Linux unit
-checks, native parsing/probes and the existing Windows suite pass. Scoped
-independent reviews drove regression fixes. No Claude joint approval or TV
-deployment is claimed. Measurements show nonzero overhead; TV/bot latency and
-CPU acceptance remain open and are documented in the operating guide.
+This matrix replaces the original unchecked task lists. “Passed” describes the
+named tests on the supported disposable VM or local model; it does not extend
+the result to every application, kernel, crash instruction or live host.
+Paths below are relative to the repository root.
 
-The checklist below records the original acceptance targets. A broad unchecked
-target is not implied complete by a narrower passing mechanism test. See
-[current operating behavior](../../linux.md) and [migration](../../linux-migration.md).
+| Original phase | Implemented result and passing evidence | Boundary or superseded work |
+|---|---|---|
+| 1. Classification before socket use | `classifier.bpf.c`, shared policy code and the native loader attach the exact `lsm_cgroup/socket_post_create` hook. `test_classifier.sh` proves first-socket marks/denials, cgroup composition checks, unrelated mark preservation, immediate TCP/UDP traffic, concurrency, rename/replacement/alias semantics, static/dynamic ELF and independent helper enrollment. System/user service and host-root private-mount fixtures pass. `test_preemption.py` reproduces the old shared-scratch race and verifies the corrected selected/unlisted socket and resolver behavior under forced same-CPU preemption. | The proposed two-hook handoff was unnecessary and was not implemented. No asynchronous watcher substitutes for classification. Normal loader exit preserves pins; SIGKILL between every native pin publication is not proved. |
+| 2. DNS and resolver isolation | `firewall.py`, `resolver_guard.bpf.c`, `test_dns_paths.py` and `test_resolver_ipc.py` prove automatic selected DNS, original response peers, identical-tuple conntrack separation, tunnel-loss blocking, IPC/cache aliases and inherited descriptor/splice restrictions. `test_resolver_integration.py` exercises actual distro nscd, Avahi and supported NSS fallback. Large EDNS/UDP and TCP fallback are covered by `test_packet_paths.py`. | Direct kernel DNS supersedes the proposed production dnsmasq UID, listener, unit and upstream-only mark. Existing mapped caches cannot be revoked; fresh exec succeeds, while old mapped state requires restart. Unsupported NSS/IPC integrations remain excluded. |
+| 3. Configuration and ownership | Strict profile/settings/stored-key parsing, bounded native bulk policy loading, collision-aware allocation and exact resource receipts are implemented in `config.py`, `network.py`, `ownership.py` and the native boundary. Configuration/network/ownership/bulk tests cover malformed input, capacity, secret handling and foreign-resource preservation. Actual network acquisition, readback, repair and cleanup pass in `test_network_vm.py`. | `test_acquisition_failures.py` covers 52 modeled before/after boundaries: ten mutating prepare commands and sixteen receipt publications. Ambiguous outcomes retain resources; only proved receipts authorize rollback. This is not every native instruction or every possible process-crash interleaving. |
+| 4. Guard, controller and recovery | `controller.py`, `preflight.py` and both systemd units load blocked policy first, require real marked DNS plus handshake readiness, verify owned state on recovery and retain enforcement on normal stop/controller death. Lifecycle tests cover pending edits, tampering, bounded locking and healthy restart without reblocking. Installed tests exercise real SIGKILL/restart, stop, underlay loss and recovery. | Restart uncertainty remains sticky when old application state was observed; PID snapshots cannot prove a whole fork lineage has ended. Application service dependencies are explicit; installation does not edit arbitrary bot units. |
+| 5. Install and CLI | Isolated root-owned packaging, inactive installation, read-only planning/configured include listing, serialized include edits and exact disable/uninstall are implemented. `test_install_cli.py` and `test_acceptance.py` cover installed import isolation, units, real first-socket/DNS/IP behavior, retained private profiles and changed/foreign-file preservation. Healthy idempotent edits retain readiness after full validation. | `include list` reports configured keys, not live enforcement. Actual policy edits still guard/reverify. Explicit disable releases protection and never kills arbitrary application processes. |
+| 6. Acceptance and CI | `tests/run-linux.sh` runs the unit/native checks and an explicitly marked disposable-VM suite; Windows checks remain in `tests/run.sh`. CI has unprivileged Linux/Windows jobs and an opt-in privileged VM job. Persistent TCP/UDP byte integrity, source identity and absence of per-packet executable lookup pass. `test_boot.py` separately passed two actual reboots with exact cleanup and baseline restoration. | A dependent early probe was denied before receiving its first socket; a deliberately failed guard prevented that dependent service from starting. This proves explicit guard ordering, not admission control over every possible boot process. Performance and compatibility qualifications below still apply. |
+| 7. Documentation and publication | Linux operating/migration documentation, common-runtime enrollment guidance, strict examples, source/private-artifact checks and platform instructions are present. Implementation was published in scoped commits; this document records the final disposition of the original tasks. | Private profiles, live paths, keys, runtime receipts and validation logs remain outside Git. Claude review and TV deployment are not claimed. |
 
-## Global constraints
+## Supported application and control contract
 
-- First validation target: native Ubuntu 26.04, kernel 7.0, cgroup v2,
-  kernel BTF and BPF LSM enabled. Verify exact helper/attachment support.
-- Include full native executable paths automatically. No wrapper/UID/name
-  substitution and no asynchronous first-packet classification claim.
-- Include mode only. Minimum latency/compute overhead remains a deployment
-  acceptance gate. The user authorized controller work after the VM transport
-  comparison; no numerical TV budget or universal compatibility is inferred.
-- Initial payload: IPv4 TCP/UDP. Block included IPv6; leave host IPv6 alone.
-- Helpers need their own paths. Reject script-only and unsupported
-  container/namespace enrollment. Already-running selected programs need
-  restart after activation/enrollment, including retained resolver state.
-- Keep unlisted host routing and resolver configuration effective.
-- Own specific interfaces, routing rules, nftables tables, BPF links,
-  services and listeners. Never flush/replace unrelated networking.
-- Keep profiles, keys, actual paths/users, private audits and logs out of Git.
-- Target 500 lines per source/test file; phases touch at most five files.
-- Original phase boundaries were split into groups of at most five files.
-  Current source and the operating guide establish implemented APIs; the
-  remaining acceptance targets below do not manufacture passing results.
+The tested platform is native Ubuntu 26.04/kernel 7.0 with systemd, cgroup v2,
+BTF and effective BPF LSM. Required hooks must actually load; a version or
+compiled kernel option alone is insufficient.
 
-## Phase 1: Prove full-path classification before first socket use
+Common native applications and Python, Node, Java, .NET and shell workloads use
+the same executable identity mechanism. Enroll the native runtime that creates
+the socket and each independent network helper. A shared interpreter selects
+all applications using that interpreter. A script/JAR/DLL pathname alone is
+not an executable enrollment. Containers, changed roots, unsupported namespaces
+and sandbox integrations are outside this scope; the native mechanism is not a
+universal application-compatibility claim.
 
-**Create:**
-
-- `src/linux/bpf/classifier.bpf.c`: provisional LSM path/mark program.
-- `src/linux/native/bpf-loader.cpp`: libbpf loading, map update and attachment.
-- `scripts/build-linux.sh`: reproducible BPF/native build under `build/linux/`.
-- `tests/linux/probe_socket.c`: immediate TCP/UDP and identity fixtures.
-- `tests/linux/test_classifier.sh`: disposable-VM classification gate.
-
-Build only in a disposable VM with matching kernel and security settings.
-Record verifier output and active hooks. A successful compile is not a
-successful attachment, and an attached program is not traffic proof.
-Record the baseline and BPF-LSM-only timings before project attachment.
-
-- [ ] Build a minimal `lsm_cgroup/socket_post_create` program using the
-  actual executable-file/path kfuncs and `bpf_setsockopt(SO_MARK)`. Use a
-  configured pathname map and release acquired file references on every
-  return path. Do not write directly into arbitrary kernel socket fields.
-- [ ] Prove it loads and marks the first socket before userspace receives
-  it. Check cgroup-LSM allow/deny return semantics, competing attachments
-  and preservation of unrelated mark bits. Start in a test-owned cgroup,
-  then verify root-cgroup descendant coverage on the disposable VM.
-- [ ] If that combined hook is rejected, test the design's synchronous
-  LSM-create to cgroup-socket-create handoff. Do not add a userspace exec
-  watcher as an undeclared replacement. If neither works, stop this plan
-  and revise the design with the reviewer.
-- [ ] Run identical probe bytes under two different absolute paths;
-  include only one. Launch through shell, system and user services and
-  cron-compatible direct exec. Immediate first TCP/UDP traffic must have
-  the right class every time, including concurrent short-lived processes.
-- [ ] Include a service with `PrivateTmp=yes` that retains the host root.
-  Reject unsupported filesystem-root/network-namespace contexts rather
-  than matching an unrelated container's identical pathname. Inject
-  pathname lookup errors/truncation and require explicit socket errors,
-  never direct fallback; check ordinary unlisted sockets remain healthy.
-- [ ] Replace the included binary atomically at its configured path:
-  newly launched copies remain included without updating an inode map;
-  new sockets from the old unlinked image must error until restart.
-  Deleted/synthetic paths never become known-unlisted through a map miss.
-  Test actual file/dentry state and genuine filenames ending in
-  ` (deleted)`; do not strip a textual suffix and assume identity.
-- [ ] Assert that a still-linked rename changes the canonical path used
-  for subsequent sockets. Enrolling the destination before the move keeps
-  inclusion; moving to an unlisted destination makes new sockets direct.
-  Existing socket marks retain their class. Test symlink canonicalization,
-  distinct hard links, multiple threads, helpers and policy changes.
-  Reject unsupported script/namespace cases with an explicit reason.
-- [ ] Use no classification cache across sockets in the first proof.
-  Any later cache must handle executable and ancestor-directory renames,
-  policy updates and supported root/mount changes synchronously; identity
-  and policy generation alone are insufficient invalidation keys.
-- [ ] Measure socket-creation and first-response latency independently
-  for included/unlisted paths, concurrent churn and rename contention.
-  Record distributions and CPU cost; no unmeasured constant-time claim.
-- [ ] Inspect loader-crash behavior and pin/link ownership. Record kernel,
-  effective LSMs, helper/attach results and packet/classification evidence
-  under ignored `local/validation/`. Commit only source/tests after the
-  gate passes; never claim the full feature is implemented at this phase.
-
-Representative fixture behavior, implemented by `probe_socket.c`:
-
-```text
-probe_socket tcp HOST PORT       # connect as its first network operation
-probe_socket udp HOST PORT       # send without a preceding UDP connect
-probe_socket udp-connected HOST PORT
-probe_socket identity           # executable, UID, namespaces and socket mark
-```
-
-The fixture reports observed socket marks/peer tuples and uses bounded
-I/O. Test keys and addresses belong to the disposable fixture, not TV.
-
-## Phase 2: Prove DNS translation and IPC isolation
-
-**Create:**
-
-- `src/linux/bpf/resolver_guard.bpf.c`: selected-process resolver IPC/cache guards.
-- `src/linux/bpf/policy.bpf.h`: shared exact policy and guard ABI.
-- `src/linux/wg_program_split/firewall.py`: owned mark/DNS rules renderer.
-- `tests/linux/test_dns_paths.py`: controlled responders and lookup clients.
-- `tests/linux/test_resolver_ipc.py`: cache, Varlink, D-Bus and alias fixtures.
-
-Consume the classifier ABI from phase 1. First compare direct DNS DNAT
-against the private forwarder below. Both must pass the same routing,
-peer-tuple, failure and IPC/cache proofs. Select one from measured results
-before phase 3; remove the unused runtime path from the remaining plan.
-
-For the forwarder candidate, the policy distinguishes direct,
-included-application and internal DNS-forwarder sockets. The internal
-class uses the dedicated service UID and executable identity together;
-other instances of the same dnsmasq executable remain direct.
-
-- [ ] In the disposable VM, first test selected output DNAT directly to
-  numeric VPN DNS with strictly scoped tunnel-address SNAT. A loopback
-  source can fail rerouting before SNAT. Test `route_localnet` on owned
-  `wgps0` only, with inbound conntrack restrictions preventing unrelated
-  loopback-service access. Preserve host `all`/`default` settings; verify
-  source/device binds, reverse-path filtering and reverse translation.
-  The final VM gates prove this selected kernel configuration within the
-  documented host/application scope.
-- [ ] Start a private dnsmasq listener on an unused loopback port with one
-  numeric VPN DNS upstream and no default config/resolv/hosts files.
-  Syntax-check with `dnsmasq --test` against the generated config.
-- [ ] Translate marked application UDP/TCP destination port 53 in the
-  output NAT path before host resolver delivery. Exclude the internal
-  upstream mark. Preserve original peer tuples through conntrack.
-- [ ] Prove queries addressed to both the loopback stub and a nonloopback
-  DNS address work, including connected UDP, TCP, truncation/fallback,
-  EDNS and large responses. Verify source addresses, reverse translation
-  and packet counters; never enable global `route_localnet` to conceal
-  an unproven design problem.
-- [ ] Enforce DNS-forwarder egress only to profile DNS through `wgps0`,
-  including worker children and its first upstream socket. Removing the
-  tunnel or killing dnsmasq must not send a query to the host resolver.
-- [ ] Add LSM restrictions for selected applications' resolved/nscd/Avahi
-  IPC, system/user buses and shared hosts-cache files. Test aliases,
-  alternate path references and sockets created after guard activation.
-  Preserve prior LSM denies and unlisted applications' access.
-- [ ] Test the reference `hosts: files mdns4_minimal [NOTFOUND=return] dns`
-  arrangement and `files dns`. Unsupported NSS backends fail preflight.
-  Do not claim `nss-resolve` compatibility unless a test demonstrates
-  successful included DNS and zero host-daemon lookup activity.
-- [ ] Warm host caches, then start fresh included/unlisted fixtures and
-  query the same unique and repeated names concurrently. Give the two DNS
-  responders different answers and require their per-query ledgers to
-  show exact origin separation. Capture network destinations as well.
-- [ ] Separately enroll an already-running fixture that mapped the shared
-  hosts cache before policy activation. New access guards cannot revoke
-  its mapping: require an explicit restart-needed result, then verify DNS
-  separation after restart. Include inherited mappings in descendants;
-  zero open network sockets must not imply per-application DNS readiness.
-- [ ] Finish the design's early performance gate: isolate classifier,
-  resolver-guard and networking costs; include an empty-list installation
-  and matched plain-WireGuard baseline. Measure both DNS candidates with
-  identical upstream/cache conditions. Cover latency tails, CPU/query,
-  packet rate, file/IPC-heavy unlisted work and representative bot traffic.
-  Do not turn a noisy result into a passing zero-overhead claim.
-- [ ] Record the selected DNS transport and remove unused forwarder or
-  direct-translation components from subsequent phases. If direct wins,
-  omit dnsmasq, its unit/UID/listener and DNS-forwarder-only settings.
-- [ ] Stop if DNS or IPC protection is not demonstrable; do not continue
-  by redirecting all host DNS or weakening origin classification.
-  Review the evidence and commit the scoped phase after it passes.
-
-## Phase 3: Validate profiles, configuration and routing ownership
-
-**Create:**
-
-- `src/linux/wg_program_split/__init__.py`: package marker with private internals.
-- `src/linux/wg_program_split/config.py`: strict JSON and WireGuard validation.
-- `src/linux/wg_program_split/network.py`: explicit route/WireGuard operations.
-- `src/linux/wg_program_split/ownership.py`: serialized acquisition/rollback.
-- `tests/linux/test_config_network.py`: validation and injected failures.
-
-Implemented interfaces include `parse_profile`, `parse_settings`, persisted-key
-`parse_policy`, `inspect`, `allocate`, and `Network.prepare/health/repair_missing/disable`.
-Commands use fixed argv and private temporary configuration files; no privileged
-command uses a shell or puts private keys in its argument vector.
-
-Implemented settings shape:
-
-```json
-{
-  "schema_version": 1,
-  "included_executables": []
-}
-```
-
-Runtime allocation records the owned mark mask/classes, routing table,
-rule priorities, firewall table, conntrack zone and BPF object IDs.
-These are selected after collision checks; do not repurpose Tailscale or
-another VPN's marks, priorities or tables.
-
-- [ ] Reject duplicate/unknown profile or JSON fields, invalid key sizes,
-  unsafe resolver addresses, IPv6, endpoint hostnames, multiple peers,
-  partial AllowedIPs, `Table`, `FwMark`, hooks and `SaveConfig`.
-  Test errors and repr for secret redaction. Generate fake keys in tests.
-- [ ] Canonicalize included paths and validate native ELF input without
-  executing it. Report helper/script and namespace limitations. Match
-  source-address/MTU/profile changes to required restart behavior.
-- [ ] Generate only owned route additions: marked traffic table with a
-  terminal unreachable/blackhole fallback and the WG preferred route;
-  separate encrypted transport behavior. Keep the host local/default
-  rules effective. Decide any necessary mark-scoped source NAT only from
-  the passing phase-2 packet evidence.
-- [ ] Record acquisitions incrementally with boot ID, interface identity,
-  rule/table specification, BPF link/map IDs, file hashes and process
-  ownership. Lock mutations and reject foreign or ambiguous resources.
-- [ ] Inject failure after each resource acquisition. Roll back only
-  resources proved to belong to the current attempt. A same-name object
-  after a crash is not sufficient evidence for deletion.
-- [ ] Run `PYTHONPATH=src/linux python3 -m unittest discover -s tests/linux -p 'test_config_network.py' -v`.
-  Confirm failures originate from missing/new behavior, implement the
-  minimum satisfying code, then rerun and commit the verified phase.
-
-## Phase 4: Early guard, controller and recovery
-
-**Create:**
-
-- `src/linux/wg_program_split/controller.py`: activation/recovery state machine.
-- `src/linux/systemd/wg-program-split-guard.service`: early pinned protection.
-- `src/linux/systemd/wg-program-split.service`: networking controller.
-- `src/linux/wg_program_split/preflight.py`: native host and real readiness checks.
-- `tests/linux/test_lifecycle.py`: staged and real systemd lifecycle cases.
-
-The state machine has `blocked`, `preparing`, `ready` and `degraded`
-protection states. Missing policy is not equivalent to direct authorization.
-Atomically publish a complete policy generation; pin the active objects.
-
-- [ ] Order guard loading ahead of ordinary host network/app startup,
-  without creating systemd dependency cycles or disabling the host's
-  security services. Generate and validate complete units using
-  `systemd-analyze verify` on the supported VM.
-- [ ] Load included-path protection in blocking state first. Install
-  routing/firewall state and configure WG, then probe the actual marked kernel
-  DNS path and observe a recent tunnel handshake before readiness.
-- [ ] Keep pinned links/maps and fail-closed rules across controller exit,
-  management-service stop and network failure. Recovery verifies real
-  owned state before reuse. Distinguish connectivity failure from lost
-  protection and never advertise one as the other.
-- [ ] Preserve unlisted DNS, routes and existing cgroup BPF programs while
-  faulting every startup/recovery phase. Test early-boot immediate-connect
-  fixtures, interface deletion, existing sockets and retained resolver
-  state at activation. Track affected processes independently of socket
-  inventories and keep restart requirements across controller recovery.
-- [ ] Identify the actual deployment bot's ordering needs so it cannot
-  start before the guard. Runtime automatic inclusion must still work
-  from all normal launch methods; do not require a wrapper to hide a
-  missing classifier. No bot-unit edits occur during reusable install.
-- [ ] Verify complete cleanup of fixture services/cgroups and listeners,
-  review observed boot/stop/restart behavior and commit.
-
-## Phase 5: Install, control CLI and reversible removal
-
-**Create:**
-
-- `src/linux/wg_program_split/cli.py`: command dispatcher.
-- `src/linux/wg_program_split/install.py`: trusted install/update/removal.
-- `scripts/wg-program-split`: installed isolated Python entrypoint.
-- `config/linux-settings.example.json`: generic settings example.
-- `tests/linux/test_install_cli.py`: staging-root install and exact ownership.
-
-Implemented CLI:
+Bot agents can enroll their own paths later through the shared CLI; there is no
+required repository-specific bot path or launcher. Preserve other agents'
+entries and use the [enrollment guide](../../linux-agents.md) for runtime choice,
+updates, restart boundaries and optional application-owned service ordering.
 
 ```text
 wg-program-split validate --profile PATH --settings PATH
 wg-program-split plan --profile PATH --settings PATH
 wg-program-split install --profile PATH --settings PATH
 wg-program-split activate
+wg-program-split include list
 wg-program-split include add ABSOLUTE_EXECUTABLE
-wg-program-split include remove ABSOLUTE_EXECUTABLE
+wg-program-split include remove EXACT_STORED_KEY
 wg-program-split status
 wg-program-split check
 wg-program-split disable
 wg-program-split uninstall
 ```
 
-There is deliberately no required `run` command: programs start normally.
-`disable` explicitly releases routing protection and reports affected
-applications/connections. `uninstall` retains private profiles and modified
-files by default. Neither operation kills arbitrary matching processes.
+Configured paths survive a temporarily missing/replaced file through exact
+stored-key loading/removal. Symlinks are resolved on enrollment; linked renames
+change subsequent socket selection, and atomic replacement preserves selection
+for newly launched images. Existing sockets retain their marks. Old unlinked
+images and uncertain path lookups fail explicitly rather than becoming direct.
+Included IPv6/raw/packet sockets are refused; unlisted host IPv6 remains usable.
+The shared per-CPU pathname buffer is protected by a short preemption-disabled
+region through policy lookup; the executable reference is released afterward.
+This preserves fresh per-operation resolution without a classification cache.
 
-- [ ] Package Python in a root-owned zipapp and invoke it with
-  `/usr/bin/python3 -I`. Test caller-directory/PYTHONPATH injection.
-  Load BPF only through the installed native loader and exact owned pins.
-- [ ] Install private config under `/etc/wg-program-split/`, transient
-  state under `/run/wg-program-split/`, and the BPF pins under an owned
-  bpffs subtree. Validate parent permissions and symlink handling.
-- [ ] Install the isolated runtime and units without activating
-  another VPN, changing kernel boot options or converting applications.
-  Refuse unsupported effective BPF-LSM state with a precise preflight
-  result, not a promise based on `CONFIG_BPF_LSM=y` alone.
-- [ ] Ensure `plan` does not mutate network state. Never print private
-  keys, raw profiles, credentials or secret-bearing subprocess arguments.
-- [ ] Stage include-list changes atomically; preserve policy generation
-  and pinned protection on errors. Report already-running selected
-  programs needing restart for connections or retained resolver state.
-- [ ] Remove only exact owned rules/pins/interfaces/units/files. Retain
-  foreign or locally edited resources and report any remaining listeners.
-  Run staging-root tests, full unit tests and the kernel/DNS gates; commit.
+## Verification entry points and evidence limits
 
-## Phase 6: End-to-end acceptance and CI
+From the repository root:
 
-**Create:** `tests/run-linux.sh`, `tests/linux/test_acceptance.py`,
-`tests/linux/fixtures.py`. **Modify:** `.github/workflows/ci.yml`,
-`tests/check-public-tree.sh`.
+```sh
+./tests/run-linux.sh
+./tests/run.sh
+./tests/check-public-tree.sh
+git diff --check
+```
 
-- [ ] Build a controlled WireGuard peer, direct and VPN DNS responders,
-  TCP/UDP endpoints and warm-cache/IPC fixtures inside a disposable VM.
-  Use ephemeral keys and test-owned `/run` storage, not production data.
-- [ ] Exercise every normal launch method, same-name/different-path
-  executables, replacements, helpers, children, static/dynamic binaries,
-  first-packet concurrency and explicitly unsupported cases.
-- [ ] Verify TCP/UDP exits and DNS UDP/TCP destinations independently;
-  include application-owned DoH as VPN payload, IPv6 attempts, MTU,
-  VPN/DNS failure, loader death, rollback and real reboot ordering.
-- [ ] Measure unlisted new-connection latency and sustained throughput.
-  Repeat the full early performance matrix with final components and
-  production instrumentation. Report p50/p95/p99, CPU per operation,
-  context switches, memory/conntrack pressure and bot deadline misses.
-  Require kernel forwarding for established payload; no per-packet path
-  lookup, userspace queue or operation-by-operation logging. No numerical
-  slowdown budget has been accepted; preserve regressions as blockers
-  rather than invent a tolerance or call inconclusive results equivalent.
-- [ ] Assert pre/post host resolver/default route invariants and inventory
-  owned additions separately from pre-existing firewall/BPF objects.
-  Drain only test-owned processes, ports, mounts, links and artifacts.
-- [ ] Add unprivileged and explicitly privileged Linux jobs; retain Windows
-  CI. A missing kernel/LSM capability is a reported failure for the
-  privileged acceptance job, not a silently skipped pass.
-- [ ] Extend source/private-artifact checks to Linux/Python/BPF files.
-  Run both platform suites and `git diff --check`, then commit.
+Only inside the explicitly provisioned disposable native VM, invoked by a
+non-root account with a working systemd user manager:
 
-## Phase 7: User documentation and publication
+```sh
+sudo env WG_CLASSIFIER_DISPOSABLE_VM=1 ./tests/run-linux.sh --vm
+sudo env WG_CLASSIFIER_DISPOSABLE_VM=1 ./tests/run-linux.sh --performance
+python3 tests/linux/test_boot.py --help
+```
 
-**Modify:** `README.md`, `CONTRIBUTING.md`, `.gitignore`.
-**Create:** `docs/linux.md`, `docs/linux-migration.md`.
+The boot harness is a separate staged operation requiring host-side manifest
+hash retention, two actual reboots and exact owned cleanup; `--help` does not
+run it. VM fixtures require their marker and refuse TV/WSL. They preserve
+pre-existing BPF attachments, routing/resolver state and unrelated resources.
+Ignored `local/validation/` holds dated detailed evidence rather than private
+live values in these documents.
 
-- [ ] Document tested kernel requirements, BPF LSM enablement, automatic
-  path semantics including rename/replacement behavior, helpers/scripts,
-  DNS APIs, connection and resolver-state restart boundaries,
-  pinned fail-closed behavior, localhost/LAN behavior and removal.
-- [ ] Explain that kernel enablement and retirement of an old full tunnel
-  are separate operator-specific migration operations. Give an audit and
-  rollback sequence; never ship machine-specific boot settings/endpoints.
-- [ ] Keep examples aligned with the parser and code. Ignore build/Python
-  caches, profiles, captures and runtime receipts. Keep Windows scope and
-  limitations accurate while linking the tested Linux implementation.
-- [ ] Run `./tests/run.sh`, `./tests/run-linux.sh`, the documented disposable
-  VM acceptance command, `./tests/check-public-tree.sh` and
-  `git diff --check`. Record exact pass/fail/blocker evidence.
-- [ ] Inspect status and staged diff, commit and push only scoped work on
-  the current branch. Do not force-push or overwrite concurrent work.
+Remaining verification qualifications:
 
-## TV deployment acceptance after implementation
+- Native loader SIGKILL at each instruction between pin publications is not
+  proved by normal loader exit, controller SIGKILL or the modeled acquisition
+  failures. Those results must remain separate.
+- Static/dynamic ELF, launch mechanisms and independent helpers are verified;
+  every language library, desktop application and networking API is not.
+  Application-owned encrypted DNS follows selected payload routing, but a
+  dedicated DoH/DoT/DoQ client compatibility matrix was not completed.
+- Source-bound/loopback DNS and large responses are verified. Arbitrary
+  `SO_BINDTODEVICE`, reverse-path-filter settings and MTU combinations are not
+  a completed compatibility matrix.
+- [Linux overhead measurements](../../linux-performance.md) records the rejected
+  run, correctness regression and fair-comparison method/results. The comparison
+  baseline includes the same scratch correctness fix as the candidate; faulty
+  classification cannot count as faster successful work. Only completed,
+  error-free measurements support numerical claims. The user's target is ideally less
+  than 1 ms of added **local p99** latency with minimal CPU/memory cost; this is
+  neither zero overhead nor a total VPN/Internet round-trip guarantee. Target
+  application deadline tails and compute under representative load remain
+  deployment gates, not conclusions from VM microbenchmarks.
 
-This phase changes a live host and remains separate from repository work.
+## Separate TV deployment gates — not completed
 
-- [ ] Verify the effective active VPN, DNS, BPF/LSM, systemd, Tailscale,
-  protected captures, bot path/launch and local metrics dependencies.
-- [ ] Prepare/review a concrete BPF-LSM boot change preserving the existing
-  security-module order. Reboot only in a coordinated maintenance window;
-  verify actual hooks afterward before claiming compatibility.
-- [ ] Prepare rollback for the old VPN and its repair daemon. Disable only
-  the daemon's VPN management, keep its LAN/Tailscale duties, and retire
-  the old tunnel through its confirmed owner. Preserve credentials.
-- [ ] Never overlap old/new tunnels using the same provider identity.
-  Do not stop protected captures or inspect their outcomes for this task.
-- [ ] Verify direct DNS/IP use the router and intended Tailscale DNS still
-  works. Independently verify router upstream DoH if that claim is made.
-- [ ] Run harmless included/unlisted probes first; prove no direct fallback
-  and no DNS crossovers. Enroll the real bot only after these pass.
-- [ ] Verify effective bot behavior, existing service continuity, LAN and
-  Tailscale access, and boot persistence. Preserve dated local evidence
-  and report any verification not actually performed.
+Repository acceptance did not change TV. Before any live cutover:
+
+- [ ] Refresh the actual VPN/repair-daemon, DNS, LSM, systemd, Tailscale,
+  protected-capture and local-service inventory; prepare exact rollback.
+- [ ] Coordinate the BPF-LSM boot change, preserve existing security-module
+  order and verify effective hooks after reboot. Do not infer enabled BPF LSM
+  from a compiled option or the disposable VM's result.
+- [ ] Retire only the confirmed old VPN ownership and repair responsibility,
+  preserving LAN/Tailscale duties and protected captures. Never overlap tunnels
+  using the same provider identity.
+- [ ] Verify harmless included/unlisted TCP/UDP and DNS paths, failure behavior,
+  router/default-route restoration and intended Tailscale DNS. Router upstream
+  DoH needs separate router evidence.
+- [ ] Verify service continuity and guard boot ordering on TV. Application
+  agents subsequently enroll their own runtimes/helpers and verify their real
+  workloads; there is no mandatory specific bot enrollment for this reusable
+  implementation.
+- [ ] Measure added local latency, throughput and compute on target hardware
+  under representative application load; retain dated evidence and any
+  unresolved regressions. VM correctness is not TV performance acceptance.
