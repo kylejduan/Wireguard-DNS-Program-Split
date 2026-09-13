@@ -25,9 +25,11 @@ IPv6 and unsupported raw/packet socket access without changing host IPv6.
 Helpers are included by their own executable paths, as on Windows.
 Interpreted scripts identify their interpreter; listing a script alone
 must be rejected rather than silently include every Python/bash program.
-Existing or inherited connections require restart and must not be
-presented as newly classified connections. Other network namespaces,
-different filesystem roots and arbitrary network-delegating IPC are
+Already-running selected programs require restart after activation or
+enrollment, including those retaining resolver mappings/cache state without
+open connections. Existing or inherited connections are not newly
+classified connections. Other network namespaces, different filesystem
+roots and arbitrary network-delegating IPC are
 outside initial support. This is not a security boundary against hostile
 applications or host administrators. Host localhost remains available;
 there is no network-namespace relocation of applications.
@@ -76,12 +78,22 @@ is the only planned fallback; it must pass the same first-socket tests.
 If both fail, stop and revise the architecture before building a controller.
 
 Use full canonical paths, not basename, `comm`, PID-only decisions or a
-static device/inode allowlist. Binary replacement at the same registered
-path must be covered synchronously. Distinct hard-link paths must not be
-silently treated as equivalent. Specify symlink canonicalization, renamed
-or deleted running executables and policy reload behavior in executable
-fixtures. A cache, if used, must be invalidated by executable identity and
-policy generation without a userspace first-packet race.
+static device/inode allowlist. Canonicalize symlinks at enrollment; distinct
+hard-link paths remain separate. The initial identity is the canonical
+executable path observed during socket creation. Renaming a still-linked
+running executable changes selection for subsequent sockets; enroll the
+destination before moving it if continuous VPN selection is required.
+Existing sockets retain their assigned class. This initial path behavior
+does not preserve a historical launch pathname after a rename.
+
+After atomic replacement at a registered path, newly launched copies must
+remain included without updating an inode map. The old unlinked running
+image's new sockets return an error requiring restart. Deleted or synthetic
+executable paths must never become known-unlisted through a map miss.
+Check file/dentry state rather than stripping the ambiguous ` (deleted)`
+text suffix; exercise real filenames with that suffix too. A cache, if
+used, must be invalidated by executable identity and policy generation
+without a userspace first-packet race. Fixtures assert these exact outcomes.
 
 Check the filesystem-root and network-namespace identity as well as the
 path; a coincident pathname inside a container is not an enrolled host
@@ -183,9 +195,15 @@ fallback to marked DNS and zero host-daemon queries. Direct use of a
 blocked resolver IPC API may fail; it must never silently resolve directly.
 
 Test late-created sockets, warm shared caches, inherited descriptors and
-both UDP/TCP lookups. Applications delegating networking to an existing
-host helper cannot be accepted merely because their main executable is
-listed. Exclude untested IPC integrations from supported enrollment.
+both UDP/TCP lookups. A guard on new file/socket access cannot revoke an
+existing shared hosts-cache mapping. Require already-running selected
+programs to restart after activation/enrollment before claiming their DNS
+readiness, even when they have no open network connections. Separately
+test a freshly started selected program against a warm host cache and a
+program that mapped that cache before enrollment; the latter must report
+restart required. Applications delegating networking to an existing host
+helper cannot be accepted merely because their main executable is listed.
+Exclude untested IPC integrations from supported enrollment.
 
 ## Configuration, control and failure behavior
 
@@ -217,8 +235,11 @@ must be reported, and the actual bot's service ordering must prevent its
 unguarded start without turning normal runtime inclusion into a launcher
 requirement. Installation does not silently alter an existing bot unit.
 
-Policy edits apply to new sockets. Document and detect existing selected
-connections that require restart. Stopping the management service retains
+Policy edits apply to new sockets. Track affected running processes at
+activation/enrollment and report their restart requirement independently
+of socket counts; retain that requirement for descendants carrying old
+resolver state. Keep per-application readiness separate from installed
+policy readiness. Stopping the management service retains
 protection; an explicit disable/uninstall operation releases it after
 reporting affected running applications. Never kill arbitrary matching
 processes as cleanup. Own and track every added rule, BPF pin, interface,
@@ -281,6 +302,8 @@ See the [implementation plan](../plans/2026-09-12-linux-include-mode.md).
   cgroup LSM socket-option availability and supported hooks.
 - [Linux socket creation](https://github.com/torvalds/linux/blob/v7.0/net/socket.c):
   post-create security checks occur before returning the socket.
+- [Linux pathname reconstruction](https://github.com/torvalds/linux/blob/v7.0/fs/d_path.c):
+  current executable paths and deleted/synthetic path handling.
 - [BPF LSM documentation](https://docs.kernel.org/bpf/prog_lsm.html):
   attachment and security-hook model.
 - [Proton socket monitor](https://github.com/ProtonVPN/proton-vpn-daemon/blob/stable/proton/vpn/daemon/split_tunneling/apps/socket_monitor.py)
@@ -292,6 +315,8 @@ See the [implementation plan](../plans/2026-09-12-linux-include-mode.md).
   marked policy routing and terminal failure rules.
 - [nss-resolve documentation](https://github.com/systemd/systemd/blob/main/man/nss-resolve.xml):
   filesystem Unix-socket resolver delegation.
+- [glibc nscd host lookup](https://github.com/bminor/glibc/blob/glibc-2.42/nscd/nscd_gethst_r.c):
+  lookup through a retained shared hosts mapping without a new socket.
 - [vopono](https://github.com/jamesmcm/vopono) and
   [WireGuard namespaces](https://www.wireguard.com/netns/):
   the launcher-based alternatives considered.
