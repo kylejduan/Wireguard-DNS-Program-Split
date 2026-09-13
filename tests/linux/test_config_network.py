@@ -68,6 +68,32 @@ class ProfileTests(unittest.TestCase):
         profile = config.parse_profile(text)
         self.assertEqual((profile.mtu, profile.persistent_keepalive), (1500, 25))
 
+    def test_rejects_utf8_profile_larger_than_runtime_byte_limit(self):
+        text = PROFILE + '#' + 'é' * 40000
+        self.assertLess(len(text), 65536)
+        self.assertGreater(len(text.encode('utf-8')), 65536)
+        with self.assertRaises(config.ConfigError) as error:
+            config.parse_profile(text)
+        self.assertNotIn(KEY, str(error.exception))
+
+    def test_accepts_exact_utf8_byte_boundary_and_rejects_one_byte_more(self):
+        prefix = PROFILE + '#'
+        remaining = 65536 - len(prefix.encode('utf-8'))
+        text = prefix + 'é' * (remaining // 2) + 'x' * (remaining % 2)
+        self.assertEqual(len(text.encode('utf-8')), 65536)
+        self.assertEqual(config.parse_profile(text), config.parse_profile(PROFILE))
+        with self.assertRaises(config.ConfigError):
+            config.parse_profile(text + 'x')
+
+    def test_rejects_unencodable_profile_comments_without_exposing_input(self):
+        for character in ('\ud800', '\udcff'):
+            text = PROFILE + '# sensitive-comment-' + character
+            with self.subTest(codepoint=ord(character)):
+                with self.assertRaises(config.ConfigError) as error:
+                    config.parse_profile(text)
+                for secret in (KEY, PUBLIC, 'sensitive-comment', text):
+                    self.assertNotIn(secret, str(error.exception))
+
     def test_rejects_duplicate_unknown_and_wg_quick_fields(self):
         additions = [f'PublicKey = {PUBLIC}', '[Peer]', '[Other]', '[DEFAULT]',
                      'Table = auto', 'FwMark = 1', 'SaveConfig = true',

@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import time
 import uuid
 
 
@@ -218,8 +219,10 @@ def create_owned_file(directory: int, name: str, content: bytes) -> FileIdentity
 
 
 @contextmanager
-def locked_state(path=STATE_ROOT, *, owner_uid: int = 0):
-    """Nonblocking exclusive flock on a persistent, validated, independent FD."""
+def locked_state(path=STATE_ROOT, *, owner_uid: int = 0, timeout: float = 0):
+    """Exclusive flock on a verified FD; optional bounded management serialization."""
+    if type(timeout) not in (int, float) or not 0 <= timeout <= 60:
+        raise OwnershipError('invalid state lock timeout')
     directory = open_private_dir(path, owner_uid=owner_uid)
     fd = -1
     try:
@@ -233,7 +236,16 @@ def locked_state(path=STATE_ROOT, *, owner_uid: int = 0):
             fd = os.open(_LOCK, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
                          dir_fd=directory)
         _regular(fd, directory)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise OwnershipError('another management operation holds the state lock') from None
+                time.sleep(min(0.025, remaining))
         held, live = os.fstat(fd), os.stat(_LOCK, dir_fd=directory, follow_symlinks=False)
         if (held.st_dev, held.st_ino) != (live.st_dev, live.st_ino):
             raise OwnershipError('state lock was replaced')
