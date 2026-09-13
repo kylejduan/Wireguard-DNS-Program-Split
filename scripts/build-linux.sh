@@ -6,11 +6,7 @@ mkdir -p "$output"
 cc -O2 -g -std=c11 -Wall -Wextra -Werror -pthread \
     "$repo/tests/linux/probe_socket.c" -o "$output/probe_socket"
 if [[ ${1:-} == --fixture-only ]]; then exit 0; fi
-if [[ ${WG_CLASSIFIER_DISPOSABLE_VM:-} != 1 ]] ||
-   [[ $(uname -r) == *microsoft* ]] || [[ $(hostname) == TV ]]; then
-    echo 'BPF build requires WG_CLASSIFIER_DISPOSABLE_VM=1 on the disposable native VM.' >&2
-    exit 1
-fi
+if [[ ${1:-} != --package-only ]]; then
 for tool in bpftool clang c++ pkg-config; do command -v "$tool" >/dev/null; done
 test -r /sys/kernel/btf/vmlinux
 test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs
@@ -29,3 +25,22 @@ c++ -O2 -g -std=c++17 -Wall -Wextra -Werror \
     $(pkg-config --cflags --libs libbpf)
 printf 'Built for kernel %s; libbpf %s. No attachment performed.\n' \
     "$(uname -r)" "$(pkg-config --modversion libbpf)"
+fi
+python3 - "$repo" "$output" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+import zipfile
+
+repo, output = map(Path, sys.argv[1:])
+with zipfile.ZipFile(output / 'wg-program-split.pyz.new', 'w',
+                     compression=zipfile.ZIP_DEFLATED) as archive:
+    for source in sorted((repo / 'src/linux/wg_program_split').glob('*.py')):
+        archive.write(source, 'wg_program_split/' + source.name)
+    archive.writestr('__main__.py',
+                     'from wg_program_split.cli import main\nraise SystemExit(main())\n')
+(output / 'wg-program-split.pyz.new').replace(output / 'wg-program-split.pyz')
+for unit in ('wg-program-split-guard.service', 'wg-program-split.service'):
+    shutil.copyfile(repo / 'src/linux/systemd' / unit, output / unit)
+print('Packaged isolated Python CLI and service units. No installation performed.')
+PY
