@@ -35,20 +35,54 @@ def data(*args): return json.loads(run(*args).stdout)
 def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def file_identity(path):
+def _hashed(path, keep):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     try:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             raise ValueError('not a singly linked regular file')
-        h = hashlib.sha256()
-        while chunk := os.read(fd, 65536): h.update(chunk)
+        h, chunks = hashlib.sha256(), []
+        while chunk := os.read(fd, 65536):
+            h.update(chunk)
+            if keep: chunks.append(chunk)
         after = os.fstat(fd)
         if (before.st_ino, before.st_ctime_ns, before.st_size) != (after.st_ino, after.st_ctime_ns, after.st_size):
             raise ValueError('file changed during read')
         return {'device': after.st_dev, 'inode': after.st_ino, 'ctime_ns': after.st_ctime_ns,
-                'uid': after.st_uid, 'mode': stat.S_IMODE(after.st_mode), 'sha256': h.hexdigest()}
+                'uid': after.st_uid, 'mode': stat.S_IMODE(after.st_mode), 'sha256': h.hexdigest()}, b''.join(chunks)
     finally: os.close(fd)
+
+
+def file_identity(path): return _hashed(path, False)[0]
+
+
+STAGING_HINT = ('copy the accepted bytes as root into a root-owned directory with no group/other write '
+                '(for example install -d -m 0700 and install -m 0644/0755), point the manifest at the copy '
+                'and keep the manifest sha256 values; the runner never edits or re-owns the source')
+
+
+def _staged(path, expected, keep, owner_uid):
+    """Root-controlled input: only root can replace or edit the file or any ancestor."""
+    path = Path(path)
+    if not path.is_absolute() or path != path.resolve():
+        raise ValueError(f'{path}: staged input must be a resolved absolute path; {STAGING_HINT}')
+    for parent in path.parents:
+        value = parent.lstat()
+        if not stat.S_ISDIR(value.st_mode) or value.st_uid not in (0, owner_uid) or value.st_mode & 0o022:
+            raise ValueError(f'{parent}: staging directory is not root-controlled; {STAGING_HINT}')
+    identity, content = _hashed(path, keep)
+    if identity['uid'] not in (0, owner_uid) or identity['mode'] & 0o022:
+        raise ValueError(f'{path}: staged file is not root-owned without group/other write; {STAGING_HINT}')
+    if identity['sha256'] != expected: raise ValueError(f'{path}: sha256 differs from the manifest; retained')
+    return identity, content
+
+
+def staged_file(path, expected, *, owner_uid=0): return _staged(path, expected, False, owner_uid)[0]
+
+
+def staged_bytes(path, expected, *, owner_uid=0):
+    """Bytes read once through the same descriptor that proved the manifest hash."""
+    return _staged(path, expected, True, owner_uid)[1]
 
 
 def directory_identity(path):
@@ -131,10 +165,8 @@ def validate_manifest(manifest):
         if directory != directory.resolve(): raise ValueError('build directory must be resolved')
         required = {'wg-program-split.pyz', 'bpf-loader', 'classifier.bpf.o', *UNITS}
         if set(build['sha256']) != required: raise ValueError('exact build artifact set required')
-        for name, expected in build['sha256'].items():
-            if file_identity(directory / name)['sha256'] != expected: raise ValueError('artifact hash changed')
-    if file_identity(manifest['probe'])['sha256'] != manifest['probe_sha256']:
-        raise ValueError('native optimized probe hash changed')
+        for name, expected in build['sha256'].items(): staged_file(directory / name, expected)
+    staged_file(manifest['probe'], manifest['probe_sha256'])
     if not manifest['management_ips']: raise ValueError('management/LAN/Tailscale route probes required')
     for address in manifest['management_ips']: ipaddress.ip_address(address)
     for key in ('host_port', 'peer_port', 'payload_port'):

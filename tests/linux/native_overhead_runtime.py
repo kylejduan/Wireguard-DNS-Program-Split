@@ -1,6 +1,7 @@
 """Owned local topology and installed singleton lifecycle; no VM orchestration."""
 import contextlib
 import fcntl
+import hashlib
 import ipaddress
 import json
 import os
@@ -17,6 +18,8 @@ ARTIFACTS = Path('/usr/lib/wg-program-split')
 CONFIG = Path('/etc/wg-program-split')
 STATE = Path('/run/wg-program-split')
 PINS = Path('/sys/fs/bpf/wg_program_split')
+UNIT_DIR = Path('/usr/lib/systemd/system')
+SHIM = b'#!/bin/sh\nexec /usr/bin/python3 -I /usr/lib/wg-program-split/wg-program-split.pyz "$@"\n'
 
 
 def report(path, value): path.write_text(json.dumps(value, indent=2) + '\n')
@@ -34,11 +37,25 @@ def line(child, timeout=10):
     raise ValueError('oversized native readiness report')
 
 
+def _children():
+    """PIDs whose parent is this thread, or None when the kernel cannot list them."""
+    try: return set(Path('/proc/thread-self/children').read_text().split())
+    except OSError: return None
+
+
 def child(journal, argv, errors):
-    intent = journal.begin('spawn', str(argv[0]))
     with errors.open('xb') as stream:
-        process = subprocess.Popen(list(map(str, argv)), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=stream, env=own.ENV)
+        intent = journal.begin('spawn', str(argv[0]))
+        before = _children()
+        try:
+            process = subprocess.Popen(list(map(str, argv)), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=stream, env=own.ENV)
+        except OSError:
+            # Popen reaps a child whose exec failed before raising. Resolve only this
+            # intent, and only when this thread provably gained no child (zombies included).
+            after = _children()
+            if before is not None and after is not None and after <= before: journal.resolve_intent(intent)
+            raise
     receipt = journal.acquire('pid', str(process.pid), own.pid_identity(process.pid))
     process.ownership_receipt = receipt
     journal.resolve_intent(intent)
@@ -76,10 +93,36 @@ def stable(value):
     return value
 
 
+def resolver_links():
+    """Per-link resolved routing configuration; an absent resolver is recorded, not fatal."""
+    result = {}
+    for command in ('dns', 'domain', 'default-route'):
+        try:
+            value = own.run('resolvectl', command, okay=False)
+            result[command] = {'exit': value.returncode, 'stdout': value.stdout}
+        except FileNotFoundError: result[command] = {'exit': None, 'stdout': 'resolvectl unavailable'}
+    return result
+
+
+def links():
+    return [{'ifindex': row.get('ifindex'), 'ifname': row.get('ifname'), 'ifalias': row.get('ifalias'),
+             'kind': row.get('linkinfo', {}).get('info_kind'), 'link_type': row.get('link_type'),
+             'address': row.get('address'), 'mtu': row.get('mtu'), 'master': row.get('master')}
+            for row in own.data('ip', '-j', '-d', 'link', 'show')]
+
+
+def addresses():
+    # Privacy addresses rotate by design; lifetimes are counters. Everything else is compared.
+    return [{'ifname': row.get('ifname'), **{k: a.get(k) for k in ('family', 'local', 'prefixlen', 'scope')}}
+            for row in own.data('ip', '-j', 'address', 'show') for a in row.get('addr_info', []) if not a.get('temporary')]
+
+
 def snapshot(manifest):
     routes = {address: stable(own.data('ip', '-j', 'route', 'get', address)) for address in manifest['management_ips']}
     # All observations are public kernel metadata; no WireGuard key dump.
+    # Keys are only ever added, so earlier raw snapshots keep their meaning.
     return {'resolver': resolver_identity(), 'management_routes': routes,
+            'links': links(), 'addresses': addresses(), 'resolver_links': resolver_links(),
             'routes4': stable(own.data('ip', '-j', '-4', 'route', 'show', 'table', 'all')),
             'routes6': stable(own.data('ip', '-j', '-6', 'route', 'show', 'table', 'all')),
             'rules4': own.data('ip', '-j', '-4', 'rule', 'show'), 'rules6': own.data('ip', '-j', '-6', 'rule', 'show'),
@@ -120,19 +163,52 @@ def _management_meaning(snapshot):
     return result
 
 
+def _brief(row): return json.dumps(row, sort_keys=True, separators=(',', ':'))[:200]
+
+
 def verify_snapshot(first, last):
+    """Both directions: originals must survive and nothing may be left behind.
+
+    Keys absent from a legacy original snapshot are not compared.
+    """
     errors = []
     for name in ('resolver', 'rules4', 'rules6', 'protected_services', 'sysctls'):
         if first[name] != last[name]: errors.append(name + ' changed')
     if _management_meaning(first) != _management_meaning(last): errors.append('management_routes changed')
-    for name in ('routes4', 'routes6', 'bpf_links'):
-        for row in first[name]:
-            if row not in last[name]: errors.append('original ' + name + ' entry missing or changed')
-    # Ignore dynamic counters; retain all original foreign nft objects.
-    for row in first['nft']['nftables']:
-        if 'metainfo' not in row and row not in last['nft']['nftables']:
-            errors.append('original foreign nft object missing or changed')
+    tables = {name: (first[name], last[name]) for name in ('routes4', 'routes6', 'bpf_links')}
+    # Ignore dynamic counters and metainfo; foreign nft objects must survive unchanged.
+    tables['nft'] = tuple([row for row in value['nftables'] if 'metainfo' not in row] for value in (first['nft'], last['nft']))
+    for name in ('links', 'addresses'):
+        if name in first: tables[name] = (first[name], last.get(name, []))
+    for name, (before, after) in tables.items():
+        errors += ['original ' + name + ' entry missing or changed: ' + _brief(row) for row in before if row not in after]
+        errors += [name + ' entry added: ' + _brief(row) for row in after if row not in before]
+    if 'resolver_links' in first and first['resolver_links'] != last.get('resolver_links'):
+        errors.append('resolver per-link configuration changed')
     return errors
+
+
+def route_proof(topology, mark=0):
+    """Kernel route decisions for every fixture destination, before any client sends.
+
+    Direct and WireGuard-endpoint traffic must use the owned veth; tunnel traffic,
+    marked on product arms, must use wgps0; the namespace can only answer locally.
+    """
+    m, underlay = topology.m, topology.m['names']['underlay']
+    outer = own.run('wg', 'show', 'wgps0', 'fwmark').stdout.strip()
+    outer = 0 if outer in ('', 'off') else int(outer, 0)
+    checks = [('direct', (), topology.peer, 0, underlay), ('endpoint', (), topology.peer, outer, underlay),
+              ('tunnel', (), m['peer_tunnel'], mark, 'wgps0'),
+              ('peer-direct', ('-n', topology.ns), topology.host, 0, m['names']['remote']),
+              ('peer-tunnel', ('-n', topology.ns), m['host_tunnel'], 0, 'peerwg')]
+    proof = []
+    for label, prefix, address, value, expected in checks:
+        rows = own.data('ip', *prefix, '-j', 'route', 'get', address, *(('mark', str(value)) if value else ()))
+        proof.append({'check': label, 'address': address, 'mark': value, 'expected_dev': expected, 'route': rows})
+        if len(rows) != 1 or rows[0].get('dev') != expected or rows[0].get('type', 'unicast') != 'unicast':
+            raise ValueError(f'fixture {label} route to {address} leaves the owned link {expected}: {_brief(rows)}')
+    topology.j.write({'event': 'route-proof', 'checks': proof})
+    return proof
 
 
 class Topology:
@@ -143,10 +219,12 @@ class Topology:
         self.ns = manifest['names']['namespace']
         self.host, self.peer = map(str, ipaddress.ip_network(manifest['underlay']).hosts())
         self.servers = []
+        self.peer_ready = []  # Parsed ready lines in server order, including effective payload_rcvbuf.
 
     def create(self):
         m, j = self.m, self.j
         if os.path.lexists(self.private): raise ValueError('private fixture path occupied')
+        own.directory_identity(self.private.parent)  # Fail before any intent if /etc/wireguard is absent or unsafe.
         j.begin('directory', str(self.private))
         self.private.mkdir(mode=0o700)
         j.acquire('directory', str(self.private), own.directory_identity(self.private))
@@ -187,7 +265,8 @@ class Topology:
             process = child(j, ['ip', 'netns', 'exec', self.ns, self.evidence / 'bin/probe', 'peer',
                                address, 53, m['payload_port'], source], self.evidence / (label + '-peer.stderr'))
             self.servers.append(process)
-            if not line(process).get('ready'): raise ValueError('native peer not ready')
+            self.peer_ready.append(line(process))
+            if not self.peer_ready[-1].get('ready'): raise ValueError('native peer not ready')
         j.write({'event': 'topology', 'namespace_links': own.data('ip', '-n', self.ns, '-j', '-d', 'link', 'show'),
                  'namespace_routes': own.data('ip', '-n', self.ns, '-j', 'route', 'show', 'table', 'all'),
                  'host_link_addresses': own.data('ip', '-j', 'addr', 'show', 'dev', m['names']['underlay'])})
@@ -233,6 +312,7 @@ def plain(topology):
         route = own.data('ip', '-j', '-4', 'route', 'show', m['peer_tunnel'] + '/32')
         route_receipt = j.acquire('route', m['peer_tunnel'] + '/32', route, dev='wgps0', metric=77)
         time.sleep(6)
+        route_proof(topology)
         yield None
     finally:
         own.same_identity(receipt['identity'], own.link_identity('wgps0'))
@@ -290,15 +370,18 @@ class Product:
             raise RuntimeError('installer failed; uncertain installation retained without adoption')
         if (CONFIG / 'installation.json').exists():
             paths = [CLI, *(ARTIFACTS / name for name in ('wg-program-split.pyz', 'bpf-loader', 'classifier.bpf.o')),
-                     *(Path('/usr/lib/systemd/system') / unit for unit in own.UNITS)]
+                     *(UNIT_DIR / unit for unit in own.UNITS)]
+            # One read per file yields both the receipt and the hash, bound to the locked
+            # manifest document rather than to build bytes that could change meanwhile.
             expected = {str(path): own.file_identity(path) for path in paths}
             for path in paths:
-                wanted = (b'#!/bin/sh\nexec /usr/bin/python3 -I /usr/lib/wg-program-split/wg-program-split.pyz "$@"\n'
-                          if path == CLI else (Path(build['directory']) / path.name).read_bytes())
-                if path.read_bytes() != wanted: raise ValueError('unexpected installed payload; retained')
+                wanted = hashlib.sha256(SHIM).hexdigest() if path == CLI else build['sha256'][path.name]
+                if expected[str(path)]['sha256'] != wanted: raise ValueError('installed payload differs from manifest sha256; retained')
+            package = Path(build['directory']) / 'wg-program-split.pyz'
+            package_identity = own.file_identity(package)
+            if package_identity['sha256'] != build['sha256'][package.name]: raise ValueError('staged package changed; retained')
             self.receipt = self.j.acquire('product', str(CLI), {'files': expected,
-                'package': {'path': str(Path(build['directory']) / 'wg-program-split.pyz'),
-                            'identity': own.file_identity(Path(build['directory']) / 'wg-program-split.pyz')},
+                'package': {'path': str(package), 'identity': package_identity},
                 'manifest': own.file_identity(CONFIG / 'installation.json'),
                 'directories': {str(p): own.directory_identity(p) for p in (ARTIFACTS, CONFIG)},
                 'config': {str(CONFIG / name): own.file_identity(CONFIG / name) for name in ('profile.conf', 'settings.json')}})
@@ -325,6 +408,7 @@ class Product:
             own.same_identity(before, own.file_identity(path))
             report(self.directory / ('product-' + name), document)
         report(self.directory / 'startup.json', {'activated_at': activated, 'instances': self.instance, 'observations': observations})
+        report(self.directory / 'route-proof.json', route_proof(self.t, self.mark()))
         return self
 
     def mark(self): return own.data(ARTIFACTS / 'bpf-loader', 'snapshot', PINS)['mark']
