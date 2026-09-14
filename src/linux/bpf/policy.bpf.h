@@ -4,9 +4,11 @@
 #ifndef WGPS_BPF
 #include <linux/types.h>
 #endif
-#define POLICY_ABI 2
+#define POLICY_ABI 3
 #define PATH_BYTES 4096
+#define SHORT_PATH_BYTES 256
 struct policy_path { char pathname[PATH_BYTES]; };
+struct policy_short_path { char pathname[SHORT_PATH_BYTES]; };
 struct path_scratch { struct policy_path key; char resolved[PATH_BYTES]; };
 struct policy_config {
     __u32 version, ready, mask, mark;
@@ -31,6 +33,12 @@ struct {
     __type(key, struct policy_path);
     __type(value, __u32);
 } paths SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct policy_short_path);
+    __type(value, __u32);
+} paths_short SEC(".maps");
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -87,17 +95,26 @@ static __always_inline int resolve_policy(struct file *exe)
     struct path_scratch *work = bpf_map_lookup_elem(&scratch, &zero);
     if (!work) return PATH_ERROR;
     /* No cross-socket cache: every creation resolves the current path. */
-    /* clang's BPF backend does not lower a 4096-byte builtin memset. */
-#pragma clang loop unroll(full)
-    for (int i = 0; i < PATH_BYTES / 8; i++)
-        ((volatile __u64 *)&work->key)[i] = 0;
     int len = bpf_path_d_path(&exe->f_path, work->resolved, sizeof(work->resolved));
     bool linked = linked_file(exe);
     if (!linked) return UNLINKED_IMAGE;
     if (len <= 1 || len > PATH_BYTES || work->resolved[0] != '/')
         return PATH_ERROR;
     /* d_path initially writes at the end, then memmoves: its tail is NOT zero.
-     * Copy only the terminated string into the zero-padded hash key. */
+     * Resolve the full path first, then zero/copy only the selected exact key.
+     * len includes NUL: a 255-byte filesystem path fits the short tier. */
+    if (len <= SHORT_PATH_BYTES) {
+#pragma clang loop unroll(full)
+        for (int i = 0; i < SHORT_PATH_BYTES / 8; i++)
+            ((volatile __u64 *)&work->key)[i] = 0;
+        if (bpf_probe_read_kernel_str(work->key.pathname, SHORT_PATH_BYTES, work->resolved) != len)
+            return PATH_ERROR;
+        return bpf_map_lookup_elem(&paths_short, &work->key) ? INCLUDED : DIRECT;
+    }
+    /* clang's BPF backend does not lower a 4096-byte builtin memset. */
+#pragma clang loop unroll(full)
+    for (int i = 0; i < PATH_BYTES / 8; i++)
+        ((volatile __u64 *)&work->key)[i] = 0;
     if (bpf_probe_read_kernel_str(work->key.pathname, PATH_BYTES, work->resolved) != len)
         return PATH_ERROR;
     __u32 *selected = bpf_map_lookup_elem(&paths, &work->key);
