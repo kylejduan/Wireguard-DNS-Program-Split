@@ -5,6 +5,358 @@ CPU cost. This is separate from total VPN or Internet round-trip time. A VM
 measurement cannot establish a worst-case bound or the actual bot's behavior on
 TV. See [Linux operation](linux.md) for the supported traffic and host context.
 
+## Final native serial results — September 14, 2026
+
+This section reports the final **serial** experiment. It runs the original
+single-outstanding UDP request/reply timing loop, unmodified, with the final
+harness. It is not the earlier native serial run below, whose whole-host CPU
+accounting is invalid, and it is not compared with the stream experiment in the
+next section. The final profiler diagnostic follows the stream section.
+
+The same physical reference host, boot and kernel as the stream run (`TV`,
+7.0.0-31-generic, 16 online CPUs, no virtualization) compared plain WireGuard or
+the direct host path, baseline `00b3efd` and candidate `3ead242`. It used six
+balanced rounds of 16 concurrent paced workloads, 10 seconds per condition, with
+the same frozen harness (`3351c2a03d2b61dd8682bf63d7ec18e30e837dbcfe20fb5a77cc154c02fd2722`),
+probe and builds. Evidence identifier: `overhead-3a9e380183`. Summary SHA-256:
+`58a4680c85b105921c59c071a7b4b3cadc7657fecda49d2330c26cc8541d6ca2`.
+
+All **1,944,000** offered operations completed across 18 of 18 windows without
+errors. All 54 CPU accounts passed with zero steal. Separate analysis and
+reconciliation entrypoints recounted the raw records and re-executed the frozen
+statistics and CPU-accounting modules, reproducing every latency statistic and
+every CPU account. All 90 route proofs, fixture-membership checks, peer counts
+and the cleanup/invariant readback passed, and all 36 peer socket records showed
+zero receive drops.
+
+The operator's recorded outcome is again **restored-with-findings**. After
+restoration, exactly one of 313 nftables rows differed: the owned
+`inet wg_program_split` table's attempt UUID comment and kernel handle. Each
+comment matched its own `wgps0` alias, and readiness and provider acceptance
+passed. Root's independent review of the full nftables snapshots, raw outcome and
+provider acceptance closed it as the expected lifecycle identity change, and the
+original restored-with-findings status is preserved. The profiler's original
+provenance capture reported the same finding as an error. That record is kept,
+and the final profiler diagnostic used a separately reviewed descriptor.
+
+### Serial latency
+
+Candidate p99 and the paired shifts have the same meaning as in the stream
+section below.
+
+| Workload | Candidate p99 (us) | Added p99 vs plain/direct (us) [95%] | vs previous (us) [95%] |
+|---|---:|---:|---:|
+| Included UDP socket | 26.2 | +11.3 [+7.5, +15.5] | -5.5 [-9.9, -1.5] |
+| Included TCP socket | 26.8 | +11.3 [+7.2, +15.4] | -7.1 [-14.1, -0.9] |
+| Included UDP DNS | 3116.6 | -219.6 [-586.8, +123.3] | -301.9 [-538.8, -0.4] |
+| Included TCP DNS | 4402.1 | -206.8 [-487.1, +118.0] | -90.7 [-540.4, +333.6] |
+| Included persistent UDP | 3917.4 | -319.8 [-541.1, -109.7] | -210.6 [-580.2, +237.7] |
+| Included persistent TCP | 3389.3 | -165.1 [-380.1, +39.2] | -42.6 [-242.7, +147.1] |
+| Unlisted UDP socket | 24.6 | +9.4 [+5.8, +13.1] | -5.4 [-9.3, -1.2] |
+| Unlisted TCP socket | 24.8 | +9.2 [+5.3, +13.0] | -5.7 [-10.3, -0.8] |
+| Unlisted UDP DNS | 479.5 | -138.2 [-416.0, +95.8] | -140.6 [-320.4, -7.5] |
+| Unlisted TCP DNS | 706.6 | -37.1 [-384.6, +339.9] | -53.8 [-282.0, +192.8] |
+| Unlisted persistent UDP | 258.0 | -16.7 [-107.1, +59.7] | -104.1 [-206.6, -14.9] |
+| Unlisted persistent TCP | 485.6 | -51.4 [-226.3, +98.5] | -193.0 [-359.5, -47.0] |
+| Unlisted file read | 32.5 | +7.8 [+2.9, +12.8] | +1.7 [-3.0, +6.5] |
+| Unlisted mmap | 61.4 | +6.1 [-3.1, +14.7] | -2.6 [-13.1, +4.5] |
+| Unlisted fresh Unix IPC | 19.8 | +5.8 [+2.9, +8.7] | +2.4 [+0.1, +5.1] |
+| Unlisted pre-attachment Unix IPC | 26.8 | +12.8 [+9.4, +16.3] | -15.9 [-24.9, -9.0] |
+
+Against plain WireGuard or the direct path, socket creation added **9.2–11.3 us**
+and local file and IPC operations added 5.8–12.8 us, with intervals excluding
+zero. The largest estimated added p99 was **+12.8 us**, and the largest upper
+endpoint of the individual intervals was **+339.9 us** (unlisted TCP DNS). These
+estimates meet the sub-millisecond added-local-overhead target for this
+experiment. Against the previous implementation, socket creation was 5.4–7.1 us
+faster, with intervals excluding zero.
+
+The same socket workload added 4.0–6.5 us in the stream experiment. That spread
+between two separate experiments is run-to-run variation beyond either run's
+intervals. Several network comparisons have intervals wholly below zero, most
+notably included persistent UDP against plain WireGuard. With the serial backlog
+described below and only six rounds, these are observed differences, not
+speedups. Endpoints within about 0.5 us of zero, such as fresh IPC and included
+UDP DNS against the previous implementation, are weak evidence that is not
+practically resolved; no regression or zero-cost conclusion follows.
+
+### Serial scheduling and backlog
+
+The included persistent UDP client waits for each reply before sending its next
+1,200-byte request, at 1,000 requests/s through the WireGuard fixture. With a
+round trip near the 1 ms period, it falls behind in every condition.
+
+| Included persistent UDP (serial) | Plain WireGuard | Previous | Candidate |
+|---|---:|---:|---:|
+| Round trip p50 / p99 (us) | 441.1 / 4014.7 | 445.0 / 4034.8 | 435.8 / 3917.4 |
+| Send lateness p99 / p99.9 / max (ms) | 1928.6 / 2190.9 / 2216.2 | 3582.5 / 4086.2 / 4175.3 | 596.6 / 720.9 / 743.6 |
+| Scheduled completion p99 / p99.9 / max (ms) | 1929.9 / 2192.5 / 2220.6 | 3586.2 / 4087.3 / 4177.2 | 597.6 / 722.6 / 744.5 |
+| Lowest per-window effective rate (requests/s) | 818.4 | 705.4 | 930.9 |
+
+All 60,000 requests per condition completed, but late. Where each window entered
+backlog varies, and six rounds cannot separate that from routing cost, so the
+ordering between conditions is not an improvement claim. This workload provides
+no sub-millisecond deadline. The direct-path unlisted persistent UDP client did
+not backlog: its scheduled-completion p99 was 581.8 us and its maximum 5.14 ms.
+Across the other candidate workloads, send-lateness p99 was 253.7–479.7 us
+(maximum 4.69 ms). Scheduled-completion p99 ranged from 269.1 us to 4.57 ms,
+with a maximum of 8.92 ms.
+
+### Serial CPU
+
+| Resource observation (six windows each) | Plain/direct | Previous | Candidate |
+|---|---:|---:|---:|
+| Observed span, including output drain (s) | 68.744 | 69.365 | 66.316 |
+| Whole-host busy CPU-seconds (± modeled allowance) | 557.630 (±0.129) | 589.188 (±0.129) | 537.001 (±0.129) |
+| Mean busy CPUs (share of 16) | 8.11 (50.7%) | 8.49 (53.1%) | 8.10 (50.6%) |
+| Controller cgroup CPU-seconds (percent of one core) | — | 1.728 (2.492%) | 1.557 (2.347%) |
+| Fixture cgroup CPU-seconds (clients, peers, sampler) | 23.210 | 27.760 | 26.560 |
+| Client loop CPU inside the fixture (lower bound) | 17.249 | 21.339 | 20.252 |
+| Sampler CPU inside the fixture | 0.880 | 0.988 | 0.947 |
+| Other host CPU, including kernel work (± modeled allowance) | 534.420 (±0.604) | 559.699 (±0.571) | 508.885 (±0.618) |
+| Largest sampled controller memory (MiB) | — | 17.29 | 21.46 |
+
+| Paired planned-window difference (CPU-seconds per second) | Mean | Approximate 95% interval | Between-round SD |
+|---|---:|---:|---:|
+| Host busy, candidate − plain/direct | +0.048 | [-1.062, +1.064] | 1.479 |
+| Host busy, candidate − previous | -0.231 | [-1.014, +0.561] | 1.113 |
+| Fixture, candidate − plain/direct | +0.058 | [+0.040, +0.075] | 0.024 |
+| Fixture, candidate − previous | -0.017 | [-0.029, -0.006] | 0.016 |
+| Controller, candidate − previous | -0.0007 | [-0.0032, +0.0018] | 0.0032 |
+
+Plain/direct planned-window busy time averaged 8.13 CPUs but ranged from 5.74 to
+10.45 across rounds, so whole-host feature cost is not resolved. The controller
+used about 2.3–2.5% of one core, and its difference from the previous
+implementation is not resolved. Serial backlog lengthened some output drains, so
+full spans differ between conditions. The fixture differences are measured scope
+differences with attribution uncertainty, and the ± values are modeled
+allowances rather than hard bounds; both carry the limits described in the
+stream section below.
+
+## Final native stream results — September 14, 2026
+
+This section reports the final **stream** experiment. It sends UDP requests
+independently of replies, a different application pattern from the serial
+workload in the previous section; it is not a speedup of serial requests and the
+two are not compared. The final profiler diagnostic follows this section; the
+dated sections after it remain the original historical records.
+
+The physical reference host (`TV`, kernel 7.0.0-31-generic, 16 online CPUs, no
+virtualization) compared plain WireGuard or the direct host path, baseline
+`00b3efd` and candidate `3ead242` in six balanced rounds of 16 concurrent paced
+workloads, 10 seconds per condition. The harness (combined SHA-256
+`3351c2a03d2b61dd8682bf63d7ec18e30e837dbcfe20fb5a77cc154c02fd2722`), probe binary
+and both builds matched their approved staging hashes. Evidence identifier:
+`overhead-91f6debe3c`. Summary SHA-256:
+`aea70e12c9132dda91a16ba903993c9e4cac521f1be14eef519caad2c85feaa3`.
+
+All **1,944,000** offered operations completed across 18 of 18 windows without
+errors. All 54 CPU accounts (full span, planned window and drain for each window)
+passed with zero steal. Separate analysis and reconciliation entrypoints recounted
+the raw records and re-executed the frozen statistics and CPU-accounting modules,
+reproducing every latency statistic and every CPU account. This is an exact-module
+cross-check, not an independent implementation. All 90 route proofs,
+fixture-membership checks, peer counts and the cleanup/invariant readback passed.
+All 72 stream client and peer socket records showed zero receive drops with
+2 MiB effective receive buffers.
+
+The operator's recorded outcome is **restored-with-findings**, not an unqualified
+pass. After accepted production was restored, the owned `inet wg_program_split`
+nftables table carried a new attempt UUID comment and kernel handle. Root's
+separate review found every nftables expression and foreign entry identical, with
+each comment matching its `wgps0` interface alias; readiness and provider
+acceptance passed. The finding concerns post-run restoration identity and does
+not affect the measured windows.
+
+### Stream latency
+
+Candidate p99 is the aggregate measured operation latency. The shift columns are
+the mean of six paired round p99 differences with approximate 95% bootstrap
+intervals, which apply individually. They are not per-request, absolute or
+worst-case bounds.
+
+| Workload | Candidate p99 (us) | Added p99 vs plain/direct (us) [95%] | vs previous (us) [95%] |
+|---|---:|---:|---:|
+| Included UDP socket | 23.1 | +6.5 [+4.2, +8.6] | -8.2 [-10.5, -5.8] |
+| Included TCP socket | 23.4 | +6.2 [+3.9, +8.7] | -8.2 [-9.7, -6.8] |
+| Included UDP DNS | 3052.2 | +51.1 [-388.0, +464.5] | +111.9 [-227.8, +456.9] |
+| Included TCP DNS | 4481.6 | -183.9 [-735.5, +383.4] | +237.4 [-237.2, +711.9] |
+| Included UDP stream | 3537.1 | +37.1 [-258.2, +288.7] | +77.1 [-38.6, +195.9] |
+| Included persistent TCP | 3558.1 | +166.4 [-188.1, +521.4] | +171.6 [-120.9, +481.1] |
+| Unlisted UDP socket | 21.3 | +4.8 [+1.8, +7.1] | -6.5 [-8.7, -4.2] |
+| Unlisted TCP socket | 21.7 | +4.0 [+2.0, +5.9] | -7.4 [-9.6, -4.9] |
+| Unlisted UDP DNS | 544.5 | +21.5 [-234.6, +212.1] | +106.2 [-4.7, +203.7] |
+| Unlisted TCP DNS | 648.4 | -95.5 [-338.0, +154.4] | +31.8 [-86.8, +158.6] |
+| Unlisted UDP stream | 292.8 | +35.9 [-118.0, +179.9] | +46.6 [-61.8, +154.9] |
+| Unlisted persistent TCP | 497.2 | +16.6 [-242.9, +197.7] | +76.9 [-15.3, +165.9] |
+| Unlisted file read | 29.9 | +2.5 [-1.6, +6.0] | +1.9 [+0.0, +4.1] |
+| Unlisted mmap | 62.2 | +2.0 [-10.8, +14.2] | +4.7 [-1.4, +11.7] |
+| Unlisted fresh Unix IPC | 15.8 | +0.3 [-2.0, +2.4] | +0.3 [-1.5, +2.2] |
+| Unlisted pre-attachment Unix IPC | 23.5 | +7.9 [+4.8, +10.6] | -15.6 [-17.8, -13.4] |
+
+Socket creation added **4.0–6.5 us** at p99 versus plain WireGuard or the direct
+path and was **6.5–8.2 us** faster than the previous implementation; all eight
+of those intervals exclude zero. Against plain WireGuard or the direct path, the
+largest estimated added p99 was **+166.4 us** (included persistent TCP), and the
+largest upper endpoint of the individual intervals was **+521.4 us** for the same
+workload. These estimates meet the sub-millisecond added-local-overhead target
+for this experiment.
+
+Against the previous implementation, which is a different reference, network
+echo and DNS estimates ranged from +31.8 to +237.4 us. The largest is included TCP
+DNS, with an upper endpoint of +711.9 us, and every such interval includes zero,
+so six rounds do not resolve them. The file-read comparison with the previous
+implementation has a computed lower endpoint of +1.166 ns, shown as +0.0 us. From
+six rounds that is weak evidence, not practically resolved at that precision,
+and no regression, zero-cost or no-regression conclusion follows.
+
+### Stream scheduling
+
+Each stream client offered 1,000 requests/s of 1,200 bytes; all 60,000 per
+condition were delivered, at pooled rates of 999.8–1000.1 requests/s. The
+in-flight high-water mark was 8 included and 4 unlisted for the candidate, and at
+most 20 in any condition, of the bounded 256 window.
+
+| Candidate stream (us) | Included | Unlisted |
+|---|---:|---:|
+| Round trip p50 / p99 | 538.0 / 3537.1 | 47.6 / 292.8 |
+| Send lateness p99 / max | 351.6 / 3559.6 | 392.0 / 3412.1 |
+| Scheduled completion p99 / p99.9 / max | 3611.7 / 4688.5 / 7652.3 | 644.2 / 1760.8 / 3761.0 |
+| Added round-trip p99 vs plain/direct [95%] | +37.1 [-258.2, +288.7] | +35.9 [-118.0, +179.9] |
+
+Round trip is reply time minus actual send; send lateness is actual minus
+scheduled send; scheduled completion is reply time minus scheduled send, which is
+what an application deadline sees. The included round-trip p99 through the local
+WireGuard fixture was about 3.4–3.5 ms in every condition, so a sub-millisecond
+**added** estimate does not make that total deadline sub-millisecond. Plain
+WireGuard's included scheduled-completion maximum was 19.8 ms. Across all 16
+candidate workloads, send-lateness p99 was 255.6–515.4 us (maximum 9.55 ms) and
+scheduled-completion p99 ranged from 269.1 us to 4.64 ms.
+
+### Stream CPU
+
+Whole-host CPU accounting was valid in this run. Busy time is elapsed CPU capacity
+minus timed idle and iowait, with verified high-resolution NO_HZ on all 16 CPUs,
+verified kernel HZ 1000, zero steal and consistent repeated `/proc/stat` reads.
+The earlier September 14 serial record's whole-host CPU remains invalid; this run
+does not change that record.
+
+| Resource observation (six windows each) | Plain/direct | Previous | Candidate |
+|---|---:|---:|---:|
+| Observed span, including output drain (s) | 66.100 | 66.109 | 66.096 |
+| Whole-host busy CPU-seconds (± modeled allowance) | 516.621 (±0.129) | 496.566 (±0.130) | 534.238 (±0.130) |
+| Mean busy CPUs (share of 16) | 7.82 (48.8%) | 7.51 (46.9%) | 8.08 (50.5%) |
+| Controller cgroup CPU-seconds (percent of one core) | — | 1.457 (2.204%) | 1.647 (2.492%) |
+| Fixture cgroup CPU-seconds (clients, peers, sampler) | 23.710 | 27.021 | 25.763 |
+| Client loop CPU inside the fixture (lower bound) | 17.877 | 21.081 | 19.674 |
+| Sampler CPU inside the fixture | 0.845 | 0.900 | 0.927 |
+| Other host CPU, including kernel work (± modeled allowance) | 492.911 (±0.551) | 468.088 (±0.622) | 506.828 (±0.592) |
+| Largest sampled controller memory (MiB) | — | 22.22 | 22.82 |
+
+The ± values are modeled accounting and source-read allowances. They come from
+read brackets, USER_HZ rounding and cgroup publication lag under the kernel's
+accounting assumptions, and are not hard bounds on true CPU. Consecutive
+`/proc/stat` reads detect large inconsistent idle/iowait splits, but smaller or
+consistently biased interleavings, and changes between membership samples, can
+remain undetected. Passing the account gates does not remove these limits; see
+[native validation](linux-native-validation.md#run-and-evidence).
+
+| Paired planned-window difference (CPU-seconds per second) | Mean | Approximate 95% interval | Between-round SD |
+|---|---:|---:|---:|
+| Host busy, candidate − plain/direct | +0.335 | [-0.847, +1.488] | 1.632 |
+| Host busy, candidate − previous | +0.686 | [-0.140, +1.584] | 1.193 |
+| Fixture, candidate − plain/direct | +0.034 | [+0.013, +0.057] | 0.031 |
+| Fixture, candidate − previous | -0.021 | [-0.037, -0.003] | 0.024 |
+| Controller, candidate − previous | +0.0032 | [+0.0020, +0.0046] | 0.0017 |
+
+Unrelated services kept the host busy. Without project hooks, planned-window busy
+time averaged 7.87 CPUs, ranging from 7.08 to 8.72 across rounds. Paired host
+differences varied by 1.1–1.6 CPUs between rounds, so this experiment does not
+resolve whole-host feature cost; those intervals include zero. The modeled
+allowances are small beside that spread.
+
+The narrower scope differences have intervals that exclude zero. The controller
+cgroup used 0.0032 CPU (0.32% of one core) more than the previous implementation,
+about 2.5% of one core in total, including its five-second health checks. The
+fixture cgroup covers the clients, peers, sampler and kernel work performed in
+their context. It used 0.034 CPU more than plain WireGuard or the direct path,
+and 0.021 CPU less than the previous implementation.
+
+These are measured scope differences with attribution uncertainty, not guaranteed
+upper or lower bounds on true feature cost. The kernel does not enable IRQ time
+accounting, so unrelated interrupt work is charged to whichever task it
+interrupts, and observer differences and scheduling variability also contribute.
+Client loop CPU is part of the fixture and is not added again. Sampler CPU
+differed by about 0.001 CPU between conditions.
+
+The local peer runs on the same host, so these results exclude Internet, WAN
+and total-VPN latency. They give no absolute, worst-case, hardware or kernel
+guarantee. Six paired rounds give weak tail precision, and sampled memory maxima
+are not continuous peaks.
+
+## Final native profiler diagnostic — September 14, 2026
+
+This diagnostic is separate from the primary timing and CPU results above. It
+attached one 5-second `bpftool prog profile` window, counting hardware cycles and
+instructions, to `guard_connect` (program 5181) on the running production
+controller. `guard_connect` is the product's Unix-stream resolver IPC LSM hook,
+not the IPv4 socket classifier. No selected test workload ran and the include
+list was empty, so any counts would have mixed the profiler's own
+instrumentation with ordinary live activity.
+
+The hook made no calls in the window. Both counters read `run_cnt 0`, `value 0`,
+`enabled 0` and `running 0`, and the profiler's quality verdict is
+**inconclusive**. That is an absence of samples, not a zero cost. No hook
+latency, total packet-path CPU or broader kernel CPU conclusion follows from this
+diagnostic.
+
+The non-attaching pre-check passed. After the window, every profiler program,
+link, map and BTF object was gone, including in an independent readback 3 seconds
+later. Product BPF objects, the controller (same PID, ready, protection
+verified, empty include list), protected services, and the
+`kernel.bpf_stats_enabled` and `kernel.sched_schedstats` settings (both 0) were
+unchanged. The raw readings are `profile-guard_connect-final/profile.stdout`,
+SHA-256 `d0d8aa9d55f8612e03aacc622d9218e68fd83932e3595dab827fc5995c710082`; the
+result record is SHA-256
+`a4cb3f5fbb4da77edeac71055a1f1fa40fcf8a3dd99d5f586f36598cd91b9f8c`.
+
+### Targeted follow-up diagnostic
+
+The idle window above remains inconclusive. A separate 5-second profile ran with
+its own synthetic workload: one short-lived local process made fresh, ordinary
+unlisted `AF_UNIX`/`SOCK_STREAM` connections at 500/s to a Unix socket that it
+created and owned, which exercises `guard_connect`'s ordinary fast path. It used
+the same program 5181, link 486 and reviewed descriptor
+(`480619d7ccc97b5b471c24e3120d906d4ba668effe0fc975caeb74593fff0f8e`).
+
+| Targeted window | Result |
+|---|---|
+| Hook calls recorded (both metrics) | 2,500 |
+| Cycles / instructions | 37,309,272 / 22,652,359 |
+| Counter multiplexing | None (enabled equals running for both) |
+| Profiler quality | Complete, no reasons |
+| Connections offered / connected / accepted | 2,814 / 2,814 / 2,814, 0 errors |
+| Workload client span; process CPU | 5.628 s; 0.31 s |
+
+The profiler's BPF objects and the workload's process, socket and directory were
+removed, and the operator's independent readback 3 seconds later found none
+present. Product objects, the controller (same PID, no restarts), protected
+services, global settings and the TCP and Unix listener sets were unchanged. The
+raw readings are `profile-guard_connect-targeted/profile.stdout`, SHA-256
+`d4bed68dc10fc8ebc9a5e80d11ab329958f1dd4cfa1c4043c1b5c486fea4f779`; the result
+record is SHA-256
+`278c4459b035b249d90f6c5ff7b61e51467d69b8cfb579e82e3c42fff402ffeb`.
+
+This workload is outside every primary measurement and does not replace or
+improve any earlier timing. It confirms that the profiler works, and it
+characterizes only this ordinary Unix-connect guard fast path under
+instrumentation. The counts include the profiler's own instrumentation. They are
+not standalone hook latency, IPv4 socket-classifier cost, selected-resolver
+denial cost, whole-kernel or nftables packet CPU, or evidence of zero overhead,
+and they are not converted to time. The workload helper's 8-second limit bounded
+that one run; it is not a real-time guarantee. The actual client span was 5.63 s
+under ordinary operating-system scheduling.
+
 ## Native reference-host results — September 14, 2026
 
 The physical reference host (Ubuntu 26.04, kernel 7.0.0-31-generic, i9-11900,

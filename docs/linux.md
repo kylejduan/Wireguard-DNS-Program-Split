@@ -58,11 +58,28 @@ The target is added local p99 overhead below 1 ms where practical, with minimal
 CPU cost. See the [performance comparison](linux-performance.md) for the controlled
 three-condition experiment, uncertainty and reproduction command. It measures
 the running controller alongside concurrent included and unlisted workloads.
-Native added socket-creation p99 was approximately 7 us; the largest estimated
-added p99 across measured workloads was 96 us. The report also retains scheduling
-backlog and invalid whole-host CPU accounting. There is no zero-overhead,
-worst-case delay or Internet RTT guarantee. Measure each release-build bot before
-relying on its particular deadline requirements.
+The final native measurements on the reference host (September 14, 2026) ran
+the serial and stream UDP workloads as separate experiments against plain
+WireGuard or the direct path. Added socket-creation p99 was 4–11 us across the
+two runs. The largest estimated added p99 was 13 us (serial) and 166 us (stream),
+with individual 95% upper endpoints up to 521 us. Whole-host CPU accounting was
+valid in both runs; the candidate's controller used about 2.3–2.5% of one core, and
+whole-host feature cost was not resolved above unrelated host load. The serial
+1,000/s included UDP loop still falls behind, sending up to 0.74 s late, so it
+gives no deadline guarantee. Earlier September runs, including a native serial
+run whose whole-host CPU accounting was invalid, are kept as historical evidence.
+
+These measurements cover new IPv4 sockets on the native host, from executables
+whose paths use the common compact exact-key tier. Existing sockets are not
+reclassified; they keep the mark and route they were created with. An
+application's cached DNS answers are not looked up again when enrollment changes,
+but a new socket connecting to a cached address is still classified normally and
+routed by its own mark. Application-owned encrypted DNS uses that application's
+provider. Operating-system
+scheduling, WAN latency and each bot's own deadlines are outside these local
+measurements, and CPU attribution on a busy host is approximate. There is no
+zero-overhead, worst-case delay or Internet RTT guarantee. Measure each
+release-build bot before relying on its particular deadline requirements.
 
 ## Supported host and applications
 
