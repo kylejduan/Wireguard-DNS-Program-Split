@@ -129,6 +129,17 @@ including pre-attachment IPC. Product arms retain normal health checks and need
 fresh daemon readiness. Failures and partial output remain; there is no selective
 retry. A failed experiment requires a new manifest/run for another comparison.
 
+`--udp-mode serial` preserves the original single-outstanding UDP request/reply
+workload. `--udp-mode stream` sends independently of replies on the same persistent
+socket, at the same 1000 requests/s and 1200-byte payload. Only those two case
+names change to `included_udp_stream` and `unlisted_udp_stream`; all other cases
+and offered rates stay identical. Run the modes as separate experiments and keep
+their results distinct. A bounded 256-request window accepts reordered replies;
+loss, duplicates, corruption, send failure or window exhaustion fails the run.
+Every offered sample remains, including failures, with actual scheduling lateness
+and `inflight_max` in the client report. This models an application able to have
+multiple requests pending; it does not speed up a sequential application.
+
 `metadata.json`, `before.json`/`after.json`, `ownership.jsonl`, per-arm raw JSON,
 startup/resource records and `summary.json` retain identity, timing and accounting
 evidence. `failure.json` and `cleanup.json` distinguish execution from cleanup.

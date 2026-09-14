@@ -198,6 +198,69 @@ static int peer(const char *host, unsigned dns_port, unsigned payload_port, cons
 }
 
 struct sample { uint64_t latency, lateness; unsigned error, bytes; };
+/* Independent paced sends on one persistent socket. Replies may arrive out of
+ * order. The window is bounded; overload/loss/corruption fails the experiment,
+ * never removes a sample or silently lowers the offered rate. */
+static int datagrams(int fd, struct sample *samples, unsigned count, unsigned nonce,
+                     uint64_t start, uint64_t period, unsigned *peak) {
+    const unsigned size = 1200, limit = 256;
+    unsigned sent = 0, received = 0;
+    int error = 0;
+    uint64_t deadline = start + period * count + 1000000000ULL;
+    unsigned char data[1217];
+    while (received < count && !stopping) {
+        uint64_t now = stamp(CLOCK_MONOTONIC);
+        if (now >= deadline) { error = ETIMEDOUT; break; }
+        /* Bounded batches keep receives from starving scheduled sends. */
+        for (unsigned batch = 0; batch < 64; batch++) {
+            ssize_t n = recv(fd, data, sizeof(data), MSG_DONTWAIT);
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            if (n < 0 && errno == EINTR) continue;
+            uint64_t arrived = stamp(CLOCK_MONOTONIC);
+            if (n != (ssize_t)size + 16 || memcmp(data, "WGPS", 4) ||
+                u32(data + 8) != size || u32(data + 12) != nonce) { error = EPROTO; break; }
+            unsigned sequence = u32(data + 4);
+            if (sequence >= sent || samples[sequence].bytes) { error = EPROTO; break; }
+            for (unsigned j = 0; j < size; j++)
+                if (data[j + 16] != (unsigned char)(j ^ sequence ^ nonce)) { error = EPROTO; break; }
+            if (error) break;
+            samples[sequence].latency = arrived - samples[sequence].latency;
+            samples[sequence].bytes = size; received++;
+        }
+        if (error || received == count) break;
+        now = stamp(CLOCK_MONOTONIC);
+        if (sent < count && now >= start + period * sent) {
+            if (sent - received >= limit) { error = ENOBUFS; break; }
+            struct sample *sample = &samples[sent];
+            sample->latency = now; sample->lateness = now - (start + period * sent);
+            memcpy(data, "WGPS", 4); put32(data + 4, sent); put32(data + 8, size); put32(data + 12, nonce);
+            for (unsigned j = 0; j < size; j++) data[j + 16] = (unsigned char)(j ^ sent ^ nonce);
+            ssize_t n = send(fd, data, size + 16, MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (n != (ssize_t)size + 16) { error = n < 0 ? errno : EIO; break; }
+            sent++;
+            if (sent - received > *peak) *peak = sent - received;
+            continue;
+        }
+        uint64_t until = sent < count ? start + period * sent : deadline;
+        now = stamp(CLOCK_MONOTONIC);
+        if (now >= until) continue;
+        uint64_t remaining = until - now;
+        struct timespec timeout = {.tv_sec = (time_t)(remaining / 1000000000ULL),
+                                   .tv_nsec = (long)(remaining % 1000000000ULL)};
+        struct pollfd pending = {.fd = fd, .events = POLLIN};
+        if (ppoll(&pending, 1, &timeout, NULL) < 0 && errno != EINTR) { error = errno; break; }
+    }
+    if (!error && received != count) error = EINTR;
+    if (error) {
+        for (unsigned i = 0; i < count; i++) if (!samples[i].bytes) {
+            samples[i].error = (unsigned)error; samples[i].latency = 0;
+        }
+        /* A duplicate/corrupt packet can arrive after all valid replies in a
+         * receive batch. Preserve that failure even if no reply is missing. */
+        samples[count - 1].error = (unsigned)error;
+    }
+    return error;
+}
 static int query(const char *host, unsigned port, unsigned mark, unsigned sequence, int tcp) {
     int fd = connection(tcp, host, port, mark);
     if (fd < 0) return errno;
@@ -226,7 +289,8 @@ static int client(int argc, char **argv) {
     if (!milliseconds || !rate || !count || count > 100000) return 2;
     int socket_case = !strcmp(mode, "socket_udp") || !strcmp(mode, "socket_tcp");
     int dns_case = !strcmp(mode, "dns_udp") || !strcmp(mode, "dns_tcp");
-    int payload_case = !strcmp(mode, "tcp") || !strcmp(mode, "udp");
+    int stream_case = !strcmp(mode, "udp_stream");
+    int payload_case = !strcmp(mode, "tcp") || !strcmp(mode, "udp") || stream_case;
     int ipc_case = !strcmp(mode, "ipc_fresh") || !strcmp(mode, "ipc_old");
     int mmap_case = !strcmp(mode, "mmap"), file_case = !strcmp(mode, "file");
     if (!socket_case && !dns_case && !payload_case && !ipc_case && !mmap_case && !file_case) return 2;
@@ -245,8 +309,12 @@ static int client(int argc, char **argv) {
     struct timespec initial = {.tv_sec = (time_t)(start / 1000000000ULL), .tv_nsec = (long)(start % 1000000000ULL)};
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &initial, NULL) == EINTR) {}
     getrusage(RUSAGE_SELF, &usage0); uint64_t cpu = stamp(CLOCK_PROCESS_CPUTIME_ID), began = stamp(CLOCK_MONOTONIC);
-    unsigned completed = 0, failed = 0;
-    for (unsigned i = 0; i < count && !stopping; i++) {
+    unsigned completed = 0, failed = 0, inflight_max = 0;
+    if (stream_case) {
+        failed = datagrams(fd, samples, count, nonce, start, period, &inflight_max) != 0;
+        completed = count;
+    }
+    for (unsigned i = 0; !stream_case && i < count && !stopping; i++) {
         uint64_t due = start + period * i;
         struct timespec wait = {.tv_sec = (time_t)(due / 1000000000ULL), .tv_nsec = (long)(due % 1000000000ULL)};
         while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wait, NULL) == EINTR) {}
@@ -294,9 +362,9 @@ static int client(int argc, char **argv) {
     if (fd >= 0) close(fd);
     if (pair[0] >= 0) { close(pair[0]); close(pair[1]); }
     printf("{\"case\":\"%s\",\"planned\":%u,\"start_ns\":%llu,\"period_ns\":%llu,\"elapsed_ns\":%llu,"
-           "\"cpu_ns\":%llu,\"context_switches\":%ld,\"samples\":[", mode, count, start,
+           "\"cpu_ns\":%llu,\"context_switches\":%ld,\"inflight_max\":%u,\"samples\":[", mode, count, start,
            (unsigned long long)period, (unsigned long long)elapsed, (unsigned long long)cpu,
-           (usage1.ru_nvcsw + usage1.ru_nivcsw) - (usage0.ru_nvcsw + usage0.ru_nivcsw));
+           (usage1.ru_nvcsw + usage1.ru_nivcsw) - (usage0.ru_nvcsw + usage0.ru_nivcsw), inflight_max);
     for (unsigned i = 0; i < completed; i++) printf("%s[%llu,%llu,%u,%u]", i ? "," : "",
         (unsigned long long)samples[i].latency, (unsigned long long)samples[i].lateness, samples[i].error, samples[i].bytes);
     puts("]}"); free(samples); return (int)(failed || completed != count);
