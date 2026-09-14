@@ -5,6 +5,94 @@ CPU cost. This is separate from total VPN or Internet round-trip time. A VM
 measurement cannot establish a worst-case bound or the actual bot's behavior on
 TV. See [Linux operation](linux.md) for the supported traffic and host context.
 
+## Native reference-host results — September 14, 2026
+
+The physical reference host (Ubuntu 26.04, kernel 7.0.0-31-generic, i9-11900,
+16 logical CPUs) passed **1,944,000 operations** over six balanced rounds and
+18 primary windows with its existing services running. Baseline `00b3efd` was
+compared with `3ead242`, whose compact exact-path tier preserves 4095-byte paths,
+1024 combined entries and the same preemption protection. All 15 production
+source hashes and both builds' artifact hashes were verified before execution.
+
+The largest estimated added p99 shift was **95.6 us**; the largest upper endpoint
+of the individual approximate 95% intervals was **460.2 us**. These observations
+meet the sub-millisecond added-local-overhead target for this experiment. They
+are paired round-quantile estimates, not per-request or worst-case bounds.
+
+Included UDP/TCP socket creation added approximately **7.2/7.1 us** at p99,
+respectively, versus plain WireGuard. Both improved by approximately **7.8 us**
+versus the previous implementation, with individual intervals excluding zero.
+Unlisted UDP/TCP socket creation improved by **6.1/6.5 us**. Full-path resolution
+remains synchronous; common paths now clear/hash a 256-byte exact key instead
+of a 4096-byte key. There is no cross-socket identity cache.
+
+| Workload | Candidate p99 (us) | Paired added p99 (us) | Approximate 95% interval (us) |
+|---|---:|---:|---:|
+| Included UDP socket | 22.4 | +7.2 | [+1.5, +11.7] |
+| Included TCP socket | 22.7 | +7.1 | [+2.6, +10.8] |
+| Included UDP DNS | 3087.7 | +95.6 | [-215.5, +460.2] |
+| Included TCP DNS | 4229.7 | -176.1 | [-703.8, +349.6] |
+| Included persistent UDP | 3911.5 | +65.8 | [-290.1, +382.8] |
+| Included persistent TCP | 3411.6 | -8.3 | [-167.0, +208.2] |
+| Unlisted UDP socket | 20.5 | +5.6 | [-0.0, +9.8] |
+| Unlisted TCP socket | 21.4 | +6.2 | [+1.6, +9.8] |
+| Unlisted UDP DNS | 499.4 | +30.8 | [-80.7, +148.0] |
+| Unlisted TCP DNS | 620.0 | -34.6 | [-188.4, +144.0] |
+| Unlisted persistent UDP | 284.5 | -70.9 | [-205.0, +55.8] |
+| Unlisted persistent TCP | 405.9 | -47.6 | [-179.5, +108.2] |
+| Unlisted file read | 28.3 | +3.7 | [-2.8, +9.5] |
+| Unlisted mmap | 56.5 | +4.8 | [-6.2, +16.3] |
+| Unlisted fresh Unix IPC | 17.2 | +2.3 | [-2.0, +5.9] |
+| Unlisted pre-attachment Unix IPC | 23.4 | +8.7 | [+3.0, +13.6] |
+
+**Scheduling and total latency:** the sequential included-UDP workload at 1000/s
+accumulated backlog. Its candidate p99 completion measured from scheduled start
+was **211.6 ms**, versus **647.3 ms** with plain WireGuard and **195.8 ms** with
+the previous implementation. All offered operations completed without errors,
+but this workload does not establish a sub-millisecond deadline guarantee.
+The other candidate workloads' scheduled-completion p99 ranged from 245.6 us to
+4.36 ms. Total DNS and WireGuard echo p99 can exceed 1 ms even when the estimated
+added selection overhead is much smaller. No failed samples or outliers were
+removed. Actual bot deadline acceptance awaits that application's implementation.
+
+| Resource observation | Previous implementation | Compact exact-path tier |
+|---|---:|---:|
+| Controller CPU, percent of one core | 2.356% | 2.322% |
+| Controller CPU seconds over observed spans | 1.548 | 1.516 |
+| Observed spans, including output drain (seconds) | 65.709 | 65.281 |
+| Largest sampled controller memory (MiB) | 22.27 | 21.54 |
+| All measured client processes, CPU seconds | 22.572 | 19.643 |
+
+Client-process CPU fell **13.0%** in this run; these totals include fixture work
+and kernel work charged to those clients. Plain-WireGuard/direct clients used
+18.449 CPU-seconds. The controller comparison does not establish a material
+change: its five-second checks and ownership observations remain intact.
+
+Whole-host CPU accounting failed its declared tick-growth consistency checks
+on all 18 windows and is explicitly **invalid** for total-CPU conclusions.
+Controller cgroup identity/accounting and client CPU observations remain separate;
+they do not quantify all kernel workers or unrelated host activity. The host
+profiler also returned an unsupported-build JSON error despite exit status zero;
+that diagnostic is recorded as unavailable. No global profiling sysctl changed.
+Further native inventory or packet-rule rewrites were not justified by these
+observations; the measured exact-key optimization is retained.
+
+The native runner removed every owned test process, namespace, link, route,
+installation and private fixture input, with empty ownership/intents and unchanged
+host invariants. Separate native link-loss/recovery and controller-restart checks
+passed. The complete privileged VM suite and stable-kernel positive/negative
+boot proofs passed. An earlier rehearsal's optional cached `table=local` annotation
+was resolved using the unchanged host-scope local FIB evidence; the original
+failure and corrected interpretation are both retained. Earlier VM upgrade and
+IPv6 router-advertisement interference records are retained separately.
+
+Native evidence identifier: `overhead-73fa80c5fc`. Summary SHA-256:
+`db0ec614bac5b694d362152cd9289bd72a8456fd172c56660b61c9ef7f7a63b9`.
+See [native validation](linux-native-validation.md) for the exact manifest,
+workloads, admission, accounting and recovery procedure. These native observations
+supersede VM-only performance assumptions for the reference host; the September 13
+experiment below remains a separate historical comparison.
+
 ## Measured results — September 13, 2026
 
 The complete corrected comparison passed all **1,944,000 operations** across
