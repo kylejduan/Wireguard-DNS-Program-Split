@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/sock_diag.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
@@ -21,6 +22,10 @@
  * records stay in memory until the measured work has ended. */
 #define CAPACITY 16400
 #define CONNECTIONS 64
+/* Stream window, and the socket queue that holds all of it: 4608 B per
+ * datagram is twice the observed ~2.3 KiB truesize. */
+#define WINDOW 256
+#define ROOM (WINDOW * 4608)
 static volatile sig_atomic_t stopping;
 static uint64_t stamp(clockid_t clock) {
     struct timespec t;
@@ -80,6 +85,28 @@ static int connection(int tcp, const char *host, unsigned port, unsigned mark) {
     }
     return fd;
 }
+/* Sizes a receive queue for a whole window so a stall becomes recorded latency,
+ * not loss. Per socket only; FORCE (CAP_NET_ADMIN) is tried only when rmem_max
+ * caps SO_RCVBUF below ROOM. Returns the effective size, or -1. */
+static int receive_room(int fd) {
+    int size = 1 << 20, effective = -1; socklen_t length = sizeof(effective);
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) ||
+        getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &effective, &length)) return -1;
+    if (effective < ROOM && !setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &size, sizeof(size)) &&
+        getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &effective, &length)) return -1;
+    return effective;
+}
+/* Datagrams this socket discarded (for example a full receive queue), or -1. */
+static long long discarded(int fd) {
+    uint32_t memory[SK_MEMINFO_VARS]; socklen_t length = sizeof(memory);
+    if (getsockopt(fd, SOL_SOCKET, SO_MEMINFO, memory, &length) || length <= SK_MEMINFO_DROPS * sizeof(*memory)) return -1;
+    return memory[SK_MEMINFO_DROPS];
+}
+/* JSON integer, or null when unavailable; text holds 24 bytes. */
+static char *optional(char *text, long long value) {
+    if (value < 0) strcpy(text, "null"); else snprintf(text, 24, "%lld", value);
+    return text;
+}
 static int dns_response(unsigned char *data, size_t length) {
     size_t end = 12;
     if (length < 17 || u16(data + 4) != 1) return -1;
@@ -114,6 +141,9 @@ static int peer(const char *host, unsigned dns_port, unsigned payload_port, cons
     sockets[1] = bind_socket(host, dns_port, 0, &ignored);
     sockets[2] = bind_socket(host, payload_port, 1, &payload_port);
     sockets[3] = bind_socket(host, payload_port, 0, &ignored);
+    int room = receive_room(sockets[3]);
+    if (room < ROOM) { fprintf(stderr, "payload receive buffer %d below %d\n", room, ROOM); return 2; }
+    char drops[24];
     struct in_addr expected;
     if (inet_pton(AF_INET, source, &expected) != 1) return 2;
     struct peer_client *clients = calloc(CONNECTIONS, sizeof(*clients));
@@ -121,7 +151,8 @@ static int peer(const char *host, unsigned dns_port, unsigned payload_port, cons
     for (int i = 0; i < CONNECTIONS; i++) clients[i].fd = -1;
     signal(SIGTERM, stopped); signal(SIGINT, stopped); signal(SIGPIPE, SIG_IGN);
     unsigned long long dns = 0, payload = 0;
-    printf("{\"ready\":true,\"dns_port\":%u,\"payload_port\":%u}\n", dns_port, payload_port); fflush(stdout);
+    printf("{\"ready\":true,\"dns_port\":%u,\"payload_port\":%u,\"payload_rcvbuf\":%d}\n", dns_port, payload_port, room);
+    fflush(stdout);
     int error = 0;
     while (!stopping && !error) {
         struct pollfd pollers[CONNECTIONS + 5];
@@ -133,7 +164,11 @@ static int peer(const char *host, unsigned dns_port, unsigned payload_port, cons
         if (pollers[4].revents & (POLLIN | POLLHUP)) {
             char command[32]; ssize_t n = read(STDIN_FILENO, command, sizeof(command));
             if (n <= 0 || (n >= 4 && !memcmp(command, "quit", 4))) stopping = 1;
-            else { printf("{\"dns\":%llu,\"payload\":%llu}\n", dns, payload); fflush(stdout); }
+            else {
+                printf("{\"dns\":%llu,\"payload\":%llu,\"payload_drops\":%s}\n", dns, payload,
+                       optional(drops, discarded(sockets[3])));
+                fflush(stdout);
+            }
         }
         for (int i = 0; i < 4; i++) if (pollers[i].revents & POLLIN) {
             struct sockaddr_in address; socklen_t size = sizeof(address);
@@ -198,67 +233,99 @@ static int peer(const char *host, unsigned dns_port, unsigned payload_port, cons
 }
 
 struct sample { uint64_t latency, lateness; unsigned error, bytes; };
-/* Independent paced sends on one persistent socket. Replies may arrive out of
- * order. The window is bounded; overload/loss/corruption fails the experiment,
- * never removes a sample or silently lowers the offered rate. */
-static int datagrams(int fd, struct sample *samples, unsigned count, unsigned nonce,
-                     uint64_t start, uint64_t period, unsigned *peak) {
-    const unsigned size = 1200, limit = 256;
-    unsigned sent = 0, received = 0;
-    int error = 0;
-    uint64_t deadline = start + period * count + 1000000000ULL;
+/* Reads already queued replies, at most 64 so due sends are not starved. Returns
+ * 0 or the failure; *culprit is set when a protocol failure names its sequence. */
+static int replies(int fd, struct sample *samples, unsigned sent, unsigned nonce,
+                   unsigned *received, unsigned *culprit) {
+    const unsigned size = 1200;
     unsigned char data[1217];
+    for (unsigned batch = 0; batch < 64; batch++) {
+        ssize_t n = recv(fd, data, sizeof(data), MSG_DONTWAIT);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : errno;
+        uint64_t arrived = stamp(CLOCK_MONOTONIC);
+        if (n != (ssize_t)size + 16 || memcmp(data, "WGPS", 4) ||
+            u32(data + 8) != size || u32(data + 12) != nonce) return EPROTO;
+        unsigned sequence = u32(data + 4);
+        if (sequence >= sent) return EPROTO;
+        struct sample *sample = &samples[sequence];
+        int intact = !sample->bytes;
+        for (unsigned j = 0; intact && j < size; j++) intact = data[j + 16] == (unsigned char)(j ^ sequence ^ nonce);
+        if (!intact) { *culprit = sequence; return EPROTO; }
+        sample->latency = arrived - sample->latency;
+        sample->bytes = size; ++*received;
+    }
+    return 0;
+}
+/* Independent paced sends on one persistent socket. Replies may arrive out of
+ * order. The window is bounded and all waits sleep in ppoll. Overload, loss or
+ * corruption fails the experiment, never removes a sample or silently lowers
+ * the offered rate. *culprit names the failing sample when it is known. */
+static int datagrams(int fd, struct sample *samples, unsigned count, unsigned nonce,
+                     uint64_t start, uint64_t period, unsigned *peak, unsigned *culprit) {
+    const unsigned size = 1200, limit = WINDOW;
+    unsigned sent = 0, received = 0;
+    int error = 0, readable = 0;
+    uint64_t deadline = start + period * count + 1000000000ULL;
+    unsigned char data[1216];
     while (received < count && !stopping) {
-        uint64_t now = stamp(CLOCK_MONOTONIC);
+        if (readable && (error = replies(fd, samples, sent, nonce, &received, culprit))) break;
+        if (received == count) break;
+        uint64_t now = stamp(CLOCK_MONOTONIC), due = start + period * sent;
         if (now >= deadline) { error = ETIMEDOUT; break; }
-        /* Bounded batches keep receives from starving scheduled sends. */
-        for (unsigned batch = 0; batch < 64; batch++) {
-            ssize_t n = recv(fd, data, sizeof(data), MSG_DONTWAIT);
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-            if (n < 0 && errno == EINTR) continue;
-            uint64_t arrived = stamp(CLOCK_MONOTONIC);
-            if (n != (ssize_t)size + 16 || memcmp(data, "WGPS", 4) ||
-                u32(data + 8) != size || u32(data + 12) != nonce) { error = EPROTO; break; }
-            unsigned sequence = u32(data + 4);
-            if (sequence >= sent || samples[sequence].bytes) { error = EPROTO; break; }
-            for (unsigned j = 0; j < size; j++)
-                if (data[j + 16] != (unsigned char)(j ^ sequence ^ nonce)) { error = EPROTO; break; }
-            if (error) break;
-            samples[sequence].latency = arrived - samples[sequence].latency;
-            samples[sequence].bytes = size; received++;
-        }
-        if (error || received == count) break;
-        now = stamp(CLOCK_MONOTONIC);
-        if (sent < count && now >= start + period * sent) {
-            if (sent - received >= limit) { error = ENOBUFS; break; }
-            struct sample *sample = &samples[sent];
-            sample->latency = now; sample->lateness = now - (start + period * sent);
+        if (sent < count && now >= due) {
+            /* Queued replies free the window before it is declared exhausted. */
+            if (sent - received >= limit && (error = replies(fd, samples, sent, nonce, &received, culprit))) break;
+            if (sent - received >= limit) { error = ENOBUFS; *culprit = sent; break; }
             memcpy(data, "WGPS", 4); put32(data + 4, sent); put32(data + 8, size); put32(data + 12, nonce);
             for (unsigned j = 0; j < size; j++) data[j + 16] = (unsigned char)(j ^ sent ^ nonce);
-            ssize_t n = send(fd, data, size + 16, MSG_DONTWAIT | MSG_NOSIGNAL);
-            if (n != (ssize_t)size + 16) { error = n < 0 ? errno : EIO; break; }
-            sent++;
-            if (sent - received > *peak) *peak = sent - received;
-            continue;
+            struct sample *sample = &samples[sent];
+            sample->latency = stamp(CLOCK_MONOTONIC); sample->lateness = sample->latency - due;
+            ssize_t n = send(fd, data, sizeof(data), MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (n != (ssize_t)sizeof(data)) { error = n < 0 ? errno : EIO; *culprit = sent; break; }
+            if (++sent - received > *peak) *peak = sent - received;
+            /* Skip a speculative receive; ppoll reports queued replies. */
+            readable = 0; continue;
         }
-        uint64_t until = sent < count ? start + period * sent : deadline;
-        now = stamp(CLOCK_MONOTONIC);
-        if (now >= until) continue;
-        uint64_t remaining = until - now;
+        uint64_t remaining = (sent < count ? due : deadline) - now;
         struct timespec timeout = {.tv_sec = (time_t)(remaining / 1000000000ULL),
                                    .tv_nsec = (long)(remaining % 1000000000ULL)};
         struct pollfd pending = {.fd = fd, .events = POLLIN};
-        if (ppoll(&pending, 1, &timeout, NULL) < 0 && errno != EINTR) { error = errno; break; }
+        int ready = ppoll(&pending, 1, &timeout, NULL);
+        if (ready < 0 && errno != EINTR) { error = errno; break; }
+        readable = ready != 0;
     }
-    if (!error && received != count) error = EINTR;
-    if (error) {
-        for (unsigned i = 0; i < count; i++) if (!samples[i].bytes) {
-            samples[i].error = (unsigned)error; samples[i].latency = 0;
-        }
-        /* A duplicate/corrupt packet can arrive after all valid replies in a
-         * receive batch. Preserve that failure even if no reply is missing. */
-        samples[count - 1].error = (unsigned)error;
+    return error || received == count ? error : EINTR;
+}
+/* After the measured window. A late duplicate, stray datagram or socket error
+ * within 50 ms, or any datagram this socket discarded, still fails the run.
+ * The cause stays on its own sample (else the first unanswered one, else the
+ * last); other unanswered samples are ETIMEDOUT when lost at the deadline,
+ * EINTR when stopped, and otherwise ECANCELED. */
+static int settle(int fd, struct sample *samples, unsigned count, unsigned nonce,
+                  int error, unsigned culprit, long long *drops) {
+    unsigned received = count, answered = 0;
+    uint64_t end = stamp(CLOCK_MONOTONIC) + 50000000ULL;
+    while (!error && !stopping) {
+        uint64_t now = stamp(CLOCK_MONOTONIC);
+        if (now >= end) break;
+        struct timespec timeout = {.tv_nsec = (long)(end - now)};
+        struct pollfd pending = {.fd = fd, .events = POLLIN};
+        int ready = ppoll(&pending, 1, &timeout, NULL);
+        if (ready < 0 && errno != EINTR) error = errno;
+        else if (ready > 0) error = replies(fd, samples, count, nonce, &received, &culprit);
     }
+    if ((*drops = discarded(fd)) > 0 && !error) error = EPROTO;
+    if (!error) return 0;
+    unsigned abandoned = error == ETIMEDOUT || error == EINTR ? (unsigned)error : ECANCELED;
+    for (unsigned i = 0; i < count; i++) {
+        if (samples[i].bytes) { answered++; continue; }
+        if (culprit == count) culprit = i;
+        samples[i].error = abandoned; samples[i].latency = 0;
+    }
+    if (culprit == count) culprit = count - 1;
+    samples[culprit].error = (unsigned)error;
+    fprintf(stderr, "udp_stream errno=%d sample=%u answered=%u drops=%lld\n", error, culprit, answered, *drops);
     return error;
 }
 static int query(const char *host, unsigned port, unsigned mark, unsigned sequence, int tcp) {
@@ -299,6 +366,11 @@ static int client(int argc, char **argv) {
     int fd = -1, pair[2] = {-1, -1}, tcp = !strcmp(mode, "tcp") || !strcmp(mode, "dns_tcp") || !strcmp(mode, "socket_tcp");
     if (payload_case) fd = connection(tcp, host, payload_port, mark);
     if ((payload_case && fd < 0) || (ipc_case && socketpair(AF_UNIX, SOCK_STREAM, 0, pair))) { free(samples); return 2; }
+    long long rcvbuf = stream_case ? receive_room(fd) : -1, drops = -1;
+    if (stream_case && rcvbuf < ROOM) {
+        fprintf(stderr, "udp_stream receive buffer %lld below %d\n", rcvbuf, ROOM);
+        close(fd); free(samples); return 2;
+    }
     unsigned nonce;
     if (getrandom(&nonce, sizeof(nonce), 0) != sizeof(nonce)) { free(samples); return 2; }
     puts("{\"ready\":true}"); fflush(stdout);
@@ -309,9 +381,10 @@ static int client(int argc, char **argv) {
     struct timespec initial = {.tv_sec = (time_t)(start / 1000000000ULL), .tv_nsec = (long)(start % 1000000000ULL)};
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &initial, NULL) == EINTR) {}
     getrusage(RUSAGE_SELF, &usage0); uint64_t cpu = stamp(CLOCK_PROCESS_CPUTIME_ID), began = stamp(CLOCK_MONOTONIC);
-    unsigned completed = 0, failed = 0, inflight_max = 0;
+    unsigned completed = 0, failed = 0, inflight_max = 0, culprit = count;
+    int stream_error = 0;
     if (stream_case) {
-        failed = datagrams(fd, samples, count, nonce, start, period, &inflight_max) != 0;
+        stream_error = datagrams(fd, samples, count, nonce, start, period, &inflight_max, &culprit);
         completed = count;
     }
     for (unsigned i = 0; !stream_case && i < count && !stopping; i++) {
@@ -359,12 +432,17 @@ static int client(int argc, char **argv) {
     }
     uint64_t elapsed = stamp(CLOCK_MONOTONIC) - began; cpu = stamp(CLOCK_PROCESS_CPUTIME_ID) - cpu;
     getrusage(RUSAGE_SELF, &usage1);
+    long long outcome = -1;
+    if (stream_case) { outcome = settle(fd, samples, count, nonce, stream_error, culprit, &drops); failed = outcome != 0; }
     if (fd >= 0) close(fd);
     if (pair[0] >= 0) { close(pair[0]); close(pair[1]); }
+    char room[24], dropped[24], status[24];
     printf("{\"case\":\"%s\",\"planned\":%u,\"start_ns\":%llu,\"period_ns\":%llu,\"elapsed_ns\":%llu,"
-           "\"cpu_ns\":%llu,\"context_switches\":%ld,\"inflight_max\":%u,\"samples\":[", mode, count, start,
-           (unsigned long long)period, (unsigned long long)elapsed, (unsigned long long)cpu,
-           (usage1.ru_nvcsw + usage1.ru_nivcsw) - (usage0.ru_nvcsw + usage0.ru_nivcsw), inflight_max);
+           "\"cpu_ns\":%llu,\"context_switches\":%ld,\"inflight_max\":%u,\"rcvbuf\":%s,\"receive_drops\":%s,"
+           "\"stream_errno\":%s,\"samples\":[", mode, count, start, (unsigned long long)period,
+           (unsigned long long)elapsed, (unsigned long long)cpu,
+           (usage1.ru_nvcsw + usage1.ru_nivcsw) - (usage0.ru_nvcsw + usage0.ru_nivcsw),
+           inflight_max, optional(room, rcvbuf), optional(dropped, drops), optional(status, outcome));
     for (unsigned i = 0; i < completed; i++) printf("%s[%llu,%llu,%u,%u]", i ? "," : "",
         (unsigned long long)samples[i].latency, (unsigned long long)samples[i].lateness, samples[i].error, samples[i].bytes);
     puts("]}"); free(samples); return (int)(failed || completed != count);
