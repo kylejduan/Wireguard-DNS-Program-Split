@@ -25,6 +25,13 @@ CASES = (
 )
 
 
+def case_set(udp_mode):
+    if udp_mode not in ('serial', 'stream'): raise ValueError('unknown UDP pacing mode')
+    return tuple((label + '_stream', 'udp_stream', included, rate)
+                 if udp_mode == 'stream' and mode == 'udp' else (label, mode, included, rate)
+                 for label, mode, included, rate in CASES)
+
+
 def launch(topology, directory, case, arm, mark, seconds):
     label, mode, included, rate = case
     root = topology.evidence / 'bin'
@@ -99,18 +106,18 @@ def peer_counts(peers):
     return [runtime.line(server) for server in peers]
 
 
-def measure(topology, arm, round_id, seconds):
+def measure(topology, arm, round_id, seconds, cases=CASES):
     directory = topology.evidence / (str(round_id) + '-' + arm)
     directory.mkdir(mode=0o700)
     children, rows, resource = {}, [], {'arm': arm, 'round': round_id, 'samples': []}
     drain = None
     try:
-        children[CASES[-1][0]] = launch(topology, directory, CASES[-1], arm, 0, seconds)
+        children[cases[-1][0]] = launch(topology, directory, cases[-1], arm, 0, seconds)
         manager = runtime.plain(topology) if arm == 'absent' else runtime.installed(topology, arm, directory)
         with manager as product:
             try:
                 mark = product.mark() if product else 0
-                for case in CASES[:-1]: children[case[0]] = launch(topology, directory, case, arm, mark, seconds)
+                for case in cases[:-1]: children[case[0]] = launch(topology, directory, case, arm, mark, seconds)
                 groups = {}
                 if product:
                     for unit, value in product.instance.items():
@@ -144,7 +151,7 @@ def measure(topology, arm, round_id, seconds):
                     try:
                         row = json.loads(output)
                         row.update(case=name, arm=arm, round=round_id, exit=process.returncode,
-                                   offered_operations=seconds * next(c[3] for c in CASES if c[0] == name))
+                                   offered_operations=seconds * next(c[3] for c in cases if c[0] == name))
                         row['intended_ns'] = seconds * 1000000000
                         row['delivered_operations'] = len(row['samples'])
                         row['delivered_bytes'] = sum(s[3] for s in row['samples'])
@@ -273,13 +280,14 @@ def recover(manifest):
 def execute(args, manifest, host):
     own.validate_manifest(manifest)
     orders = statistics.schedule(args.rounds, args.seed)
+    cases = case_set(args.udp_mode)
     if not 10 <= args.seconds <= 30: raise ValueError('each arm must run for 10..30 seconds')
     own.preflight(manifest, own.inventory())
     first = runtime.snapshot(manifest)
     root = Path(manifest['evidence']); root.mkdir(mode=0o700)
     runtime.report(root / 'before.json', first)
     metadata = {'schema': 1, 'run_id': manifest['run_id'], 'mode': manifest['mode'], 'host': host,
-                'owner': own.pid_identity(os.getpid()), 'manifest': manifest, 'cases': CASES,
+                'owner': own.pid_identity(os.getpid()), 'manifest': manifest, 'cases': cases, 'udp_mode': args.udp_mode,
                 'schedule': orders, 'rounds': args.rounds, 'seconds_per_arm': args.seconds, 'seed': args.seed,
                 'cpu_affinity': sorted(os.sched_getaffinity(0)), 'clock_ticks_per_second': os.sysconf('SC_CLK_TCK'),
                 'cpu_states': {str(p): p.read_text().strip() for p in Path('/sys/devices/system/cpu').glob('cpu[0-9]*/cpufreq/scaling_governor')},
@@ -302,7 +310,7 @@ def execute(args, manifest, host):
         topology.create()
         for round_id, order in enumerate(orders):
             for arm in order:
-                observed, resource = measure(topology, arm, round_id, args.seconds)
+                observed, resource = measure(topology, arm, round_id, args.seconds, cases)
                 rows.extend(observed); resources.append(resource)
                 runtime.report(root / 'rows.json', rows); runtime.report(root / 'resources.json', resources)
                 print(f'Completed {manifest["mode"]} round {round_id + 1}: {arm}', flush=True)
@@ -347,6 +355,7 @@ def main():
     parser.add_argument('--seconds', type=int, default=10)
     parser.add_argument('--seed', type=int, default=20260914)
     parser.add_argument('--profile', action='store_true')
+    parser.add_argument('--udp-mode', choices=('serial', 'stream'), default='serial')
     parser.add_argument('--recover', action='store_true')
     args = parser.parse_args()
     os.umask(0o077)
