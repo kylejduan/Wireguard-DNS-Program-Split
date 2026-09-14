@@ -259,8 +259,8 @@ char LICENSE[] SEC("license")="GPL";
         assert json.loads(control('policy',pins).stdout)==expected
         snapshot=json.loads(control('snapshot',pins).stdout)
         assert snapshot['paths']==expected, 'snapshot must include policy under the same ownership lock'
-        assert snapshot['abi']==2 and snapshot['ready'] is False
-        assert len(snapshot['maps'])==12 and len(snapshot['links'])==12
+        assert snapshot['abi']==3 and snapshot['ready'] is False
+        assert len(snapshot['maps'])==13 and len(snapshot['links'])==12
         assert snapshot['mask']==0x00ff0000 and snapshot['mark']==0x00010000
         foreign=pins/'unexpected'
         run(['bpftool','map','pin','id',snapshot['maps']['paths'],foreign])

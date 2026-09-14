@@ -66,8 +66,20 @@ assert re.findall(r'mark=(0x[0-9a-f]+)', output) == ['0x00000000'] * 3, output
 assert 'launcher_before' in output and 'launcher_after' in output and 'exe=' in output
 print('PASS: native launcher observes its own and execed helper sockets without setting marks')
 PY
-    python3 - "$probe" <<'PY'
-import socket, subprocess, sys, threading
+    python3 - "$probe" "$repo/tests/linux/test_classifier.sh" "$native_fixture" <<'PY'
+import ast, os, pathlib, shutil, socket, subprocess, sys, threading
+# Run the actual VM command helper without executing its privileged setup.
+script = pathlib.Path(sys.argv[2]).read_text()
+vm_source = script.split('export WG_TEST_REPO="$repo"\npython3 - <<\'PY\'\n', 1)[1].split('\nPY\n', 1)[0]
+helper = next(node for node in ast.parse(vm_source).body
+              if isinstance(node, ast.FunctionDef) and node.name == 'command')
+exec(compile(ast.Module(body=[helper], type_ignores=[]), sys.argv[2], 'exec'))
+raw_image = pathlib.Path(sys.argv[3]) / ('raw-' + os.fsdecode(b'\xff'))
+shutil.copy2(sys.argv[1], raw_image)
+observed = command([raw_image, 'identity']).stdout
+assert 'mark=0x00000000 ' in observed
+assert os.fsencode(observed.split('exe=', 1)[1].rstrip('\n')) == os.fsencode(raw_image)
+print('PASS: VM command decoder preserves the native raw-byte executable identity')
 with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as receiver, \
      socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as responder:
     receiver.bind(('127.0.0.1',0)); receiver.settimeout(3)
@@ -123,8 +135,8 @@ def scoped_args(args):
 
 def command(args, okay=True, scoped=False, **kwargs):
     if scoped: args=scoped_args(args)
-    result = subprocess.run([str(x) for x in args], text=True, capture_output=True,
-                            timeout=30, **kwargs)
+    result = subprocess.run([str(x) for x in args], text=True, errors='surrogateescape',
+                            capture_output=True, timeout=30, **kwargs)
     if okay and result.returncode:
         raise AssertionError(f'{args}: {result.returncode}\n{result.stdout}\n{result.stderr}')
     return result
@@ -278,6 +290,33 @@ char LICENSE[] SEC("license") = "GPL";
     probe(alias); probe(hard, expected='0x00000000')
     add(hard); probe(hard); delete(hard)
     passed('symlink canonicalization and distinct hard-link executable paths')
+    # Exercise the actual full resolver and exact-map selection at byte limits.
+    boundary = []
+    for length, character in ((255, 's'), (256, 'l'), (255, os.fsdecode(b'\xff')),
+                              (256, os.fsdecode(b'\xfe')), (4095, 'm')):
+        parent = evidence / ('tier-' + str(len(boundary))); parent.mkdir()
+        while length - len(os.fsencode(parent)) - 1 > 255:
+            parent /= 'd' * min(250, length - len(os.fsencode(parent)) - 3)
+            parent.mkdir()
+        path = parent / (character * (length - len(os.fsencode(parent)) - 1))
+        assert len(os.fsencode(path)) == length
+        shutil.copy2(direct, path)
+        probe(path, expected='0x00000000'); add(path); probe(path)
+        delete(path); probe(path, expected='0x00000000')
+        boundary.append(path)
+    passed('255/256 filesystem-byte tier boundaries, raw bytes and 4095-byte exact paths')
+    short_image, long_image = boundary[:2]
+    add(short_image)
+    held = control(short_image)
+    step(held, 's', 'mark='+mark)
+    short_image.rename(long_image)
+    step(held, 's', 'mark=0x00000000')
+    add(long_image); step(held, 's', 'mark='+mark)
+    long_image.rename(short_image); step(held, 's', 'mark='+mark)
+    # Deleting the old long key must ignore a replacement symlink's short target.
+    long_image.symlink_to(short_image); delete(long_image)
+    probe(long_image); delete(short_image); step(held, 's', 'mark=0x00000000')
+    passed('running image renames cross tiers synchronously; deletion keeps exact stored identity')
     old = control(included)
     step(old, 'o', 'held_mark='+mark)
     destination = evidence / 'renamed'

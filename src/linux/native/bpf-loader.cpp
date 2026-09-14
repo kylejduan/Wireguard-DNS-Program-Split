@@ -40,8 +40,9 @@ using PathKey = policy_path;
 using Configuration = policy_config;
 static_assert(sizeof(Configuration) == 40);
 struct MapSpec { const char *name; uint32_t key, value, type, entries; };
-const std::array<MapSpec,12> maps{{
+const std::array<MapSpec,13> maps{{
     {"paths",sizeof(PathKey),4,BPF_MAP_TYPE_HASH,1024},
+    {"paths_short",sizeof(policy_short_path),4,BPF_MAP_TYPE_HASH,1024},
     {"policy_cfg",4,sizeof(Configuration),BPF_MAP_TYPE_ARRAY,1},
     {"scratch",4,sizeof(path_scratch),BPF_MAP_TYPE_PERCPU_ARRAY,1},
     {"stats",4,8,BPF_MAP_TYPE_PERCPU_ARRAY,9},
@@ -188,6 +189,17 @@ std::vector<PathKey> read_policy_stdin(std::istream &input) {
     }
     if (!input.eof() || !current.empty()) fail("policy stdin read failed or final NUL missing");
     return keys;
+}
+const MapSpec &path_map_spec(const PathKey &key) {
+    return maps[std::strlen(key.pathname)<SHORT_PATH_BYTES ? 1 : 0];
+}
+void initialize_paths(bpf_object *object, const std::vector<PathKey> &keys) {
+    uint32_t selected=1;
+    if (keys.size()>1024) fail("policy exceeds combined path capacity");
+    for (const auto &key:keys) {
+        int fd=bpf_object__find_map_fd_by_name(object,path_map_spec(key).name);
+        check(bpf_map_update_elem(fd,&key,&selected,BPF_NOEXIST)==0,"initialize path");
+    }
 }
 int map_fd(const fs::path &dir, const char *name, uint32_t key_size,
            uint32_t value_size, uint32_t type, uint32_t entries) {
@@ -392,11 +404,9 @@ void load(int argc, char **argv) {
     std::cerr << log.data();
     if (rc) fail("BPF verifier/load rejected classifier: " + std::to_string(rc));
     int conf = bpf_object__find_map_fd_by_name(object.get(), "policy_cfg");
-    int paths = bpf_object__find_map_fd_by_name(object.get(), "paths");
-    uint32_t zero = 0, selected = 1;
+    uint32_t zero = 0;
     check(bpf_map_update_elem(conf, &zero, &cfg, BPF_ANY) == 0, "initialize blocked config");
-    for (const auto &key : keys)
-        check(bpf_map_update_elem(paths, &key, &selected, BPF_NOEXIST) == 0, "initialize path");
+    initialize_paths(object.get(),keys);
     seed_guards(object.get(),cfg.netns);
     check(mkdir(dir.c_str(), 0700) == 0, "create exclusive pin directory");
     std::vector<fs::path> pinned;
@@ -472,16 +482,44 @@ std::string json_string(const std::string &text) {
     }
     return output+'"';
 }
-void policy_json(const fs::path &dir) {
-    Fd fd(map_fd(dir,"paths",sizeof(PathKey),4,BPF_MAP_TYPE_HASH,1024));
-    PathKey key{}, next{}; const PathKey *previous=nullptr;
+std::set<std::string> policy_entries(const fs::path &dir) {
     std::set<std::string> entries;
-    while (bpf_map_get_next_key(fd.value,previous,&next)==0) {
-        if (!memchr(next.pathname,0,sizeof(next.pathname))) fail("unterminated policy key");
-        entries.insert(next.pathname); key=next; previous=&key;
-        if (entries.size()>1024) fail("policy changed during readback");
+    for (const auto &spec:maps) {
+        if (std::string(spec.name)!="paths" && std::string(spec.name)!="paths_short") continue;
+        Fd fd(map_fd(dir,spec.name,spec.key,spec.value,spec.type,spec.entries));
+        PathKey key{}, next{}; const PathKey *previous=nullptr;
+        while (bpf_map_get_next_key(fd.value,previous,&next)==0) {
+            const char *end=static_cast<const char *>(memchr(next.pathname,0,spec.key));
+            if (!end) fail("unterminated policy key");
+            size_t length=end-next.pathname;
+            if ((length<SHORT_PATH_BYTES)!=(spec.key==SHORT_PATH_BYTES))
+                fail("policy key in wrong path tier");
+            if (!entries.insert(next.pathname).second || entries.size()>1024)
+                fail("policy changed during readback or exceeds capacity");
+            key=next; previous=&key;
+        }
+        if (errno!=ENOENT) fail("read policy keys");
     }
-    if (errno!=ENOENT) fail("read policy keys");
+    return entries;
+}
+void change_path(const fs::path &dir, const PathKey &key, bool adding, const std::string &command) {
+    const auto &spec=path_map_spec(key);
+    Fd fd(map_fd(dir,spec.name,spec.key,spec.value,spec.type,spec.entries));
+    uint32_t value=1;
+    if (adding) {
+        /* The caller holds the directory's exclusive ownership lock. Both maps
+         * share one limit; re-adding an existing exact key remains idempotent. */
+        uint32_t previous=0;
+        if (bpf_map_lookup_elem(fd.value,&key,&previous)) {
+            if (errno!=ENOENT) fail("read policy before add");
+            if (policy_entries(dir).size()>=1024) fail("policy exceeds combined path capacity");
+        }
+    }
+    check((adding ? bpf_map_update_elem(fd.value,&key,&value,BPF_ANY) :
+           bpf_map_delete_elem(fd.value,&key))==0,command);
+}
+void policy_json(const fs::path &dir) {
+    auto entries=policy_entries(dir);
     std::cout<<'['; bool comma=false;
     for (const auto &entry:entries) { if (comma) std::cout<<','; comma=true; std::cout<<json_string(entry); }
     std::cout<<']';
@@ -576,10 +614,7 @@ int main(int argc, char **argv) {
         if ((command == "path-add" || command == "path-add-policy" || command == "path-del") && argc == 4) {
             bool adding = command != "path-del";
             auto key = path_key(argv[3], command == "path-add");
-            Fd fd(map_fd(dir, "paths", sizeof(PathKey), 4, BPF_MAP_TYPE_HASH, 1024));
-            uint32_t value = 1;
-            check((adding ? bpf_map_update_elem(fd.value, &key, &value, BPF_ANY) :
-                   bpf_map_delete_elem(fd.value, &key)) == 0, command);
+            change_path(dir,key,adding,command);
         } else if (command=="guard-slot" && argc==5) {
             auto cfg=configuration(dir);
             if (cfg.ready) fail("guard configuration changes require blocked state");
