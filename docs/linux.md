@@ -1,8 +1,9 @@
 # Linux executable include mode
 
 This implementation automatically routes selected executable paths through kernel
-WireGuard. It is experimental: the native VM proofs cover the mechanisms below;
-TV installation, its boot configuration and bot latency require separate acceptance.
+WireGuard. The native reference host is activated and has passed standalone
+application, DNS/IP separation and local failure/recovery acceptance. Supported
+kernel/host limits remain explicit; actual bot deadlines need application testing.
 The Windows implementation and its installation commands remain separate.
 
 | Traffic from a supported executable | Included path | Unlisted path |
@@ -24,7 +25,9 @@ A BPF LSM program resolves the current executable's complete canonical path when
 the kernel creates a socket. It sets the selected socket's routing mark before
 userspace receives the socket. Exact path matching is synchronous; there is no
 process polling window, wrapper, process-name match, UID substitution or cached
-classification shared between sockets.
+classification shared between sockets. Paths of at most 255 filesystem bytes
+use a 256-byte exact-key map; longer paths retain full 4096-byte keys. ABI 3
+requires both maps, with a combined limit of 1024 entries.
 The temporary per-CPU pathname buffer is protected against task preemption
 through resolution and lookup; executable references are released afterward.
 The [forced-preemption regression](linux-performance.md#correctness-prerequisite)
@@ -55,8 +58,11 @@ The target is added local p99 overhead below 1 ms where practical, with minimal
 CPU cost. See the [performance comparison](linux-performance.md) for the controlled
 three-condition experiment, uncertainty and reproduction command. It measures
 the running controller alongside concurrent included and unlisted workloads.
-There is no zero-overhead, worst-case delay or Internet RTT guarantee. TV
-release-build bot measurements remain necessary before deployment.
+Native added socket-creation p99 was approximately 7 us; the largest estimated
+added p99 across measured workloads was 96 us. The report also retains scheduling
+backlog and invalid whole-host CPU accounting. There is no zero-overhead,
+worst-case delay or Internet RTT guarantee. Measure each release-build bot before
+relying on its particular deadline requirements.
 
 ## Supported host and applications
 
@@ -127,7 +133,9 @@ BPF object and two service units. Private configuration lives in
 not activate the VPN, alter kernel boot options or convert application services.
 It refuses to overwrite existing installation files. The current update path is
 explicit disable/uninstall followed by installation; retained configuration must
-match the supplied input.
+match the supplied input. For an ABI 2 to ABI 3 update, use the installed old CLI
+to disable/uninstall before replacing artifacts; ABI 3 deliberately refuses old
+pins. Stop affected application trees during that explicit maintenance boundary.
 
 ## Operate
 
@@ -197,6 +205,10 @@ paths; it does not overwrite or delete the replacement. Unproved runtime ownersh
 also stops cleanup. Read the error and inspect effective state before retrying.
 
 ## Development verification
+
+The [guarded native measurement procedure](linux-native-validation.md) has its
+own physical-host admission, private manifest and ownership/recovery contract.
+It never bypasses the disposable-VM guards below.
 
 `./tests/run-linux.sh` runs unprivileged configuration, ownership, lifecycle,
 installer, native path/JSON and fixture checks. It does not attach BPF or change

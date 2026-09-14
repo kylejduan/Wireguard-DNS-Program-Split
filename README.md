@@ -68,7 +68,7 @@ See [Installation](docs/installation.md), [Architecture](docs/architecture.md), 
 
 The experimental [Linux implementation](docs/linux.md) automatically selects native executable paths at socket creation. Included IPv4 TCP/UDP uses kernel WireGuard, ordinary included DNS uses the profile resolver through that tunnel, and unlisted programs retain host routing and DNS. No launcher or packet proxy is required. Linux supports include mode only.
 
-The tested kernel target is native Ubuntu 26.04 with Linux 7.0 and active BPF LSM. Read the [Linux operating limits](docs/linux.md) and [migration procedure](docs/linux-migration.md), especially existing sockets/cache mappings, early boot, helpers and application-owned encrypted DNS. TV deployment and its latency acceptance are separate from the repository implementation.
+The tested kernel target is native Ubuntu 26.04 with Linux 7.0 and active BPF LSM. Read the [Linux operating limits](docs/linux.md) and [migration procedure](docs/linux-migration.md), especially existing sockets/cache mappings, early boot, helpers and application-owned encrypted DNS. The native reference host is activated and verified with independent applications. Its [measured added overhead](docs/linux-performance.md#native-reference-host-results--september-14-2026) met the sub-millisecond target in the controlled comparison; actual bot deadlines remain application-specific.
 
 Bot agents can manage their own entries using the [application enrollment workflow](docs/linux-agents.md). It covers native programs, Python, Node, Java, .NET and shell applications through their actual runtime/helper executables, with guidance for dedicated runtimes and shared interpreters.
 
