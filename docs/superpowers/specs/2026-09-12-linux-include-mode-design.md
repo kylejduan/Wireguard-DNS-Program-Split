@@ -1,13 +1,13 @@
 # Automatic Linux executable-path VPN and DNS inclusion
 
-Status: implemented with combined native VM and two-reboot validation, September 13, 2026.
-The combined socket hook, kernel DNS transport and resolver guards are
-implemented; the operator guide is [Linux include mode](../../linux.md).
-The full native VM and Linux unit/native suites passed again after the scratch
-preemption correction in `75e9b6c`.
-The user authorized implementation; independent scoped code reviews
-have driven regression fixes. TV deployment and its performance/boot gates
-remain separate.
+Status: implemented, with native reference-host activation and standalone
+application acceptance completed September 14, 2026. See [Linux operation](../../linux.md),
+[measured performance](../../linux-performance.md) and [migration](../../linux-migration.md).
+The full privileged VM suite and stable-kernel positive/negative boot proofs passed.
+A later focused independent review completed on September 14 against `00b3efd`, recommending
+the compact exact-path tier; it did not run experiments or certify the whole
+implementation. The tier is now implemented and measured at `3ead242`.
+Actual unfinished-bot deadlines remain separate from this reusable host implementation.
 
 ## Required behavior
 

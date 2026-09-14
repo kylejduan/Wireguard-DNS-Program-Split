@@ -1,9 +1,22 @@
 # Native Linux migration
 
-Repository implementation and disposable-VM tests do not migrate TV. No live
-TV networking, router settings, boot configuration or application services are
-changed by this source release. Perform migration in a coordinated maintenance
-window with a working management connection and a prepared rollback.
+The installer does not perform host migration. The reference-host migration was
+completed separately on September 14, 2026: BPF LSM was enabled with the original
+boot entry retained, the old full-tunnel owner was retired, and the include-only
+service was activated. Independent native curl/dig/getent/socket probes verified
+VPN versus router exits and ordinary DNS paths. The shared include list was left
+empty for bot agents; [enroll applications through the CLI](linux-agents.md).
+
+The native local loss/recovery and controller restart checks passed. Positive
+and failed-guard boot ordering was tested in a matching disposable VM; the native
+BPF boot and installed enabled-unit ordering were verified separately. No second
+native reboot was imposed after product installation. One initial provider
+activation retained blocking protection; a later complete readiness check and
+activation passed. That first failure remains in private evidence.
+
+For another host, perform migration in a coordinated maintenance window with a
+working management connection and prepared rollback. Preserve its own state;
+do not copy the reference host's identities, allocation or private profile.
 
 1. Read the current native host state: OS/kernel, effective LSMs, BTF/cgroup
    support, active VPN owner, routes/rules, nftables, DNS/NSS, Tailscale and the
