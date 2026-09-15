@@ -5,6 +5,77 @@ CPU cost. This is separate from total VPN or Internet round-trip time. A VM
 measurement cannot establish a worst-case bound or the actual bot's behavior on
 TV. See [Linux operation](linux.md) for the supported traffic and host context.
 
+## Production CPU and backlog follow-up — September 15, 2026
+
+This follow-up adds read-only production measurements and a scoped hook census
+on the same reference host, boot and kernel as the final results below. The
+accepted `3ead242` build was running with an empty include list and no test
+workload. It changes no earlier number. Here CPU means CPU-seconds per second,
+the share of one core. Result SHA-256: E1 rates and controller
+`20e5cab823cf942e35645ef8896ba0943b3fd830798ed0a8f8b5f3c85e990273`; E2 guard
+census `9f89491e3b9673c02eabe5537443c1bf00b94b3a4e62eaa41d15979056aa31f3`.
+
+**Controller.** The earlier 2.3–2.5% per-window controller figures are quantized
+observations: each window of about 11 seconds contained two or three discrete
+health checks. A 600-second passive sample at 2 Hz measured 109 checks averaging
+110.3 ms of controller-cgroup CPU each (SD 17.1 ms), 74.6% of it in the child
+processes a check starts, for 0.0204 CPU. The build was unchanged, so the value
+being lower than in the benchmark windows is host-state variation, not a source
+change.
+
+**Hook work charged to other processes.** BPF hook time runs in the calling
+process, outside the controller cgroup. Over 624 seconds, the product's own
+counters recorded 25.0 unlisted socket creations/s through the classifier
+(about 0.00009 CPU, at most 0.00012 with the in-situ per-call cost) and 115.8
+unknown-stream fallbacks/s. A `bpftool prog profile` census of all 11 guard LSM
+programs, one at a time for 2–5 seconds each (37 seconds attached, no workload),
+measured exact production call rates, which include those fallbacks. The socket
+receive and send hooks ran about 68,000 and 42,000 calls/s and the
+file-permission hook about 20,000/s, at roughly 650–1,200 cycles per call. In
+total the guard hooks used about 116 million cycles/s, or 0.0315–0.0386 CPU at
+the highest observed and the mean CPU frequency. The counts include the
+profiler's own fentry/fexit instrumentation, so they are conservative per call;
+assuming every call ran at the 0.8 GHz minimum frequency gives a hard 0.142 CPU.
+The Unix-stream connect, socketpair and file-receive hooks recorded no calls in
+their windows, which is an absence of samples, not zero cost.
+
+**Estimate and limits.** Controller, classifier and guard hooks together come to
+about **0.052–0.059 CPU** (about 5–6% of one core). This excludes nftables chain
+passes, the fwmark rule, routing and WireGuard packet work, which the census
+cannot count. The only packet evidence is 52,902 interface packets/s (5,229/s
+excluding loopback) times the benchmark's per-unit cost of at most about 1.4 us,
+which gives at most about 0.074 CPU. That proxy is not a chain-pass count,
+overlaps the send and receive hook work already measured, and is crude. No
+total feature upper bound, zero-overhead claim or whole-host A/B resolution
+follows: at this host's 1.1–1.6 CPU between-round spread, a whole-host
+comparison cannot resolve differences of this size.
+
+**Serial 1,000/s backlog.** Re-analysis of the final serial and stream raw
+samples classifies the serial backlog as capacity accumulation. A
+single-outstanding loop keeps up only while its mean service time, the round
+trip plus about 4 us of loop overhead, stays below the 1 ms period. The three
+published backlog maxima come from the most contended round, whose windows had a
+per-window utilization of 1.07–1.42, and host run-queue contention explained
+most of the variation in mean round trip. After adjusting for contention, no
+product effect on the included round trip was resolved, and plain WireGuard and
+the previous implementation backlog the same way. This is an application
+concurrency and capacity limit, not a measured classifier defect, and no product
+change is justified. An incomplete supporting diagnostic ran the unchanged probe
+over loopback in a private network namespace without WireGuard; its three
+completed serial runs (6 of 8 total planned 10-second runs completed) held the
+schedule, with send-lateness p99 100.6 us. It is not a like-for-like benchmark.
+
+Applications that need 1,000 requests/s through the tunnel should send
+independently paced requests with a bounded in-flight window of at least
+2 × rate × round-trip p99.9. With the local fixture's per-window p99.9 of
+4.2–10.0 ms, that is at least 20 at 1,000/s. Account for scheduled completion,
+the reply time minus the intended send time, and shed or coalesce requests older
+than their deadline instead of bursting to catch up. In the final stream
+experiment this pattern delivered 1,000 requests/s with zero loss and at most 20
+in flight. The serial workload remains the unchanged reference. These local
+fixture figures do not describe WAN or provider latency, and p99 shifts
+elsewhere in this document are paired estimates, not worst-case bounds.
+
 ## Final native serial results — September 14, 2026
 
 This section reports the final **serial** experiment. It runs the original

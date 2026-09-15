@@ -66,8 +66,17 @@ with individual 95% upper endpoints up to 521 us. Whole-host CPU accounting was
 valid in both runs; the candidate's controller used about 2.3–2.5% of one core, and
 whole-host feature cost was not resolved above unrelated host load. The serial
 1,000/s included UDP loop still falls behind, sending up to 0.74 s late, so it
-gives no deadline guarantee. Earlier September runs, including a native serial
-run whose whole-host CPU accounting was invalid, are kept as historical evidence.
+gives no deadline guarantee. A
+[September 15 follow-up](linux-performance.md#production-cpu-and-backlog-follow-up--september-15-2026)
+measured the running controller at 0.0204 CPU (share of one core; about 110 ms
+per health check at a five-second interval) and estimated about 0.052–0.059 CPU
+including the guard-hook work charged to other processes. That estimate includes profiler
+instrumentation and excludes nftables, routing and WireGuard packet work, so it
+is not a total bound. The follow-up also classifies the serial backlog as an
+application capacity limit: use independently paced requests with bounded
+concurrency instead of a single-outstanding 1,000/s loop. Earlier September
+runs, including a native serial run whose whole-host CPU accounting was invalid,
+are kept as historical evidence.
 
 These measurements cover new IPv4 sockets on the native host, from executables
 whose paths use the common compact exact-key tier. Existing sockets are not
