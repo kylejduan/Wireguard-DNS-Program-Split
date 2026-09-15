@@ -90,6 +90,22 @@ VPN connectivity is established; retain the application's normal connection
 retry behavior. The dependency does not select the executable or prove network
 readiness. Add the path before starting the service.
 
+## Latency expectations
+
+The classifier adds microseconds to each new socket and nothing per payload
+packet beyond ordinary nftables and WireGuard processing; see the
+[performance report](linux-performance.md). What an included application
+actually experiences is the provider path. Every round trip crosses the tunnel
+endpoint, and every ordinary DNS lookup is a full round trip to the profile
+resolver, because included queries are translated before the host stub and
+never use its cache. On the reference host a 147 ms endpoint made a fresh HTTPS
+connection take about 0.86 s included against 0.19 s unlisted, with 147 ms of
+that in name lookup alone. Choose the nearest permitted provider server for the
+application's destinations, keep long-lived connections instead of reconnecting
+per request, and resolve names once and cache them inside the application.
+Expect IPv6 socket attempts to fail with `EPERM`; tools such as `dig` print
+that and continue over IPv4, and `-4` avoids the attempt where available.
+
 ## Updates, removal and boundaries
 
 Atomic replacement at the same canonical path keeps new instances included.

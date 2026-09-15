@@ -89,6 +89,11 @@ scheduling, WAN latency and each bot's own deadlines are outside these local
 measurements, and CPU attribution on a busy host is approximate. There is no
 zero-overhead, worst-case delay or Internet RTT guarantee. Measure each
 release-build bot before relying on its particular deadline requirements.
+On the reference host the provider path, not the classifier, sets total
+included latency: a 147 ms endpoint made a fresh HTTPS connection take about
+0.86 s included against 0.19 s unlisted, and every included DNS query bypasses
+the host cache. See the
+[end-to-end check](linux-performance.md#reference-host-end-to-end-check--september-15-2026).
 
 ## Supported host and applications
 
