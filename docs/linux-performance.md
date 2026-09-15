@@ -5,6 +5,47 @@ CPU cost. This is separate from total VPN or Internet round-trip time. A VM
 measurement cannot establish a worst-case bound or the actual bot's behavior on
 TV. See [Linux operation](linux.md) for the supported traffic and host context.
 
+## Reference-host end-to-end check — September 15, 2026
+
+This check re-verified the activated reference host with the accepted build
+and no source change. Root-owned copies of `curl` and `dig` in a private
+directory were enrolled, compared with the unlisted originals, then removed
+together with the directory; the include list is empty again. Each enrollment
+returned `ready` in under one second and the controller stayed `ready`
+throughout, with no restart.
+
+| Observation | Included copy | Unlisted original |
+|---|---|---|
+| IPv4 exit reported by a public echo service | Provider exit address | Home ISP address |
+| Resolver egress reported by `whoami.akamai.net` | Provider resolver egress | Router upstream (Cloudflare) |
+| TXT query sent directly to `ns1.google.com` | Provider exit address | Home ISP address |
+| `dig +tcp` resolver egress | Provider resolver egress | Router upstream (Cloudflare) |
+| `curl -6` | Refused: `socket()` returns `EPERM` | Existing host behavior |
+
+Total included latency on this host is set by the provider path, not by the
+classifier or firewall rules. The tunnel endpoint's direct ICMP round trip was
+147 ms (five samples, 0.25 ms spread). Five fresh HTTPS connections to a
+trading API host took about 0.89 s each when included and about 0.18 s when
+unlisted:
+
+| Phase (`curl -w`, mean of five) | Included (ms) | Unlisted (ms) |
+|---|---:|---:|
+| Name lookup | 147 | 0.9 |
+| TCP connect | 295 | 8.8 |
+| TLS handshake complete | 567 | 24 |
+| Total | 862 | 189 |
+
+Every included round trip crosses the endpoint, and every ordinary included
+DNS query is a full tunnel round trip to the profile resolver because included
+queries are translated before the host stub resolver and never use its cache;
+`dig` reported 146 ms for a name that the unlisted host cache answered in 0 ms.
+Twenty sequential included `dig -4` runs took 3.17 s against 0.25 s unlisted.
+These are provider distance and cache-bypass costs, and they do not change the
+microsecond-scale added-overhead estimates below. They are the numbers an
+application deadline sees. Choose the nearest permitted provider server for the
+application's destinations, keep connections persistent, and cache resolved
+names inside the application.
+
 ## Production CPU and backlog follow-up — September 15, 2026
 
 This follow-up adds read-only production measurements and a scoped hook census
