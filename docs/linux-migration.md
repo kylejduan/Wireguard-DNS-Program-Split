@@ -6,6 +6,11 @@ boot entry retained, the old full-tunnel owner was retired, and the include-only
 service was activated. Independent native curl/dig/getent/socket probes verified
 VPN versus router exits and ordinary DNS paths. The shared include list was left
 empty for bot agents; [enroll applications through the CLI](linux-agents.md).
+On September 16, 2026 the reference host was moved to the reviewed release build
+(`2fb06c7`) through the documented disable, uninstall, install and activate
+path with its retained profile and settings, then re-verified with enrolled
+copies of `curl` and `dig` against the unlisted originals, including delivery
+to the host's own LAN address. The include list was left empty.
 
 The native local loss/recovery and controller restart checks passed. Positive
 and failed-guard boot ordering was tested in a matching disposable VM; the native
