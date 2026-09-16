@@ -313,7 +313,7 @@ class AllocationTests(unittest.TestCase):
                        subprocess.TimeoutExpired(['wg', PRIVATE], 1, output=PRIVATE)):
             with self.subTest(kind=type(result).__name__):
                 kwargs = {'side_effect': result} if isinstance(result, Exception) else {'return_value': result}
-                with patch('wg_program_split.network.subprocess.run', **kwargs):
+                with patch('wg_program_split.inventory.subprocess.run', **kwargs):
                     with self.assertRaises(network.NetworkError) as error:
                         network.run_command(('wg', 'show', 'all', 'fwmark'))
                 self.assertNotIn(PRIVATE, str(error.exception))
