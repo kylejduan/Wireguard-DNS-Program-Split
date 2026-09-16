@@ -158,8 +158,8 @@ def validate_manifest(manifest):
         raise ValueError('root host/protection review attestation required')
     if str(root).startswith('/home/tv/') and manifest.get('native_account_verified') != 'tv@TV':
         raise ValueError('root must verify native tv@TV before writes below /home/tv')
-    if manifest['builds']['baseline']['revision'] != 'c6af621':
-        raise ValueError('baseline must be the validated c6af621 build')
+    if manifest['builds']['baseline']['revision'] != 'b843960':
+        raise ValueError('baseline must be the validated b843960 build')
     for arm in ('baseline', 'candidate'):
         build = manifest['builds'][arm]
         directory = Path(build['directory'])

@@ -559,7 +559,7 @@ if __name__ == '__main__':
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument('--vm', action='store_true', required=True)
         parser.add_argument('--baseline-root', type=Path, required=True)
-        parser.add_argument('--baseline-revision', default='1738da0', help='Exact baseline revision and any explicit correctness backport')
+        parser.add_argument('--baseline-revision', default='7297931', help='Exact baseline revision and any explicit correctness backport')
         parser.add_argument('--candidate-root', type=Path, required=True)
         parser.add_argument('--candidate-revision', required=True)
         parser.add_argument('--rounds', type=int, default=6)

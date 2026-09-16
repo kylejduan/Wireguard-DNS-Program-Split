@@ -98,7 +98,7 @@ harness; do not weaken the existing VM admission checks to run it on production.
 
 ## Completion record — September 14, 2026
 
-- Exact-path tier: `7ced0b9`; guarded native harness: `5dfebac`. Source/ABI tests,
+- Exact-path tier: `d0a40ff`; guarded native harness: `c81d958`. Source/ABI tests,
   full privileged VM suite, stable-kernel positive/negative boot proofs, 201 local
   tests/native gates and Linux/Windows CI passed.
 - The native 18-window comparison passed 1,944,000 operations with zero errors.

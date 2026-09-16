@@ -4,9 +4,9 @@ Status: implemented, with native reference-host activation and standalone
 application acceptance completed September 14, 2026. See [Linux operation](../../linux.md),
 [measured performance](../../linux-performance.md) and [migration](../../linux-migration.md).
 The full privileged VM suite and stable-kernel positive/negative boot proofs passed.
-A later focused independent review on September 14 against `c6af621` recommended
+A later focused independent review on September 14 against `b843960` recommended
 the compact exact-path tier; it did not run experiments or certify the whole
-implementation. The tier is now implemented and measured at `7ced0b9`.
+implementation. The tier is now implemented and measured at `d0a40ff`.
 Actual unfinished-bot deadlines remain separate from this reusable host implementation.
 
 ## Required behavior
