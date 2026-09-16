@@ -92,9 +92,10 @@ readiness. Add the path before starting the service.
 
 ## Latency expectations
 
-The classifier adds microseconds to each new socket and nothing per payload
-packet beyond ordinary nftables and WireGuard processing; see the
-[performance report](linux-performance.md). What an included application
+The classifier adds about 1.5 us to each new socket, the firewall rules add
+about 0.7 us per packet direction, and the resolver-guard hooks add about 15 ns
+per send or receive call on IP sockets, measured in isolation on the reference
+host; see the [performance report](linux-performance.md). What an included application
 actually experiences is the provider path. Every round trip crosses the tunnel
 endpoint, and every ordinary DNS lookup is a full round trip to the profile
 resolver, because included queries are translated before the host stub and

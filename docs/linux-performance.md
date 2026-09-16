@@ -46,6 +46,57 @@ application deadline sees. Choose the nearest permitted provider server for the
 application's destinations, keep connections persistent, and cache resolved
 names inside the application.
 
+### Isolated per-packet and per-hook cost
+
+A second measurement on the same host, boot and build isolated what the
+implementation itself adds to each packet, without WireGuard or any WAN path. A
+64-byte UDP echo client and server, pinned to two idle CPUs, ran 10 rounds of
+100,000 serial round trips under five interleaved conditions: a private network
+namespace with no rules; the same namespace after loading the production
+nftables table, fwmark rule and owned table exactly as rendered by the
+installed allocation, first with an unmarked and then with a marked socket
+(`SO_MARK` set to the included mark by root); and the live host namespace,
+unmarked and marked. Each condition delivered all 1,000,000 echoes without
+error. Paired per-round differences, with approximate 95% bootstrap intervals
+on the mean:
+
+| Added per round trip (two packets) | Mean (us) | p50 (us) | p99 (us) |
+|---|---:|---:|---:|
+| Product rules present, unlisted socket | +1.37 [+1.23, +1.53] | +1.16 | +1.30 |
+| Product rules present, included socket | +1.54 [+1.38, +1.69] | +1.36 | +1.33 |
+| Mark-dependent part alone | +0.16 [-0.06, +0.39] | +0.19 | +0.03 |
+| Live host, marked versus unmarked | +0.21 [+0.09, +0.34] | +0.21 | +0.81 |
+
+The base namespace round trip was 6.8 us at p50 and 8.3 us at p99. The rules
+therefore add about 0.7 us per packet direction, about 0.1 us of which depends
+on the mark; the rest is chain traversal and conntrack that every host packet
+pays once the table exists. The live host's own stack (other firewall and
+policy rules) accounts for the further 0.8 us between the namespace and host
+unmarked conditions and is not part of this implementation.
+
+During a separate 3.1-second window, `kernel.bpf_stats_enabled` was set to 1
+and then restored to 0 while 400,000 marked echoes ran. The kernel's own
+per-program accounting gave the exact in-hook cost, excluding trampoline entry:
+
+| Hook | Calls/s observed | ns per call |
+|---|---:|---:|
+| `guard_send` (`socket_sendmsg`) | 259,797 | 14.9 |
+| `guard_recv` (`socket_recvmsg`) | 260,089 | 14.8 |
+| `guard_read` (`file_permission`) | 4,069 | 55.4 |
+| `guard_open` (`file_open`) | 1,383 | 110.8 |
+| `guard_mmap` (`mmap_file`) | 58 | 131.4 |
+| `guard_datagram` (`unix_may_send`) | 146 | 652.8 |
+| `classify` (`socket_post_create`) | 43 | 1,451.9 |
+
+All product hooks together used 0.0083 CPU during that window. The earlier
+census figures of 650–1,200 cycles per send/receive call included the
+profiler's own instrumentation; the kernel accounting shows the IP fast path
+of those hooks at about 15 ns. Socket classification itself costs about 1.5 us
+inside the hook, once per socket, consistent with the 4–11 us added p99 that
+the whole-syscall comparisons measured. Evidence is retained under ignored
+`local/validation/linux-loopback-20260915`; summary SHA-256
+`f7cfa4b3e1d2954b87bdb5ca3e2a958309b89b94a9525979c6b84ebe2d0cc512`.
+
 ## Production CPU and backlog follow-up — September 15, 2026
 
 This follow-up adds read-only production measurements and a scoped hook census

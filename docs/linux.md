@@ -92,7 +92,10 @@ release-build bot before relying on its particular deadline requirements.
 On the reference host the provider path, not the classifier, sets total
 included latency: a 147 ms endpoint made a fresh HTTPS connection take about
 0.86 s included against 0.19 s unlisted, and every included DNS query bypasses
-the host cache. See the
+the host cache. Isolated from WireGuard, the implementation's own rules add
+about 0.7 us per packet direction (1.5 us per UDP round trip, p99 +1.3 us), the
+send and receive hooks cost about 15 ns per call on IP sockets, and
+classification costs about 1.5 us once per new socket. See the
 [end-to-end check](linux-performance.md#reference-host-end-to-end-check--september-15-2026).
 
 ## Supported host and applications
