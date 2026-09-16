@@ -11,7 +11,7 @@ The Windows implementation and its installation commands remain separate.
 | New IPv4 TCP/UDP sockets | WireGuard | Existing host route |
 | Ordinary UDP/TCP DNS on port 53 | Profile DNS through WireGuard | Existing resolver path |
 | Application-owned DoH/DoT/DoQ | Application's provider, over WireGuard | Application's existing behavior |
-| IPv6 and raw/packet sockets | Refused | Existing host behavior |
+| IPv6, raw/packet, ICMP datagram, SCTP, MPTCP and UDP-Lite sockets | Refused | Existing host behavior |
 | IPv4 traffic to the host's own addresses (loopback or local) | Delivered locally | Delivered locally |
 
 The program does not configure the router or verify its upstream Cloudflare DoH.
@@ -44,7 +44,12 @@ there is no userspace packet queue or DNS forwarder service.
 Resolver guards prevent included processes from using supported host resolver
 IPC and shared nscd hosts-cache files. These guards also cover inherited/received
 file descriptors, Unix stream `splice`, endpoint aliases and late standard
-endpoints. Ordinary IP sends and ordinary file operations do not repeat the
+endpoints. A Unix stream is labelled from its peer's audited identity when it
+connects; a stream that predates the guard, or whose label a rename, bind or
+guard configuration change invalidated, is labelled again on its next use from
+its own or its peer's bind address, so a generation change costs one resolution
+per socket rather than one per message, and an included process keeps its
+unrelated streams. Ordinary IP sends and ordinary file operations do not repeat the
 guard's executable-path lookup. The controller checks health every five seconds;
 successful health checks do not briefly block new sockets. A failed check (an
 ownership mismatch, a lost handshake, or a DNS probe that fails three attempts)
@@ -111,7 +116,13 @@ kernel BTF and **active** BPF LSM. A build configuration containing
 `CONFIG_BPF_LSM=y` alone is insufficient. The loader verifies the actual helpers,
 attachments, initial namespaces and pinned objects. WSL, containers and changed
 filesystem roots are outside the supported host enrollment context. A private
-mount namespace retaining the host root, such as `PrivateTmp=yes`, is covered.
+mount namespace retaining the host root, such as `PrivateTmp=yes`, is covered,
+and so is a private user namespace (`PrivateUsers=`, `DynamicUser=`,
+`unshare -U`): user namespaces do not change executable identity. Tasks in
+another network namespace or with another filesystem root are outside
+classification and stay unmarked. The loader verifies at load time that its own
+socket classifies as an ordinary host task; it takes superblock device numbers
+from the mount table, so btrfs subvolume roots are identified correctly.
 
 Enroll a native ELF executable, using its absolute path. Symlinks are resolved
 when enrolled. Scripts run under their interpreter: enrolling Python includes
@@ -122,6 +133,8 @@ module, sandbox, privileged networking API or externally supplied socket.
 
 Replacing an executable atomically at the enrolled path preserves inclusion for
 new copies. New sockets from the old unlinked image are refused until restart.
+Only enrolled paths are refused that way: an unlisted process whose binary a
+package upgrade replaced stays unlisted and keeps creating sockets.
 Renaming a still-linked image changes the path used for subsequent sockets;
 enroll the destination before moving it if inclusion must continue. Existing
 socket marks do not change. Unresolvable, synthetic or unlinked executable
@@ -244,7 +257,7 @@ networking before removing BPF pins. It also completes after a foreign ruleset
 flush removed the whole owned nftables table, flushing the owned conntrack zone
 by number, and removes a private configuration directory orphaned by an
 interrupted preparation. A guard load interrupted midway leaves a staging
-directory named after the pin directory with a `.new` suffix; its links keep
+directory named after the pin directory with a `_new` suffix; its links keep
 protecting, and the next load replaces it. Removal preserves private profile/settings.
 If an installed artifact was changed or replaced, uninstall defers artifact
 deletion and retains a runnable command for a later retry. It reports the retained

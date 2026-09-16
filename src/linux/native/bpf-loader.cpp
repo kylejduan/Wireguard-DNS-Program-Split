@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -297,8 +298,33 @@ void reject_competitors(const fs::path &group) {
     closedir(listing);
     for (const auto &child : children) reject_competitors(group / child);
 }
-object_id identity(const struct stat &st) {
-    return {(static_cast<uint64_t>(major(st.st_dev))<<20)|minor(st.st_dev),st.st_ino};
+/* The kernel compares superblock device numbers (i_sb->s_dev). stat() reports
+ * them for most filesystems, but btrfs reports a per-subvolume anonymous device
+ * instead; the mount table lists the superblock's own number for every mount,
+ * so take it from the longest mount point containing the path. */
+uint64_t kernel_device(const fs::path &path, const struct stat &st) {
+    std::istringstream table(read_text("/proc/self/mountinfo"));
+    std::string line, best_point, best_device;
+    while (std::getline(table, line)) {
+        std::istringstream fields(line);
+        std::string id, parent, device, root, point;
+        if (!(fields >> id >> parent >> device >> root >> point)) continue;
+        std::string decoded;
+        for (size_t i = 0; i < point.size(); i++) {
+            if (point[i] == '\\' && i + 3 < point.size() && std::isdigit(point[i+1]))
+                decoded += static_cast<char>(std::stoi(point.substr(i + 1, 3), nullptr, 8)), i += 3;
+            else decoded += point[i];
+        }
+        bool covers = decoded == "/" || path == decoded ||
+                      path.string().compare(0, decoded.size() + 1, decoded + "/") == 0;
+        if (covers && decoded.size() >= best_point.size()) { best_point = decoded; best_device = device; }
+    }
+    auto colon = best_device.find(':');
+    if (best_point.empty() || colon == std::string::npos) return (static_cast<uint64_t>(major(st.st_dev))<<20)|minor(st.st_dev);
+    return (static_cast<uint64_t>(number(best_device.substr(0, colon)))<<20)|number(best_device.substr(colon + 1));
+}
+object_id identity(const fs::path &path, const struct stat &st) {
+    return {kernel_device(path, st), st.st_ino};
 }
 struct GuardMaps { int slots, dirs, names, roles; };
 void merge_role(int fd,const void *key,uint32_t role) {
@@ -321,7 +347,7 @@ void guard_slot_add(GuardMaps fd,uint32_t netns,const std::string &kind,const st
         auto st=stat_path(path);
         if (!S_ISDIR(st.st_mode)) fail("guard directory is not a directory");
         role=kind=="cache-dir" ? ROLE_CACHE_DIR : kind=="user-bus-dir" ? ROLE_USER_ROOT : ROLE_NSCD_PARENT;
-        auto key=identity(st); merge_role(fd.dirs,&key,role); return;
+        auto key=identity(path,st); merge_role(fd.dirs,&key,role); return;
     }
     if (kind!="socket" && kind!="cache") fail("guard kind must be socket, abstract, cache, cache-dir or user-bus-dir");
     if (role==ROLE_SOCKET) {
@@ -333,7 +359,7 @@ void guard_slot_add(GuardMaps fd,uint32_t netns,const std::string &kind,const st
     }
     if (fs::exists(path.parent_path())) {
         auto st=stat_path(path.parent_path());
-        guard_slot slot{}; slot.parent=identity(st);
+        guard_slot slot{}; slot.parent=identity(path.parent_path(),st);
         auto name=path.filename().string();
         if (name.size()>=sizeof(slot.name)) fail("guard basename exceeds slot capacity");
         memcpy(slot.name,name.c_str(),name.size()+1); merge_role(fd.slots,&slot,role);
@@ -366,7 +392,7 @@ void guard_user_bus(GuardMaps fd,uint32_t netns,const fs::path &directory) {
     memcpy(name.name,spelling.c_str(),name.length); merge_role(fd.names,&name,ROLE_SOCKET);
     struct stat parent{};
     if (lstat(directory.c_str(),&parent) || !S_ISDIR(parent.st_mode)) return;
-    guard_slot slot{}; slot.parent=identity(parent);
+    guard_slot slot{}; slot.parent=identity(directory,parent);
     memcpy(slot.name,"bus",4); merge_role(fd.slots,&slot,ROLE_SOCKET);
     struct stat st{};
     if (lstat(path.c_str(),&st) || !S_ISSOCK(st.st_mode)) return;
@@ -383,8 +409,8 @@ void seed_guards(bpf_object *object,uint32_t netns) {
         guard_slot_add(fd,netns,"socket",path);
     for (const char *path:{"/run","/var/cache","/var/lib"})
         guard_slot_add(fd,netns,"nscd-parent",path);
-    auto runtime=identity(stat_path("/run")); merge_role(fd.dirs,&runtime,ROLE_RUNTIME);
-    auto systemd=identity(stat_path("/run/systemd")); merge_role(fd.dirs,&systemd,ROLE_SYSTEMD);
+    auto runtime=identity("/run",stat_path("/run")); merge_role(fd.dirs,&runtime,ROLE_RUNTIME);
+    auto systemd=identity("/run/systemd",stat_path("/run/systemd")); merge_role(fd.dirs,&systemd,ROLE_SYSTEMD);
     if (fs::exists("/run/user")) {
         guard_slot_add(fd,netns,"user-bus-dir","/run/user");
         for (const auto &entry:fs::directory_iterator("/run/user")) {
@@ -421,6 +447,59 @@ void ready_preflight() {
     if (hosts!="files dns" && hosts!="files mdns4_minimal [NOTFOUND=return] dns")
         fail("unsupported hosts NSS configuration; ready accepts files dns or files mdns4_minimal [NOTFOUND=return] dns only");
 }
+/* Indices into the classifier stats map, in the BPF object's enum reason order
+ * (the same order as the names printed by status). */
+constexpr uint32_t REASON_DIRECT = 0, REASON_UNSUPPORTED_CONTEXT = 3;
+uint64_t counter(const fs::path &dir, const char *name, uint32_t entries, uint32_t index) {
+    Fd fd(map_fd(dir, name, 4, 8, BPF_MAP_TYPE_PERCPU_ARRAY, entries));
+    int count = libbpf_num_possible_cpus();
+    if (count < 1) fail("cannot discover possible CPUs");
+    std::vector<uint64_t> values(count);
+    check(bpf_map_lookup_elem(fd.value, &index, values.data()) == 0, "read counter");
+    uint64_t sum = 0;
+    for (auto value : values) sum += value;
+    return sum;
+}
+/* Prove the recorded root/namespace identity matches what the hooks observe:
+ * this unlisted process must classify as DIRECT. A mismatch would silently
+ * make every task UNSUPPORTED_CONTEXT, which is allowed unmarked, so it must
+ * fail the load rather than pass readiness. */
+bool inside_cgroup(const fs::path &group) {
+    std::istringstream table(read_text("/proc/self/mountinfo"));
+    std::string line, mount;
+    while (std::getline(table, line)) {
+        auto separator = line.find(" - ");
+        if (separator == std::string::npos) continue;
+        std::istringstream tail(line.substr(separator + 3)), head(line);
+        std::string type, id, parent, device, root, point;
+        if ((tail >> type) && type == "cgroup2" && (head >> id >> parent >> device >> root >> point)) { mount = point; break; }
+    }
+    std::istringstream cgroups(read_text("/proc/self/cgroup"));
+    std::string self;
+    while (std::getline(cgroups, line))
+        if (line.rfind("0::", 0) == 0) self = mount + line.substr(3);
+    if (mount.empty() || self.empty()) return false;
+    auto target = group.string();
+    return self == target || self.compare(0, target.size() + 1, target + "/") == 0;
+}
+void verify_context(const fs::path &dir, const fs::path &group) {
+    if (!inside_cgroup(group)) {
+        /* A test attaches to a cgroup this process is not in; only a load onto
+         * this process's own cgroup ancestry can observe its probe socket. */
+        std::cerr << "classification context self-check skipped: loader is outside the target cgroup\n";
+        return;
+    }
+    for (int attempt = 0; attempt < 5; attempt++) {
+        uint64_t direct = counter(dir, "stats", 9, REASON_DIRECT), unsupported = counter(dir, "stats", 9, REASON_UNSUPPORTED_CONTEXT);
+        Fd probe(::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+        uint64_t direct_after = counter(dir, "stats", 9, REASON_DIRECT), unsupported_after = counter(dir, "stats", 9, REASON_UNSUPPORTED_CONTEXT);
+        if (direct_after > direct && unsupported_after == unsupported) return;
+        if (direct_after == direct && unsupported_after > unsupported)
+            fail("classification context mismatch: this host's root identity is not observed by the hooks");
+        /* Another process created a socket in the same window; sample again. */
+    }
+    fail("classification context could not be verified against concurrent socket creation");
+}
 /* Remove a staging pin directory and everything this loader could have pinned
  * there; unpinning the last reference to a link detaches its program. Only a
  * leftover foreign entry keeps the directory, which is then reported. */
@@ -447,7 +526,7 @@ void load(int argc, char **argv) {
     reject_competitors(group);
     auto root = stat_path("/");
     Configuration cfg{abi, 0, number(argv[5]), number(argv[6]),
-        (static_cast<uint64_t>(major(root.st_dev)) << 20) | minor(root.st_dev),
+        kernel_device("/", root),
         root.st_ino, static_cast<uint32_t>(stat_path("/proc/self/ns/net").st_ino),
         static_cast<uint32_t>(stat_path("/proc/self/ns/user").st_ino)};
     if (!cfg.mask || !cfg.mark || (cfg.mark & ~cfg.mask)) fail("MARK must be nonzero and contained in MASK");
@@ -478,8 +557,9 @@ void load(int argc, char **argv) {
      * killed midway (for example by the caller's timeout) never leaves a
      * half-populated directory under the owned name. Stale staging from such
      * a death is replaced here; its links keep protecting until then. */
+    /* bpffs reserves names containing a dot, so the staging suffix has none. */
     fs::path staging = dir;
-    staging += ".new";
+    staging += "_new";
     discard_staging(staging);
     check(mkdir(staging.c_str(), 0700) == 0, "create exclusive staging pin directory");
     try {
@@ -496,6 +576,7 @@ void load(int argc, char **argv) {
             check(bpf_link__pin(link.get(),(staging/spec.pin).c_str())==0,"pin link");
         }
         verify_owner(staging);
+        verify_context(staging, group);
         check(rename(staging.c_str(), dir.c_str()) == 0, "publish pin directory");
     } catch (...) {
         discard_staging(staging);
@@ -527,7 +608,7 @@ void status(const fs::path &dir) {
         uint64_t sum=0; for (auto value:values) sum+=value;
         std::cout<<guard_names[i]<<'='<<sum<<'\n';
     }
-    std::cout<<"resolver_guards=active restart_audit=required unknown_pre_guard_streams=denied_for_selected\n";
+    std::cout<<"resolver_guards=active restart_audit=required unknown_pre_guard_streams=labelled_by_peer_on_first_use\n";
 }
 std::string json_string(const std::string &text) {
     std::string output="\"";
@@ -648,7 +729,7 @@ void capabilities() {
     check(uname(&name) == 0, "uname");
     std::cout << "abi=" << abi << " kernel=" << name.release << " libbpf=" << libbpf_version_string()
               << "\nlsm=" << read_text("/sys/kernel/security/lsm") << '\n'
-              << "coverage=host-root,host-netns,host-userns;private-mounts-with-host-root\n"
+              << "coverage=host-root,host-netns,any-userns;private-mounts-with-host-root\n"
               << "unsupported-context=outside-classification;restart-required=yes;cache=none\n"
               << "attachment-and-helper-support=unverified-until-load\n";
     std::unique_ptr<btf, decltype(&btf__free)> types(btf__load_vmlinux_btf(), btf__free);

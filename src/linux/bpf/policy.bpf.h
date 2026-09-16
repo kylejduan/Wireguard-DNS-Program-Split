@@ -75,6 +75,15 @@ static __always_inline int result(__u32 reason, int allow)
     return allow;
 }
 
+/* memfd and other anonymous images synthesize their names; they are refused
+ * rather than guessed, unlike a regular file that a replacement unlinked. */
+static __always_inline bool synthetic_file(struct file *file)
+{
+    struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
+    const struct dentry_operations *ops = BPF_CORE_READ(dentry, d_op);
+    return ops && BPF_CORE_READ(ops, d_dname);
+}
+
 static __always_inline bool linked_file(struct file *file)
 {
     struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
@@ -97,29 +106,52 @@ static __always_inline int resolve_policy(struct file *exe)
     /* No cross-socket cache: every creation resolves the current path. */
     int len = bpf_path_d_path(&exe->f_path, work->resolved, sizeof(work->resolved));
     bool linked = linked_file(exe);
-    if (!linked) return UNLINKED_IMAGE;
     if (len <= 1 || len > PATH_BYTES || work->resolved[0] != '/')
         return PATH_ERROR;
+    if (!linked) {
+        if (synthetic_file(exe)) return UNLINKED_IMAGE;
+        /* The identity check above, not this text, established that the image
+         * is unlinked. d_path appends " (deleted)"; strip it so the enrolled
+         * key can be looked up. Only an enrolled path whose image was replaced
+         * is refused: an unlisted process whose binary a package upgrade
+         * replaced stays unlisted instead of losing socket creation. */
+        if (len < 12) return PATH_ERROR;
+        __u32 cut = len - 11;
+        /* Keep the bound check on the register the access uses: the compiler
+         * would otherwise fold it into the earlier len check and the verifier
+         * loses the bound across the 32-bit spill. */
+        asm volatile("" : "+r"(cut));
+        if (cut > PATH_BYTES - 11) return PATH_ERROR;
+        char *tail = work->resolved + cut;
+        if (tail[0] != ' ' || tail[1] != '(' || tail[2] != 'd' || tail[3] != 'e' ||
+            tail[4] != 'l' || tail[5] != 'e' || tail[6] != 't' || tail[7] != 'e' ||
+            tail[8] != 'd' || tail[9] != ')' || tail[10] != 0)
+            return PATH_ERROR;
+        tail[0] = 0;
+        len = cut + 1;
+    }
     /* d_path initially writes at the end, then memmoves: its tail is NOT zero.
      * Resolve the full path first, then zero/copy only the selected exact key.
      * len includes NUL: a 255-byte filesystem path fits the short tier. */
+    __u32 *selected;
     if (len <= SHORT_PATH_BYTES) {
 #pragma clang loop unroll(full)
         for (int i = 0; i < SHORT_PATH_BYTES / 8; i++)
             ((volatile __u64 *)&work->key)[i] = 0;
         if (bpf_probe_read_kernel_str(work->key.pathname, SHORT_PATH_BYTES, work->resolved) != len)
             return PATH_ERROR;
-        return bpf_map_lookup_elem(&paths_short, &work->key) ? INCLUDED : DIRECT;
-    }
-    /* clang's BPF backend does not lower a 4096-byte builtin memset. */
+        selected = bpf_map_lookup_elem(&paths_short, &work->key);
+    } else {
+        /* clang's BPF backend does not lower a 4096-byte builtin memset. */
 #pragma clang loop unroll(full)
-    for (int i = 0; i < PATH_BYTES / 8; i++)
-        ((volatile __u64 *)&work->key)[i] = 0;
-    if (bpf_probe_read_kernel_str(work->key.pathname, PATH_BYTES, work->resolved) != len)
-        return PATH_ERROR;
-    __u32 *selected = bpf_map_lookup_elem(&paths, &work->key);
+        for (int i = 0; i < PATH_BYTES / 8; i++)
+            ((volatile __u64 *)&work->key)[i] = 0;
+        if (bpf_probe_read_kernel_str(work->key.pathname, PATH_BYTES, work->resolved) != len)
+            return PATH_ERROR;
+        selected = bpf_map_lookup_elem(&paths, &work->key);
+    }
     if (!selected) return DIRECT;
-    return INCLUDED;
+    return linked ? INCLUDED : UNLINKED_IMAGE;
 }
 
 static __always_inline int policy_select(void)
@@ -129,17 +161,15 @@ static __always_inline int policy_select(void)
     if (!cfg || cfg->version != POLICY_ABI) return BLOCKED;
     struct task_struct *task = bpf_get_current_task_btf();
     struct inode *root = BPF_CORE_READ(task, fs, root.dentry, d_inode);
+    /* A private user namespace does not change executable identity: with the
+     * host root and network namespace the path resolves and is classified
+     * normally. The recorded userns identity is diagnostic only. */
     if (BPF_CORE_READ(root, i_ino) != cfg->root_ino ||
         BPF_CORE_READ(root, i_sb, s_dev) != cfg->root_dev ||
-        BPF_CORE_READ(task, nsproxy, net_ns, ns.inum) != cfg->netns ||
-        BPF_CORE_READ(task, cred, user_ns, ns.inum) != cfg->userns)
+        BPF_CORE_READ(task, nsproxy, net_ns, ns.inum) != cfg->netns)
         return UNSUPPORTED_CONTEXT;
     struct file *exe = bpf_get_task_exe_file(task);
     if (!exe) return EXE_ERROR;
-    if (!linked_file(exe)) {
-        bpf_put_file(exe);
-        return UNLINKED_IMAGE;
-    }
     /* BPF LSM execution pins the CPU but permits task preemption. Another
      * task's classifier or resolver guard could otherwise overwrite scratch
      * between resolution and lookup, silently treating an included path as

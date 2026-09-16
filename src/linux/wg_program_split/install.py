@@ -16,7 +16,7 @@ LAYOUT = {
     'wg-program-split-guard.service': ('usr/lib/systemd/system/wg-program-split-guard.service', 0o644),
     'wg-program-split.service': ('usr/lib/systemd/system/wg-program-split.service', 0o644),
 }
-LAUNCHER = b'#!/bin/sh\nexec /usr/bin/python3 -I /usr/lib/wg-program-split/wg-program-split.pyz "$@"\n'
+LAUNCHER = b'#!/bin/sh\n# SPDX-License-Identifier: GPL-3.0-or-later\nexec /usr/bin/python3 -I /usr/lib/wg-program-split/wg-program-split.pyz "$@"\n'
 COMMAND = 'usr/bin/wg-program-split'
 CONFIG = 'etc/wg-program-split'
 MANIFEST = CONFIG + '/installation.json'
