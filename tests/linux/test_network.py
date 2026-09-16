@@ -84,6 +84,8 @@ class Kernel:
             return self.conntrack
         if argv in (('iptables-legacy-save',), ('ip6tables-legacy-save',)):
             return self.legacy
+        if argv in (('iptables-nft-save',), ('ip6tables-nft-save',)):
+            return getattr(self, 'nft_save', '')
         if argv == ('ip', '-j', '-4', 'address', 'show', 'dev', 'wgps0'):
             return json.dumps([{'addr_info': self.addresses}])
         if argv == ('wg', 'show', 'wgps0', 'dump'):

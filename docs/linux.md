@@ -55,9 +55,10 @@ successful health checks do not briefly block new sockets. A failed check (an
 ownership mismatch, a lost handshake, or a DNS probe that fails three attempts)
 blocks new included sockets until the next passing check, at least five seconds
 later; established sockets continue. Foreign nftables mark or conntrack-zone
-expressions the inventory cannot classify, including opaque iptables-nft mark
-and conntrack extensions, block activation and degrade a running guard rather
-than being assumed disjoint.
+expressions the inventory cannot classify block activation and degrade a
+running guard rather than being assumed disjoint. iptables rules of either
+flavour are read through their `-save` dumps, so `MARK` and
+`CONNMARK --restore-mark --nfmask` bits are reserved exactly.
 
 The optimized controller shares a coherent guard snapshot and reads the owned
 WireGuard interface once per network observation. Ordinary-file and IP resolver

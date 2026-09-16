@@ -16,7 +16,7 @@ from wg_program_split import network, ownership
 
 
 def mutates(argv):
-    return not (argv[0] in ('iptables-legacy-save', 'ip6tables-legacy-save') or
+    return not (argv[0] in network._IPTABLES_DUMPS or
                 argv[:2] in (('ip', '-j'), ('nft', '-j'), ('nft', '-c'),
                              ('wg', 'show'), ('sysctl', '-n'), ('conntrack', '-L')))
 

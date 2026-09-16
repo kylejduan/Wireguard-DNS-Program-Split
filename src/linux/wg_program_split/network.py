@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 
@@ -20,10 +21,14 @@ class NetworkError(RuntimeError):
     """A bounded operation failed; never include command output or profile data."""
 
 
+_TOOL_PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
+_IPTABLES_DUMPS = ('iptables-legacy-save', 'ip6tables-legacy-save', 'iptables-nft-save', 'ip6tables-nft-save')
+_OPAQUE_MARK_EXTENSIONS = {'MARK', 'CONNMARK', 'CT', 'mark', 'connmark'}
+
+
 def run_command(argv, *, input=None):
     """Run fixed argv with a trusted executable search path, no shell, no logs."""
-    if not argv or argv[0] not in {'ip', 'wg', 'nft', 'conntrack', 'sysctl',
-                                  'iptables-legacy-save', 'ip6tables-legacy-save'}:
+    if not argv or argv[0] not in {'ip', 'wg', 'nft', 'conntrack', 'sysctl', *_IPTABLES_DUMPS}:
         raise NetworkError('unsupported network command')
     try:
         result = subprocess.run(tuple(argv), input=input, capture_output=True, text=True,
@@ -180,10 +185,8 @@ def _nft_usage(value):
     if not isinstance(value, dict):
         return used, zones
     if 'xt' in value and isinstance(value['xt'], dict):
-        # iptables-nft renders its extensions opaquely; a mark or conntrack
-        # extension could use any bits or zone, so it cannot be proved disjoint.
-        if str(value['xt'].get('name', '')).upper() in ('MARK', 'CONNMARK', 'CT'):
-            raise NetworkError('unsupported opaque iptables-nft mark or conntrack expression')
+        # iptables-nft renders its extensions opaquely; their bits and zones
+        # come from the textual iptables-nft-save dump instead (see _opaque_marks).
         return used, zones
     if 'mangle' in value and value['mangle'].get('key') == mark:
         output = value['mangle']['value']
@@ -224,30 +227,91 @@ def _nft_usage(value):
     return used, zones
 
 
+def _opaque_marks(entries):
+    """True when the ruleset carries iptables extensions whose marks nft -j hides."""
+    if isinstance(entries, list):
+        return any(_opaque_marks(item) for item in entries)
+    if not isinstance(entries, dict):
+        return False
+    xt = entries.get('xt')
+    if isinstance(xt, dict) and xt.get('name') in _OPAQUE_MARK_EXTENSIONS:
+        return True
+    return any(_opaque_marks(item) for item in entries.values())
+
+
+def _iptables_dumps(runner):
+    """Textual dumps from every installed iptables flavour; absent tools are skipped."""
+    return {tool: _call(runner, tool) for tool in _IPTABLES_DUMPS
+            if shutil.which(tool, path=_TOOL_PATH) is not None}
+
+
+def _require_mark_visibility(nft_entries, dumps):
+    if _opaque_marks(nft_entries) and not {'iptables-nft-save', 'ip6tables-nft-save'} <= set(dumps):
+        raise NetworkError('iptables-nft mark or conntrack rules need iptables-nft-save to be inventoried')
+
+
+def _split_mark(value):
+    pieces = value.split('/')
+    if len(pieces) > 2:
+        raise ValueError
+    return _u32(pieces[0]), _u32(pieces[1]) if len(pieces) == 2 else 0xffffffff
+
+
 def _legacy_mask(text):
+    """Packet-mark bits an iptables dump can read or write.
+
+    MARK writes the packet mark; CONNMARK --restore-mark copies conntrack-mark
+    bits into the packet mark within --nfmask (all bits by default); every other
+    CONNMARK operation and the connmark match touch the conntrack mark only.
+    """
     used = 0
     for line in text.splitlines():
-        if not re.search(r'\b(?:MARK|CONNMARK|mark)\b', line):
+        if not re.search(r'\b(?:MARK|CONNMARK|mark|connmark)\b', line):
             continue
         try:
             args = shlex.split(line)
+            module = target = None
             recognized = False
-            for option in ('--mark', '--set-mark', '--set-xmark', '--and-mark', '--or-mark', '--xor-mark'):
-                if option not in args:
+            index = 0
+            while index < len(args):
+                token = args[index]
+                if token in ('-m', '--match'):
+                    module = args[index + 1]
+                    index += 2
                     continue
-                index = args.index(option)
-                pieces = args[index + 1].split('/')
-                value = _u32(pieces[0])
-                mask = _u32(pieces[1]) if len(pieces) == 2 else 0xffffffff
-                if len(pieces) > 2:
-                    raise ValueError
-                used |= ((~value) & 0xffffffff if option == '--and-mark' else
-                         value if option in ('--or-mark', '--xor-mark') else mask | value)
-                recognized = True
-            if not recognized or 'CONNMARK' in args:
+                if token in ('-j', '--jump', '-g', '--goto'):
+                    target = args[index + 1]
+                    index += 2
+                    continue
+                if token == '--mark':
+                    value, mask = _split_mark(args[index + 1])
+                    if module == 'mark':
+                        used |= value | mask
+                    elif module != 'connmark':
+                        raise ValueError
+                    recognized = True
+                elif token in ('--set-mark', '--set-xmark', '--and-mark', '--or-mark', '--xor-mark'):
+                    value, mask = _split_mark(args[index + 1])
+                    if target == 'MARK':
+                        used |= ((~value) & 0xffffffff if token == '--and-mark' else
+                                 value if token in ('--or-mark', '--xor-mark') else mask | value)
+                    elif target != 'CONNMARK':
+                        raise ValueError
+                    recognized = True
+                elif token == '--restore-mark':
+                    if target != 'CONNMARK':
+                        raise ValueError
+                    used |= _u32(args[args.index('--nfmask') + 1]) if '--nfmask' in args else 0xffffffff
+                    recognized = True
+                elif token == '--save-mark':
+                    if target != 'CONNMARK':
+                        raise ValueError
+                    recognized = True
+                index += 1
+            if not recognized:
                 raise ValueError
         except (ValueError, IndexError):
-            raise NetworkError('unsupported legacy iptables mark state') from None
+            raise NetworkError('unsupported iptables mark state') from None
     return used
 
 
@@ -356,10 +420,11 @@ def _inspect(profile, *, runner, require_underlay):
             raise NetworkError('unparseable WireGuard mark inventory')
         if parts[1] != 'off':
             used |= _u32(parts[1])
-    for tool in ('iptables-legacy-save', 'ip6tables-legacy-save'):
-        legacy = _call(runner, tool)
-        used |= _legacy_mask(legacy)
-        zones |= _legacy_zones(legacy)
+    dumps = _iptables_dumps(runner)
+    _require_mark_visibility(nft['nftables'], dumps)
+    for text in dumps.values():
+        used |= _legacy_mask(text)
+        zones |= _legacy_zones(text)
     for token in _call(runner, 'conntrack', '-L', '-o', 'extended').split():
         if 'zone' in token:
             if not re.fullmatch(r'zone(?:-orig|-reply)?=[0-9]{1,5}', token):
@@ -660,10 +725,11 @@ class Network:
                 raise NetworkError('unparseable WireGuard mark inventory')
             if parts[0] != a.interface and parts[1] != 'off':
                 bits |= _u32(parts[1])
-        for tool in ('iptables-legacy-save', 'ip6tables-legacy-save'):
-            legacy = self._run(tool)
-            bits |= _legacy_mask(legacy)
-            zones |= _legacy_zones(legacy)
+        dumps = _iptables_dumps(self.runner)
+        _require_mark_visibility(foreign_nft, dumps)
+        for text in dumps.values():
+            bits |= _legacy_mask(text)
+            zones |= _legacy_zones(text)
         return bool(bits & a.mask or a.zone in zones)
 
     def _acquire(self, kind, name, *argv, input=None):
