@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Unprivileged rule tests; --vm exercises real automatic selection and DNS."""
 import unittest
 import concurrent.futures

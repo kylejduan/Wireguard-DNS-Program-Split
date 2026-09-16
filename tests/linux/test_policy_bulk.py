@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Bounded filesystem-byte policy transport; privileged proof requires explicit VM mode."""
 import argparse
 import errno

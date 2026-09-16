@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Explicit owned Linux networking operations; controller owns BPF readiness."""
 from dataclasses import asdict, dataclass, replace
 import base64
@@ -118,9 +119,44 @@ def _wireguard_state(raw):
     return result
 
 
+_BUILTIN_TABLES = {'local': 255, 'main': 254, 'default': 253, 'unspec': 0}
+_TABLE_FILES = ('/etc/iproute2/rt_tables', '/usr/lib/iproute2/rt_tables', '/usr/share/iproute2/rt_tables')
+_TABLE_DIRS = ('/etc/iproute2/rt_tables.d', '/usr/lib/iproute2/rt_tables.d')
+
+
+def _named_tables():
+    """Resolve administrator-named routing tables, which ip prints by name."""
+    names = dict(_BUILTIN_TABLES)
+    paths = [Path(p) for p in _TABLE_FILES]
+    for directory in _TABLE_DIRS:
+        try:
+            paths.extend(sorted(Path(directory).glob('*.conf')))
+        except OSError:
+            continue
+    for path in paths:
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            fields = line.split('#', 1)[0].split()
+            if len(fields) == 2 and re.fullmatch(r'0x[0-9a-fA-F]{1,8}|[0-9]{1,10}', fields[0]):
+                try:
+                    names.setdefault(fields[1], _u32(fields[0]))
+                except NetworkError:
+                    continue
+    return names
+
+
 def _table(value):
-    names = {'local': 255, 'main': 254, 'default': 253}
-    return names[value] if isinstance(value, str) and value in names else _u32(value)
+    if isinstance(value, str) and value in _BUILTIN_TABLES:
+        return _BUILTIN_TABLES[value]
+    if isinstance(value, str) and not re.fullmatch(r'0x[0-9a-fA-F]{1,8}|[0-9]{1,10}', value):
+        named = _named_tables()
+        if value in named:
+            return named[value]
+        raise NetworkError('unknown named routing table')
+    return _u32(value)
 
 
 def _has_mark(value):
@@ -142,6 +178,12 @@ def _nft_usage(value):
             zones |= found
         return used, zones
     if not isinstance(value, dict):
+        return used, zones
+    if 'xt' in value and isinstance(value['xt'], dict):
+        # iptables-nft renders its extensions opaquely; a mark or conntrack
+        # extension could use any bits or zone, so it cannot be proved disjoint.
+        if str(value['xt'].get('name', '')).upper() in ('MARK', 'CONNMARK', 'CT'):
+            raise NetworkError('unsupported opaque iptables-nft mark or conntrack expression')
         return used, zones
     if 'mangle' in value and value['mangle'].get('key') == mark:
         output = value['mangle']['value']
@@ -727,6 +769,12 @@ class Network:
         return self.receipt
 
     def health(self):
+        try:
+            return self._health()
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            raise NetworkError('live network inventory contains unsupported values') from None
+
+    def _health(self):
         if self.receipt is None or not self.receipt.resources:
             return Health((), (), ('unrecorded acquisition',) if self.uncertain else ())
         own.validate_receipt(self.receipt, boot_id=self.boot_id, attempt_id=self.receipt.attempt_id)
@@ -811,9 +859,51 @@ class Network:
             raise NetworkError('repaired network did not survive final ownership verification')
         return self.receipt
 
+    def _flush_zone(self):
+        a = self.allocation
+        try:
+            self._run('conntrack', '-D', '--zone', str(a.zone))
+        except NetworkError:
+            # conntrack may report failure when no matching entries exist.
+            # A successful empty scoped readback is required, never assume.
+            if self._run('conntrack', '-L', '--zone', str(a.zone), '-o', 'extended').strip():
+                raise NetworkError('owned conntrack zone cleanup is incomplete') from None
+        if self._run('conntrack', '-L', '--zone', str(a.zone), '-o', 'extended').strip():
+            raise NetworkError('owned conntrack zone still contains flows after cleanup')
+
+    def _sweep_private(self, attempt_id):
+        """Remove a private configuration orphaned by a crash before its scoped removal."""
+        name = 'wgps-' + attempt_id
+        try:
+            root = own.open_private_dir(self.wireguard_root, owner_uid=self.owner_uid)
+            try:
+                try:
+                    os.stat(name, dir_fd=root, follow_symlinks=False)
+                except FileNotFoundError:
+                    return
+                directory = own.open_private_dir(self.wireguard_root / name, owner_uid=self.owner_uid)
+                try:
+                    try:
+                        os.unlink('wg.conf', dir_fd=directory)
+                    except FileNotFoundError:
+                        pass
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+                os.rmdir(name, dir_fd=root)
+                os.fsync(root)
+            finally:
+                os.close(root)
+        except (own.OwnershipError, OSError):
+            raise NetworkError('orphaned private configuration could not be verified and removed') from None
+
     def _remove(self, resource):
         live = self._observe(resource, self._snapshot())
         if live is None:
+            if resource.kind == 'conntrack_zone':
+                # The owned table is already gone (for example a foreign ruleset
+                # flush); stale zone flows are still ours to remove by number.
+                self._flush_zone()
             self._forget(resource)
             return
         own.verify_resource(self.receipt, resource.kind, resource.name, live,
@@ -844,22 +934,13 @@ class Network:
         elif kind == 'nft_table':
             self._run('nft', 'delete', 'table', 'inet', a.nft_table)
         elif kind == 'conntrack_zone':
-            try:
-                self._run('conntrack', '-D', '--zone', str(a.zone))
-            except NetworkError:
-                # conntrack may report failure when no matching entries exist.
-                # A successful empty scoped readback is required, never assume.
-                if self._run('conntrack', '-L', '--zone', str(a.zone), '-o', 'extended').strip():
-                    raise NetworkError('owned conntrack zone cleanup is incomplete') from None
+            self._flush_zone()
         elif kind == 'sysctl':
             # Per-interface setting dies with the verified owned interface.
             raise NetworkError('owned interface must be removed before forgetting its sysctl')
         else:
             raise NetworkError('resource is outside the network cleanup scope')
-        if kind == 'conntrack_zone':
-            if self._run('conntrack', '-L', '--zone', str(a.zone), '-o', 'extended').strip():
-                raise NetworkError('owned conntrack zone still contains flows after cleanup')
-        elif self._observe(resource, self._snapshot()) is not None:
+        if kind != 'conntrack_zone' and self._observe(resource, self._snapshot()) is not None:
             raise NetworkError('resource remains after its scoped deletion; retain ownership receipt')
         self._forget(resource)
 
@@ -873,7 +954,12 @@ class Network:
         if not self.receipt.resources:
             return self.receipt
         health = self.health()
-        if health.changed or 'conntrack_zone:vpn' in health.missing:
+        # A missing zone binding is only acceptable together with its whole owned
+        # table (for example after a foreign ruleset flush): the flows are then
+        # removed by zone number. A missing binding under a present table is an
+        # ambiguous replacement and stays for inspection.
+        table_missing = 'nft_table:' + self.allocation.nft_table in health.missing
+        if health.changed or ('conntrack_zone:vpn' in health.missing and not table_missing):
             raise NetworkError('cleanup ownership is incomplete; retain guard and inspect live resources')
         # All identities are checked before the first deletion, then individually
         # again. Keep nft drop rules/zone binding until WG and its flows are gone.
@@ -885,8 +971,5 @@ class Network:
             resource = next((r for r in self.receipt.resources if (r.kind, r.name) == key), None)
             if resource is not None:
                 self._remove(resource)
+        self._sweep_private(self.receipt.attempt_id)
         return self.receipt
-
-    def rollback_partial(self, *, guard_blocked):
-        """Explicit caller decision; same identity gates and scope as disable."""
-        return self.disable(guard_blocked=guard_blocked)

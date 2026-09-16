@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Measurement analysis must preserve noise, pair rounds, and reject errors."""
 import unittest
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Same-CPU scratch regression; no VM, attachment or scheduler changes on import.
 
 --native checks the ordinary unmarked client. --vm uses a FIFO periodic client

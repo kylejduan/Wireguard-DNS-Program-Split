@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Real probe I/O: pacing must not depend on replies, and errors stay visible."""
 from errno import ECANCELED, ECONNREFUSED, ENOBUFS, EPROTO, ETIMEDOUT
 import json

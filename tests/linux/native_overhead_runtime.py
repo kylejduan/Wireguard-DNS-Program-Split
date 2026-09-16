@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Owned local topology and installed singleton lifecycle; no VM orchestration."""
 import contextlib
 import fcntl

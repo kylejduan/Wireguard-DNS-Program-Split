@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- Add the experimental Linux include mode: a BPF LSM classifier marks new IPv4 sockets of enrolled executable paths, kernel policy routing and nftables send them and their ordinary DNS through WireGuard, and unlisted programs keep host routing and DNS. See [docs/linux.md](docs/linux.md).
+- Add the experimental Linux include mode: a BPF LSM classifier marks new IPv4 sockets of enrolled executable paths, kernel policy routing and nftables send them and their ordinary DNS through WireGuard, and unlisted programs keep host routing and DNS. See [docs/linux.md](docs/linux.md). Updating from policy ABI 2 requires an explicit disable/uninstall with the old CLI before installing ABI 3 artifacts.
+- Add a Linux CI job for the unprivileged suite, a manual privileged disposable-VM job, and the guarded native overhead measurement harness.
+- Harden the Linux loader and controller: guard loading tolerates cgroups that vanish mid-walk, verifies the BPF object inventory before pinning, publishes pins by atomic rename from a staging directory, never fails on user-writable runtime-directory content, and lets libbpf own the verifier log; the controller recovers pending edits from its health loop, survives transient errors, retries the DNS probe, observes the daemon's activation before competing for the lock, reports lock timeouts as such, resolves named routing tables, refuses opaque iptables-nft mark and conntrack extensions, delivers included traffic to all local host addresses, and completes an explicit disable after a foreign ruleset flush.
 - Record the reference-host end-to-end check: enrolled copies exit through the provider with provider DNS, unlisted programs keep the router path, and total included latency is set by the provider endpoint distance and DNS cache bypass, not by the classifier.
 - Replace the delayed startup controller task with an automatic, restartable Windows service.
 - Wait for physical-route readiness without repair backoff and tolerate a tunnel-service `StartPending` race.

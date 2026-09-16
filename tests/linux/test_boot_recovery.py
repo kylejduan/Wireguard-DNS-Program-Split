@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Local disk recovery checks; systemd/network operations are replaced, never run."""
 from contextlib import ExitStack
 import io

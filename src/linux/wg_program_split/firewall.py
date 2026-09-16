@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Owned kernel DNS translation and egress rules; never edit host DNS."""
 from dataclasses import dataclass
 from ipaddress import IPv4Address
@@ -31,7 +32,7 @@ class Firewall:
         selected = f'meta mark & {self.mask:#x} == {self.mark:#x}'
         return f'''table inet {self.table} {{
  chain vpn_zone_output {{ type filter hook output priority raw; policy accept;
-  meta nfproto ipv4 {selected} ip daddr != 127.0.0.0/8 ct zone set {self.zone}
+  meta nfproto ipv4 {selected} fib daddr type != local ct zone set {self.zone}
   meta nfproto ipv4 {selected} udp dport 53 ct zone set {self.zone}
   meta nfproto ipv4 {selected} tcp dport 53 ct zone set {self.zone}
  }}
@@ -48,7 +49,7 @@ class Firewall:
  chain egress {{ type filter hook postrouting priority filter; policy accept;
   meta nfproto ipv6 {selected} counter drop
   {selected} oifname "{self.interface}" accept
-  {selected} oifname "lo" ip daddr 127.0.0.0/8 accept
+  {selected} oifname "lo" fib daddr type local accept
   {selected} counter drop
  }}
  chain loopback_input {{ type filter hook input priority filter; policy accept;

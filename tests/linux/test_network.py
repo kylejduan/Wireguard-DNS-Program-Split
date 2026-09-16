@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Network adapter contract tests; an argv-aware kernel fixture performs no I/O."""
 import base64
 from dataclasses import replace
@@ -466,7 +467,7 @@ class NetworkTests(unittest.TestCase):
         self.assertFalse(self.net.health().ready)
         self.assertTrue(self.kernel.nft['nftables'])
         self.kernel.fail_prefix = None
-        self.net.rollback_partial(guard_blocked=True)
+        self.net.disable(guard_blocked=True)
         self.assertEqual(self.net.receipt.resources, ())
         self.assertEqual(list(self.wireguard.iterdir()), [])
 
@@ -502,7 +503,7 @@ class NetworkTests(unittest.TestCase):
         self.assertIn('private_file:configuration', health.changed)
         self.assertIn('nft_table:wg_program_split', health.changed)
         with self.assertRaises(network.NetworkError):
-            self.net.rollback_partial(guard_blocked=True)
+            self.net.disable(guard_blocked=True)
         self.assertTrue(config.is_symlink())
 
     def test_failed_receipt_publication_retains_uncertain_acquisition(self):
@@ -519,7 +520,7 @@ class NetworkTests(unittest.TestCase):
                 self.net.prepare(guard_blocked=True)
         self.assertTrue(any(r.get('type') == 'unreachable' for r in self.kernel.routes))
         with self.assertRaises(network.NetworkError):
-            self.net.rollback_partial(guard_blocked=True)
+            self.net.disable(guard_blocked=True)
         self.assertFalse(any('delete' in c for c in self.kernel.calls))
 
     def test_same_boot_recovery_compares_live_state_and_foreign_boot_is_rejected(self):

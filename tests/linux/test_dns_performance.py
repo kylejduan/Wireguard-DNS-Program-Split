@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Disposable VM measurements; results are observations, never an automatic SLO pass."""
 import json
 import os

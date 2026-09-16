@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """NO_HZ accounting uses timed idle, with explicit capacity and scope bounds."""
 import copy
 import gzip

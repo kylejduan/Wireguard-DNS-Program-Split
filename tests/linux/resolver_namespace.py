@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Private-mount supervisor for actual distro nscd and Avahi test processes."""
 import json
 import os

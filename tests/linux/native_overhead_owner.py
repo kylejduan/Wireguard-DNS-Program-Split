@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Explicit native admission and identity-bound, persistent fixture ownership."""
 import contextlib
 import fcntl
@@ -157,8 +158,8 @@ def validate_manifest(manifest):
         raise ValueError('root host/protection review attestation required')
     if str(root).startswith('/home/tv/') and manifest.get('native_account_verified') != 'tv@TV':
         raise ValueError('root must verify native tv@TV before writes below /home/tv')
-    if manifest['builds']['baseline']['revision'] != '00b3efd':
-        raise ValueError('baseline must be the validated 00b3efd build')
+    if manifest['builds']['baseline']['revision'] != 'c6af621':
+        raise ValueError('baseline must be the validated c6af621 build')
     for arm in ('baseline', 'candidate'):
         build = manifest['builds'][arm]
         directory = Path(build['directory'])

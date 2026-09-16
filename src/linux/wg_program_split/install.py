@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Install reviewed build artifacts; preserve configurations and modified files."""
 import hashlib
 import json

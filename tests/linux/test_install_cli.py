@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 import base64
 import contextlib
 import io
@@ -147,6 +148,22 @@ class InstallTests(unittest.TestCase):
             controller.return_value.activate.assert_not_called()
             controller.return_value.guard.assert_called_once()
             self.assertEqual(service.call_args_list[-1], mock.call('stop'))
+
+    def test_activate_observes_daemon_activation_before_competing_for_the_lock(self):
+        from wg_program_split import cli
+        with mock.patch('wg_program_split.controller.Controller') as controller, \
+                mock.patch.object(cli, '_service_units'), mock.patch.object(cli, '_services'), \
+                mock.patch.object(cli.time, 'sleep'):
+            controller.return_value.peek_state.side_effect = ['inactive', 'preparing', 'ready']
+            controller.return_value.status.return_value = {'state': 'ready'}
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(cli.main(['activate']), 0)
+            controller.return_value.activate.assert_not_called()
+            self.assertEqual(json.loads(output.getvalue())['state'], 'ready')
+            controller.return_value.peek_state.side_effect = ['loading', 'degraded']
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(['activate']), 0)
+            controller.return_value.activate.assert_called_once()
 
     def test_failure_during_copy_rolls_back_only_our_acquisitions(self):
         import wg_program_split.install as module

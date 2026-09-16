@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 param([switch] $SelfTest, [long] $StopEventHandle)
 
 $ErrorActionPreference = 'Stop'

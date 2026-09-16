@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Owned IPv6 setup must settle before strict fixture snapshots start."""
 import json
 from types import SimpleNamespace

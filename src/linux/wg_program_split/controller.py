@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Serialized lifecycle with pinned protection and a durable policy-edit journal.
 
 The controller owns controller.json; Network exclusively owns receipt.json.
@@ -348,6 +349,20 @@ class Controller:
                 'lineage_audit_complete': False, 'dns_last_checked': journal['probe_at'],
                 'reason': journal['reason']}
 
+    def peek_state(self):
+        """Unlocked journal read for progress observation only; never a status claim."""
+        try:
+            if not self.paths.state.exists():
+                return 'inactive'
+            fd = own.open_private_dir(self.paths.state, owner_uid=self.owner_uid)
+            try:
+                journal, _ = self._journal(fd)
+            finally:
+                os.close(fd)
+            return 'inactive' if journal is None else journal['state']
+        except (OSError, ValueError, RuntimeError):
+            return None
+
     def status(self):
         if not self.paths.state.exists():
             return {'state': 'inactive', 'protection_verified': False, 'restart_required': []}
@@ -377,6 +392,7 @@ class Controller:
             journal, identity = self._journal(state)
             if journal is None or journal['state'] in ('disabled', 'disabling'):
                 return {'state': 'inactive' if journal is None else journal['state'], 'protection_verified': False}
+            profile = None
             try:
                 self.host_check()
                 profile, digest, policy, _ = self._inputs(config)
@@ -387,17 +403,18 @@ class Controller:
                 _, identity = self._journal(state)
                 self._degrade(state, journal, identity)
                 protected = False
-                try:
-                    self._observed(journal)
-                    health = self._network(state, profile, journal).health()
-                    protected = health.ready and not health.changed and not health.missing
-                except (OSError, ValueError, RuntimeError, UnboundLocalError):
-                    pass
+                if profile is not None:
+                    try:
+                        self._observed(journal)
+                        health = self._network(state, profile, journal).health()
+                        protected = health.ready and not health.changed and not health.missing
+                    except (OSError, ValueError, RuntimeError):
+                        pass
                 return self._result(journal, protection=protected)
 
     def _edit(self, action, path):
-        try:
-            with self._locked() as (state, config):
+        with self._locked() as (state, config):
+            try:
                 previous, identity = self._journal(state)
                 was_ready = previous is not None and previous['state'] == 'ready'
                 if (was_ready and previous['pending'] is None and
@@ -445,8 +462,8 @@ class Controller:
                     _, identity = self._journal(state)
                     self._degrade(state, journal, identity)
                     raise
-        except (OSError, ValueError, RuntimeError):
-            raise ControllerError('policy edit is blocked; its durable intent is retained for recovery') from None
+            except (OSError, ValueError, RuntimeError):
+                raise ControllerError('policy edit is blocked; its durable intent is retained for recovery') from None
 
     def include_list(self):
         directory = own.open_private_dir(self.paths.config, owner_uid=self.owner_uid)
@@ -538,7 +555,14 @@ class Controller:
                 if checked not in ('ready', 'disabled', 'disabling'):
                     self.activate()
             while not event.wait(interval):
-                self.check()
+                try:
+                    if self.check().get('state') == 'degraded':
+                        # A pending edit or interrupted preparation needs the
+                        # guarded recovery only activation performs; a plain
+                        # check would leave the host blocked until a command.
+                        self.activate()
+                except (OSError, ValueError, RuntimeError):
+                    pass  # Blocked protection is retained; the next interval retries.
         finally:
             for signum, handler in old.items():
                 signal.signal(signum, handler)

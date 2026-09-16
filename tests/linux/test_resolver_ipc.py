@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Disposable-VM resolver-object proof; subprocess clients use identical Python bytes."""
 import argparse
 import array

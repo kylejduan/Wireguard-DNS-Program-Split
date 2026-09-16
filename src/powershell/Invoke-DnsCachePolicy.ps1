@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 param(
     [ValidateSet('Enable', 'Disable', 'Status')]
     [string] $Action = 'Status'

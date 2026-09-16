@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Runtime safeguards: manifest-bound payloads, root-controlled staging, route proof,
 bidirectional host snapshots and narrowly resolved spawn intents.
 
@@ -289,7 +290,7 @@ class StagingTests(unittest.TestCase):
         for arm in ('baseline', 'candidate'):
             directory = root / arm; directory.mkdir(mode=0o700)
             for name in NAMES: (directory / name).write_bytes(arm.encode() + name.encode()); (directory / name).chmod(0o644)
-            builds[arm] = {'directory': str(directory), 'revision': '00b3efd' if arm == 'baseline' else 'candidate',
+            builds[arm] = {'directory': str(directory), 'revision': 'c6af621' if arm == 'baseline' else 'candidate',
                            'sha256': {name: own.digest(directory / name) for name in NAMES}}
         probe = root / 'probe'; probe.write_bytes(b'probe'); probe.chmod(0o755)
         return {'schema': 1, 'run_id': run_id, 'names': own.names(run_id), 'evidence': str(root / 'evidence'),

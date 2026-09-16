@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Explicit disposable-VM acceptance for the real network ownership adapter."""
 from dataclasses import replace
 import json

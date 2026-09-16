@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Unprivileged boundaries for native ownership and CPU measurement."""
 import copy
 import importlib.util

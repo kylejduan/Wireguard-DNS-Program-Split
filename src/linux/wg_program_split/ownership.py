@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Private state files, exclusive acquisition, and durable ownership receipts.
 
 Receipts are evidence of an attempt, not proof of effective network ownership.
@@ -17,11 +18,7 @@ import time
 import uuid
 
 
-CONFIG_ROOT = Path('/etc/wg-program-split')
 STATE_ROOT = Path('/run/wg-program-split')
-# A later wg adapter must create exclusive transient key/config files here:
-# the target AppArmor policy disallows the attempted stdin configuration path.
-WIREGUARD_PRIVATE_ROOT = Path('/etc/wireguard')
 _RECEIPT = 'receipt.json'
 _LOCK = '.lock'
 _MAX_RECEIPT = 1024 * 1024

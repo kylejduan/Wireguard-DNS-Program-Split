@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Lifecycle state transitions with real private files and simulated kernel state."""
 import base64
 import json

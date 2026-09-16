@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Native-host checks, private input reads, and observed readiness probes."""
 import json
 import os
@@ -149,13 +150,17 @@ class NativeGuard:
     def unload(self):
         self._run('remove', self.pins)
 
-    def probe_dns(self):
-        try:
-            result = json.loads(self._run('probe-dns', self.pins))
-            if not isinstance(result, dict) or set(result) != {'dns'} or result['dns'] is not True:
-                raise ValueError()
-        except (ValueError, TypeError):
-            raise ControllerError('native DNS readiness probe failed') from None
+    def probe_dns(self, *, attempts=3):
+        """One lost datagram is not an ownership failure; retry within the check."""
+        for attempt in range(attempts):
+            try:
+                result = json.loads(self._run('probe-dns', self.pins))
+                if not isinstance(result, dict) or set(result) != {'dns'} or result['dns'] is not True:
+                    raise ValueError()
+                return
+            except (ValueError, TypeError, ControllerError):
+                if attempt == attempts - 1:
+                    raise ControllerError('native DNS readiness probe failed') from None
 
 
 def process_snapshot():

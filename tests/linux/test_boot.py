@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Staged disposable-VM reboot proof. Never invokes reboot itself.
 
 Host captures each JSON manifest_sha256 and passes it to the next stage:

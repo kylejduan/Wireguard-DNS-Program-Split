@@ -1,9 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Include-only command line; installed entrypoint runs in Python isolated mode."""
 import argparse
 import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 from .config import parse_profile, parse_settings
 from .install import install, uninstall, verify_units
@@ -27,6 +29,19 @@ def _services(*operation):
     units = _service_units()
     subprocess.run(['/usr/bin/systemctl', *operation, *units], check=True, timeout=60,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=SERVICE_ENV)
+
+
+def _await_activation(controller, *, attempts=60, delay=1.0):
+    """The started daemon activates under the state lock. Observe its outcome
+    instead of competing for the lock; activate directly only if it did not."""
+    for _ in range(attempts):
+        state = controller.peek_state()
+        if state == 'ready':
+            return
+        if state in ('degraded', 'disabled', 'disabling'):
+            break
+        time.sleep(delay)
+    controller.activate()
 
 
 def _parser():
@@ -88,7 +103,7 @@ def main(argv=None):
                 _service_units()
                 try:
                     _services('enable', '--now')
-                    result = controller.activate()
+                    _await_activation(controller)
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
                     try:
                         _services('stop')

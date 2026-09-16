@@ -6,6 +6,7 @@
 #include <linux/magic.h>
 #include <linux/nsfs.h>
 #include <sys/ioctl.h>
+#include <dirent.h>
 #include <elf.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -103,7 +104,7 @@ void require_mutation_host() {
     struct utsname name{};
     check(uname(&name)==0,"uname");
     std::string release=name.release;
-    if (release.rfind("7.0.",0)!=0 || release.find("microsoft")!=std::string::npos)
+    if ((release.rfind("7.0.",0)!=0 && release.rfind("7.0-",0)!=0) || release.find("microsoft")!=std::string::npos)
         fail("mutations require supported native Ubuntu 26.04 / kernel 7.0");
     std::istringstream lines(read_text("/etc/os-release"));
     std::string line,id,version;
@@ -141,17 +142,21 @@ PathKey path_key(const std::string &input, bool adding) {
      * not lexical normalization. Deletion names the stored policy key exactly and
      * must keep working after the old file becomes a symlink or disappears. */
     fs::path path = adding ? fs::canonical(input) : fs::path(input);
-    if (!adding && path.lexically_normal().string() != input)
-        fail("stored policy requires the exact canonical key, without . or .. components");
+    if (!adding && (path.lexically_normal().string() != input || input == "/" || input.back() == '/'))
+        fail("stored policy requires the exact canonical key, without . or .. components or a trailing slash");
     auto text = path.string();
     if (text.size() >= sizeof(PathKey)) fail("executable path exceeds ABI pathname capacity");
     if (adding) {
-        Fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC));
+        /* Inspect the type before opening for read: a FIFO or device at the path
+         * must not block or be opened; only a regular executable is read. */
+        Fd probe(open(path.c_str(), O_PATH | O_CLOEXEC));
         struct stat st{};
-        check(fstat(fd.value, &st) == 0, "fstat executable");
+        check(fstat(probe.value, &st) == 0, "fstat executable");
+        if (!S_ISREG(st.st_mode) || !(st.st_mode & 0111))
+            fail("unsupported enrollment: requires a native executable ELF file; scripts need their interpreter path");
+        Fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY));
         Elf64_Ehdr header{};
-        if (!S_ISREG(st.st_mode) || !(st.st_mode & 0111) ||
-            read(fd.value, &header, sizeof(header)) != sizeof(header) ||
+        if (read(fd.value, &header, sizeof(header)) != sizeof(header) ||
             std::memcmp(header.e_ident, ELFMAG, SELFMAG) ||
             header.e_ident[EI_CLASS] != ELFCLASS64 ||
             header.e_ident[EI_DATA] != ELFDATA2LSB ||
@@ -263,13 +268,34 @@ void verify_owner(const fs::path &dir) {
     }
     if (owned!=used) fail("pinned map is not used by the owned link set");
 }
+/* Walk the cgroup tree with plain readdir so that a cgroup removed during the
+ * walk (systemd scopes churn constantly, most of all during early boot) is
+ * skipped rather than aborting the load. Every other error remains fatal. */
 void reject_competitors(const fs::path &group) {
-    Fd fd(open(group.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    int raw = open(group.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (raw < 0 && errno == ENOENT) return;
+    Fd fd(raw);
     uint32_t count = 0;
     int rc = bpf_prog_query(fd.value, BPF_LSM_CGROUP, BPF_F_QUERY_EFFECTIVE,
                             nullptr, nullptr, &count);
     if (rc && errno != ENOSPC) fail("cannot query effective cgroup LSM attachments: " + std::string(strerror(errno)));
     if (count) fail("competing cgroup LSM attachments can override denial: " + group.string());
+    DIR *listing = opendir(group.c_str());
+    if (!listing) {
+        if (errno == ENOENT) return;
+        check(false, "list cgroup " + group.string());
+    }
+    std::vector<std::string> children;
+    while (dirent *entry = readdir(listing)) {
+        std::string name = entry->d_name;
+        if (name == "." || name == ".." || (entry->d_type != DT_DIR && entry->d_type != DT_UNKNOWN)) continue;
+        struct stat st{};
+        if (entry->d_type == DT_UNKNOWN && (fstatat(dirfd(listing), name.c_str(), &st, AT_SYMLINK_NOFOLLOW) || !S_ISDIR(st.st_mode)))
+            continue;
+        children.push_back(name);
+    }
+    closedir(listing);
+    for (const auto &child : children) reject_competitors(group / child);
 }
 object_id identity(const struct stat &st) {
     return {(static_cast<uint64_t>(major(st.st_dev))<<20)|minor(st.st_dev),st.st_ino};
@@ -326,6 +352,29 @@ GuardMaps guard_maps(bpf_object *object) {
         bpf_object__find_map_fd_by_name(object,"endpoint_names"),
         bpf_object__find_map_fd_by_name(object,"object_roles")};
 }
+/* A user's runtime directory is user-writable. Never resolve symlinks there,
+ * enroll only the exact expected spelling, and never fail on user content:
+ * an unprivileged user must not be able to block guard loading or redirect
+ * a socket role by placing a symlink or an unrelated object at "bus". The
+ * BPF guard additionally recognizes "bus" under the user-root directory and
+ * at a tmpfs root, so this enrollment only adds the immutable bind address. */
+void guard_user_bus(GuardMaps fd,uint32_t netns,const fs::path &directory) {
+    fs::path path=directory/"bus";
+    auto spelling=path.string();
+    endpoint_name name{}; name.netns=netns; name.length=spelling.size()+1;
+    if (name.length>sizeof(name.name)) return;
+    memcpy(name.name,spelling.c_str(),name.length); merge_role(fd.names,&name,ROLE_SOCKET);
+    struct stat parent{};
+    if (lstat(directory.c_str(),&parent) || !S_ISDIR(parent.st_mode)) return;
+    guard_slot slot{}; slot.parent=identity(parent);
+    memcpy(slot.name,"bus",4); merge_role(fd.slots,&slot,ROLE_SOCKET);
+    struct stat st{};
+    if (lstat(path.c_str(),&st) || !S_ISSOCK(st.st_mode)) return;
+    int raw=open(path.c_str(),O_PATH|O_NOFOLLOW|O_CLOEXEC);
+    if (raw<0) return;
+    Fd file(raw);
+    merge_role(fd.roles,&file.value,ROLE_SOCKET);
+}
 void seed_guards(bpf_object *object,uint32_t netns) {
     auto fd=guard_maps(object);
     for (const char *path:{"/run/systemd/resolve/io.systemd.Resolve","/run/nscd/socket",
@@ -340,9 +389,11 @@ void seed_guards(bpf_object *object,uint32_t netns) {
         guard_slot_add(fd,netns,"user-bus-dir","/run/user");
         for (const auto &entry:fs::directory_iterator("/run/user")) {
             auto name=entry.path().filename().string();
-            if (name.empty() || name.find_first_not_of("0123456789")!=std::string::npos) continue;
-            if (entry.is_directory() && stat_path(entry.path()).st_uid==number(name))
-                guard_slot_add(fd,netns,"socket",entry.path()/"bus");
+            if (name.empty() || name.size()>10 || name.find_first_not_of("0123456789")!=std::string::npos) continue;
+            struct stat st{};
+            /* A session ending mid-walk simply disappears; it is not an error. */
+            if (lstat(entry.path().c_str(),&st) || !S_ISDIR(st.st_mode) || st.st_uid!=number(name)) continue;
+            guard_user_bus(fd,netns,entry.path());
         }
     }
     for (const char *path:{"/run/nscd","/var/cache/nscd","/var/lib/nscd"}) {
@@ -350,7 +401,8 @@ void seed_guards(bpf_object *object,uint32_t netns) {
         guard_slot_add(fd,netns,"cache-dir",path);
         for (const auto &entry:fs::directory_iterator(path)) {
             auto name=entry.path().filename().string();
-            if (entry.is_regular_file() && (name=="hosts" || (name.size()==8 && name.substr(0,2)=="db")))
+            std::error_code ec;
+            if (entry.is_regular_file(ec) && (name=="hosts" || (name.size()==8 && name.substr(0,2)=="db")))
                 guard_slot_add(fd,netns,"cache",entry.path());
         }
     }
@@ -369,6 +421,16 @@ void ready_preflight() {
     if (hosts!="files dns" && hosts!="files mdns4_minimal [NOTFOUND=return] dns")
         fail("unsupported hosts NSS configuration; ready accepts files dns or files mdns4_minimal [NOTFOUND=return] dns only");
 }
+/* Remove a staging pin directory and everything this loader could have pinned
+ * there; unpinning the last reference to a link detaches its program. Only a
+ * leftover foreign entry keeps the directory, which is then reported. */
+void discard_staging(const fs::path &staging) {
+    std::error_code ec;
+    if (!fs::exists(staging, ec)) return;
+    for (const auto &spec:links) fs::remove(staging/spec.pin, ec);
+    for (const auto &spec:maps) fs::remove(staging/spec.name, ec);
+    if (!fs::remove(staging, ec)) fail("stale staging pin directory could not be removed: " + staging.string());
+}
 void load(int argc, char **argv) {
     if (argc < 7) fail("load OBJECT PIN_DIR CGROUP MASK MARK [PATH...]");
     bool bulk = std::string(argv[1]) == "load-policy-stdin";
@@ -383,53 +445,60 @@ void load(int argc, char **argv) {
     check(statfs(group.c_str(), &cgfs) == 0 && cgfs.f_type == CGROUP2_SUPER_MAGIC,
           "CGROUP must be cgroup v2");
     reject_competitors(group);
-    for (const auto &entry : fs::recursive_directory_iterator(group))
-        if (entry.is_directory()) reject_competitors(entry.path());
     auto root = stat_path("/");
     Configuration cfg{abi, 0, number(argv[5]), number(argv[6]),
         (static_cast<uint64_t>(major(root.st_dev)) << 20) | minor(root.st_dev),
         root.st_ino, static_cast<uint32_t>(stat_path("/proc/self/ns/net").st_ino),
         static_cast<uint32_t>(stat_path("/proc/self/ns/user").st_ino)};
     if (!cfg.mask || !cfg.mark || (cfg.mark & ~cfg.mask)) fail("MARK must be nonzero and contained in MASK");
-    std::vector<char> log(4 * 1024 * 1024);
-    bpf_object_open_opts opts{};
-    opts.sz = sizeof(opts);
-    opts.kernel_log_buf = log.data();
-    opts.kernel_log_size = log.size();
-    opts.kernel_log_level = 1;
+    if (fs::exists(dir)) fail("pin directory already exists; existing pins are never adopted");
+    /* libbpf owns the verifier log buffer: it retries with a larger buffer on
+     * ENOSPC and prints the log on failure, so a chattier verifier cannot turn
+     * a valid load into a spurious rejection. */
     std::unique_ptr<bpf_object, decltype(&bpf_object__close)> object(
-        bpf_object__open_file(argv[2], &opts), bpf_object__close);
+        bpf_object__open_file(argv[2], nullptr), bpf_object__close);
     if (!object) fail("open BPF object failed");
+    std::set<std::string> expected_maps, expected_programs, found_maps, found_programs;
+    for (const auto &spec:maps) expected_maps.insert(spec.name);
+    for (const auto &spec:links) expected_programs.insert(spec.program);
+    bpf_map *map;
+    bpf_object__for_each_map(map, object.get()) found_maps.insert(bpf_map__name(map));
+    bpf_program *program;
+    bpf_object__for_each_program(program, object.get()) found_programs.insert(bpf_program__name(program));
+    if (found_maps != expected_maps || found_programs != expected_programs)
+        fail("BPF object inventory does not match this loader's map and program set");
     int rc = bpf_object__load(object.get());
-    std::cerr << log.data();
-    if (rc) fail("BPF verifier/load rejected classifier: " + std::to_string(rc));
+    if (rc) fail("BPF verifier/load rejected classifier: " + std::string(strerror(-rc)));
     int conf = bpf_object__find_map_fd_by_name(object.get(), "policy_cfg");
     uint32_t zero = 0;
     check(bpf_map_update_elem(conf, &zero, &cfg, BPF_ANY) == 0, "initialize blocked config");
     initialize_paths(object.get(),keys);
     seed_guards(object.get(),cfg.netns);
-    check(mkdir(dir.c_str(), 0700) == 0, "create exclusive pin directory");
-    std::vector<fs::path> pinned;
+    /* Pin into a staging directory and publish it with one rename, so a load
+     * killed midway (for example by the caller's timeout) never leaves a
+     * half-populated directory under the owned name. Stale staging from such
+     * a death is replaced here; its links keep protecting until then. */
+    fs::path staging = dir;
+    staging += ".new";
+    discard_staging(staging);
+    check(mkdir(staging.c_str(), 0700) == 0, "create exclusive staging pin directory");
     try {
-        for (const auto &spec:maps) {
-            auto path=dir/spec.name;
-            check(bpf_map__pin(bpf_object__find_map_by_name(object.get(),spec.name),path.c_str())==0,"pin map");
-            pinned.push_back(path);
-        }
+        for (const auto &spec:maps)
+            check(bpf_map__pin(bpf_object__find_map_by_name(object.get(),spec.name),(staging/spec.name).c_str())==0,"pin map");
         Fd cg(open(group.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC));
         for (const auto &spec:links) {
-            auto *program=bpf_object__find_program_by_name(object.get(),spec.program);
+            auto *target=bpf_object__find_program_by_name(object.get(),spec.program);
+            if (!target) fail("program missing from object: "+std::string(spec.program));
             std::unique_ptr<bpf_link,decltype(&bpf_link__destroy)> link(
-                spec.cgroup ? bpf_program__attach_cgroup(program,cg.value) : bpf_program__attach_lsm(program),
+                spec.cgroup ? bpf_program__attach_cgroup(target,cg.value) : bpf_program__attach_lsm(target),
                 bpf_link__destroy);
             if (!link) fail("attach failed: "+std::string(spec.hook)+": "+strerror(errno));
-            check(bpf_link__pin(link.get(),(dir/spec.pin).c_str())==0,"pin link");
-            pinned.push_back(dir/spec.pin);
+            check(bpf_link__pin(link.get(),(staging/spec.pin).c_str())==0,"pin link");
         }
-        verify_owner(dir);
+        verify_owner(staging);
+        check(rename(staging.c_str(), dir.c_str()) == 0, "publish pin directory");
     } catch (...) {
-        for (auto it = pinned.rbegin(); it != pinned.rend(); ++it) fs::remove(*it);
-        fs::remove(dir);
+        discard_staging(staging);
         throw;
     }
     std::cout << "abi=" << abi << " state=blocked links=pinned resolver_guards=active restart_audit=required\n";

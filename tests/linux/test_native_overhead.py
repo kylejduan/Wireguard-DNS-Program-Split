@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Guarded native local comparison. Root owns host preparation and provider cutover."""
 import argparse
 import contextlib

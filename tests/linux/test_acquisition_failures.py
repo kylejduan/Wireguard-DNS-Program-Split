@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Modeled errors around every prepare command/publication, not native SIGKILL.
 
 Real private files/receipts and the argv-aware network fixture are reused. An
@@ -115,7 +116,7 @@ class AcquisitionFailureTests(unittest.TestCase):
                              'private_file:configuration', 'sysctl:route_localnet', 'route:preferred'):
                 self.assertTrue(any(resource in publication for publication in publications), resource)
             case.net.runner = case.kernel
-            case.net.rollback_partial(guard_blocked=True)
+            case.net.disable(guard_blocked=True)
             self.assertEqual(state(case), baseline)
             return trace
 
@@ -150,14 +151,15 @@ class AcquisitionFailureTests(unittest.TestCase):
                     self.assertEqual(ownership.read_receipt(case.fd), case.net.receipt)
                     self.assertNotIn(fixtures.PRIVATE, receipt_path.read_text())
                 before_rollback = state(case)
-                if case.net.uncertain or health.changed or 'conntrack_zone:vpn' in health.missing:
+                table_missing = 'nft_table:wg_program_split' in health.missing
+                if case.net.uncertain or health.changed or ('conntrack_zone:vpn' in health.missing and not table_missing):
                     with self.assertRaises(network.NetworkError):
-                        case.net.rollback_partial(guard_blocked=True)
+                        case.net.disable(guard_blocked=True)
                     self.assertEqual(state(case), before_rollback)
                     retained.append(point)
                 else:
                     # Only an exact, unambiguous receipt may authorize cleanup.
-                    result = case.net.rollback_partial(guard_blocked=True)
+                    result = case.net.disable(guard_blocked=True)
                     self.assertFalse(result.resources)
                     self.assertEqual(state(case), baseline)
                     rolled_back.append(point)

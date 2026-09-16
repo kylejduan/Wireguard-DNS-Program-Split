@@ -1,8 +1,5 @@
 # Linux latency optimization and native-host activation
 
-> Execute with `superpowers:subagent-driven-development`; the user authorized
-> optimization, native-host activation and measurement with a separate test app.
-
 **Goal:** Reduce measured local latency and compute while preserving automatic
 executable-path selection, then activate and verify the native reference host.
 
@@ -29,8 +26,8 @@ and [performance baseline](../../linux-performance.md).
 - Treat sub-millisecond added p99 as a target, not a guaranteed worst-case bound.
 - Refresh host identity, protection/catalog state, services, boot parameters,
   management routes and resolver state before host changes. Preserve data and
-  unrelated units. The user authorized the previously described BPF boot and
-  old-VPN migration necessary for activation; prepare exact rollback first.
+  unrelated units. The BPF boot change and old-VPN migration are prerequisites
+  for activation; prepare exact rollback first.
 
 ## Task 1: Short exact-path tier
 

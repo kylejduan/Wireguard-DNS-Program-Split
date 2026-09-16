@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Runtime resolver sockets must not inherit the checkout's path length."""
 import json
 from pathlib import Path

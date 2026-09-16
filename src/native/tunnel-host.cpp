@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
 

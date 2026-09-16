@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Paired descriptive latency shifts; never infer Internet RTT or equivalence."""
 import itertools
 import math

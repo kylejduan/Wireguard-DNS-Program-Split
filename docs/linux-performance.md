@@ -25,7 +25,7 @@ throughout, with no restart.
 Total included latency on this host is set by the provider path, not by the
 classifier or firewall rules. The tunnel endpoint's direct ICMP round trip was
 147 ms (five samples, 0.25 ms spread). Five fresh HTTPS connections to a
-trading API host took about 0.89 s each when included and about 0.18 s when
+remote HTTPS API host took about 0.89 s each when included and about 0.18 s when
 unlisted:
 
 | Phase (`curl -w`, mean of five) | Included (ms) | Unlisted (ms) |

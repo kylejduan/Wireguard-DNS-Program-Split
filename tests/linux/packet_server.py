@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Controlled peer echo and DNS servers; no external names or upstream DNS."""
 import hashlib
 import json

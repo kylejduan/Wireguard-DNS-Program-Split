@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Owned disposable-VM WireGuard peer and controlled DNS responders."""
 import contextlib
 import shutil

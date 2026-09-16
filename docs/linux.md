@@ -12,7 +12,7 @@ The Windows implementation and its installation commands remain separate.
 | Ordinary UDP/TCP DNS on port 53 | Profile DNS through WireGuard | Existing resolver path |
 | Application-owned DoH/DoT/DoQ | Application's provider, over WireGuard | Application's existing behavior |
 | IPv6 and raw/packet sockets | Refused | Existing host behavior |
-| Ordinary IPv4 localhost traffic | Localhost | Localhost |
+| IPv4 traffic to the host's own addresses (loopback or local) | Delivered locally | Delivered locally |
 
 The program does not configure the router or verify its upstream Cloudflare DoH.
 Leaving host DNS unchanged preserves whatever router/resolver configuration is
@@ -46,7 +46,13 @@ IPC and shared nscd hosts-cache files. These guards also cover inherited/receive
 file descriptors, Unix stream `splice`, endpoint aliases and late standard
 endpoints. Ordinary IP sends and ordinary file operations do not repeat the
 guard's executable-path lookup. The controller checks health every five seconds;
-successful health checks do not briefly block new sockets.
+successful health checks do not briefly block new sockets. A failed check (an
+ownership mismatch, a lost handshake, or a DNS probe that fails three attempts)
+blocks new included sockets until the next passing check, at least five seconds
+later; established sockets continue. Foreign nftables mark or conntrack-zone
+expressions the inventory cannot classify, including opaque iptables-nft mark
+and conntrack extensions, block activation and degrade a running guard rather
+than being assumed disjoint.
 
 The optimized controller shares a coherent guard snapshot and reads the owned
 WireGuard interface once per network observation. Ordinary-file and IP resolver
@@ -162,7 +168,9 @@ sudo python3 -I build/linux/wg-program-split.pyz install --artifacts build/linux
 ```
 
 Installation copies a root-owned isolated Python application, native loader,
-BPF object and two service units. Private configuration lives in
+BPF object and two service units. Activation requires an existing root-owned
+`/etc/wireguard` directory with mode 0700 for its transient private
+configuration. Private configuration lives in
 `/etc/wg-program-split` with mode 0700 and files with mode 0600. Installation does
 not activate the VPN, alter kernel boot options or convert application services.
 It refuses to overwrite existing installation files. The current update path is
@@ -232,7 +240,12 @@ sudo wg-program-split uninstall
 ```
 
 Explicit disable stops/disables verified owned services and releases owned
-networking before removing BPF pins. Removal preserves private profile/settings.
+networking before removing BPF pins. It also completes after a foreign ruleset
+flush removed the whole owned nftables table, flushing the owned conntrack zone
+by number, and removes a private configuration directory orphaned by an
+interrupted preparation. A guard load interrupted midway leaves a staging
+directory named after the pin directory with a `.new` suffix; its links keep
+protecting, and the next load replaces it. Removal preserves private profile/settings.
 If an installed artifact was changed or replaced, uninstall defers artifact
 deletion and retains a runnable command for a later retry. It reports the retained
 paths; it does not overwrite or delete the replacement. Unproved runtime ownership

@@ -127,7 +127,7 @@ Remaining verification qualifications:
   run, correctness regression and fair-comparison method/results. The comparison
   baseline includes the same scratch correctness fix as the candidate; faulty
   classification cannot count as faster successful work. Only completed,
-  error-free measurements support numerical claims. The user's target is ideally less
+  error-free measurements support numerical claims. The target is ideally less
   than 1 ms of added **local p99** latency with minimal CPU/memory cost; this is
   neither zero overhead nor a total VPN/Internet round-trip guarantee. Target
   application deadline tails and compute under representative load remain

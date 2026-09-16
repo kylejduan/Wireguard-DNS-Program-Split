@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Native /proc accounting with explicit read skew, hotplug and drain validity."""
 import gzip
 import hashlib

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Strict configuration and real filesystem ownership boundaries; no network I/O."""
 import base64
 from dataclasses import FrozenInstanceError, asdict, replace

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Persistent payload and large-DNS proof; privileged work requires --vm."""
 import json
 import hashlib

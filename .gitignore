@@ -16,3 +16,4 @@ __pycache__/
 *.pyz
 *.o
 .pytest_cache/
+/config/linux-settings.json

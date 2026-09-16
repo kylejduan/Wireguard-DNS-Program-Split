@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Real distro resolver integration; privileged work requires explicit --vm."""
 from contextlib import contextmanager
 import json

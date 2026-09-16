@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Strict profile/policy parsing without executing configuration or executables."""
 from base64 import b64decode, b64encode
 from dataclasses import dataclass, field

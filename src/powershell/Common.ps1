@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 Set-StrictMode -Version Latest
 
 function Assert-ProgramSplit64BitPowerShell {

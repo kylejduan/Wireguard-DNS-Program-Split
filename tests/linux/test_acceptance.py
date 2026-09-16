@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Installed CLI/systemd acceptance; runs only in the marked disposable VM."""
 import argparse
 import fcntl

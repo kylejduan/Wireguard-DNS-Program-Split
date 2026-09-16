@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Runner fixture-cgroup, NO_HZ readback, acceptance, lifecycle, stop and recovery contracts.
 
 Real child processes stand in for peers and clients; host CPU samples, the

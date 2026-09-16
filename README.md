@@ -1,8 +1,8 @@
 # WireGuard DNS Program Split
 
-Windows 11 tooling that sends selected executables' IPv4 TCP, UDP, and ordinary Windows DNS through a WireGuard profile while leaving every unlisted application's payload and DNS on the normal Windows/router path.
+Per-executable WireGuard split tunneling with split DNS. Selected executables' IPv4 TCP, UDP, and ordinary DNS go through a WireGuard profile; every unlisted application keeps its payload and DNS on the normal host/router path. There is a Windows 11 implementation (WFP) and an experimental Linux implementation (BPF LSM and nftables, see [Linux include mode](#linux-include-mode)). Neither uses a userspace packet proxy or launcher.
 
-> **Experimental:** this is a source release for advanced Windows users. It installs privileged networking components, currently supports IPv4 only, and has explicit fail-open cases. Read [Limitations](docs/limitations.md) before using it.
+> **Experimental:** this is a source release for advanced users. It installs privileged networking components, currently supports IPv4 only, and the Windows implementation has explicit fail-open cases. Read [Limitations](docs/limitations.md) and the [Linux operating limits](docs/linux.md) before using it.
 
 ## What is different
 
@@ -14,7 +14,7 @@ Windows 11 tooling that sends selected executables' IPv4 TCP, UDP, and ordinary 
 
 There is no universal TUN in the direct data path. A high-metric WireGuard route and Windows Filtering Platform (WFP) binding redirect only listed executable paths. This avoids imposing user-mode packet-proxy overhead on unlisted multi-gigabit traffic.
 
-## Requirements
+## Windows requirements
 
 - Windows 11 x64 and an administrator account.
 - One IPv4 WireGuard `.conf` containing exactly one interface `Address`, one `DNS`, and one peer. Proton users generate this from the Proton account website; the desktop client does not export it.
@@ -25,7 +25,7 @@ There is no universal TUN in the direct data path. A high-metric WireGuard route
 Third-party binaries, profiles, keys, machine settings, and build output are intentionally not distributed here.
 The provider desktop app is not a runtime dependency after its profile and compatible runtime files have been supplied. This project does not connect to PIA; it uses only the signed local callout driver.
 
-## Quick start
+## Windows quick start
 
 From WSL:
 
@@ -68,9 +68,23 @@ See [Installation](docs/installation.md), [Architecture](docs/architecture.md), 
 
 The experimental [Linux implementation](docs/linux.md) automatically selects native executable paths at socket creation. Included IPv4 TCP/UDP uses kernel WireGuard, ordinary included DNS uses the profile resolver through that tunnel, and unlisted programs retain host routing and DNS. No launcher or packet proxy is required. Linux supports include mode only.
 
+Build, validate and install on the supported host, then enroll executables and activate:
+
+```sh
+./scripts/build-linux.sh
+./tests/run-linux.sh
+python3 -I build/linux/wg-program-split.pyz validate --profile /path/to/provider.conf --settings config/linux-settings.example.json
+sudo python3 -I build/linux/wg-program-split.pyz install --artifacts build/linux --profile /path/to/provider.conf --settings config/linux-settings.example.json
+sudo wg-program-split include add /absolute/path/to/native-program
+sudo wg-program-split activate
+sudo wg-program-split check
+```
+
 The tested kernel target is native Ubuntu 26.04 with Linux 7.0 and active BPF LSM. Read the [Linux operating limits](docs/linux.md) and [migration procedure](docs/linux-migration.md), especially existing sockets/cache mappings, early boot, helpers and application-owned encrypted DNS. The native reference host is activated and verified with independent applications. Its final native [serial](docs/linux-performance.md#final-native-serial-results--september-14-2026) and [stream](docs/linux-performance.md#final-native-stream-results--september-14-2026) measurements kept the estimated added p99 overhead below 1 ms in controlled local comparisons, with valid whole-host CPU accounting. That is added local overhead, not total, WAN or worst-case latency, and actual bot deadlines remain application-specific. Existing sockets are not reclassified. See the [performance report](docs/linux-performance.md) for results, earlier historical runs and measurement limits.
 
 Bot agents can manage their own entries using the [application enrollment workflow](docs/linux-agents.md). It covers native programs, Python, Node, Java, .NET and shell applications through their actual runtime/helper executables, with guidance for dedicated runtimes and shared interpreters.
+
+Design history: [Windows design](docs/design.md), [Linux include-mode design](docs/superpowers/specs/2026-09-12-linux-include-mode-design.md) and its [implementation](docs/superpowers/plans/2026-09-12-linux-include-mode.md) and [optimization](docs/superpowers/plans/2026-09-14-linux-latency-and-activation.md) plans.
 
 Contributions are welcome under [GPL-3.0-or-later](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
