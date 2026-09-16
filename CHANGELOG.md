@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Windows dispatcher: reuse the route of a name and type answered within the previous three seconds when a repeated query carries no new DNS Client attribution event, instead of answering `SERVFAIL`. Retransmissions and TCP fallback by the Windows DNS Client no longer fail; never-attributed queries still do.
 - Add the experimental Linux include mode: a BPF LSM classifier marks new IPv4 sockets of enrolled executable paths, kernel policy routing and nftables send them and their ordinary DNS through WireGuard, and unlisted programs keep host routing and DNS. See [docs/linux.md](docs/linux.md). Updating from policy ABI 2 requires an explicit disable/uninstall with the old CLI before installing ABI 3 artifacts.
 - Add a Linux CI job for the unprivileged suite, a manual privileged disposable-VM job, and the guarded native overhead measurement harness.
 - Fix Linux guard semantics: label Unix streams again on first use after a generation change instead of re-resolving every message and refusing an included process's unrelated streams; classify tasks in private user namespaces normally; refuse only enrolled unlinked images so unlisted processes keep socket creation after a package upgrade replaces their binary; identify filesystems by the kernel's superblock device (btrfs subvolume roots) and verify the classification context at load time; match `nscd` cache parents and 63-byte slot names exactly.

@@ -56,7 +56,7 @@ See [Installation](docs/installation.md), [Architecture](docs/architecture.md), 
 
 - The imported profile is copied locally with locked ACLs and never printed by the scripts.
 - The physical default route remains globally preferred.
-- DNS without a process-attribution event returns `SERVFAIL`; it is not guessed onto either resolver.
+- DNS without a process-attribution event returns `SERVFAIL`; it is not guessed onto either resolver. The one exception is a repeat of a name and type answered within the previous three seconds, which reuses that answer's route so Windows DNS Client retransmissions and TCP fallback succeed.
 - Dynamic WFP filters vanish if their host exits. The controller repairs them, but this release is not a persistent per-application kill switch.
 - Existing connections must be closed and reopened after changing the included-app list.
 

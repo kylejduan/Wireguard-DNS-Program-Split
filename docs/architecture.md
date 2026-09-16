@@ -32,7 +32,7 @@ Because unlisted payload does not traverse a universal TUN or user-mode packet e
 
 Windows commonly performs application DNS through the shared DNS Client service. The dispatcher therefore cannot classify the loopback packet's owner. It pairs the query with the DNS Client ETW event, whose process ID identifies the originating executable.
 
-Attribution waits up to 500 ms. A selected hint chooses tunnel DNS; an attributed unlisted query chooses physical DNS. Missing or inaccessible attribution is blocked with `SERVFAIL`. Responses have TTLs zeroed, and the controller temporarily caps the Windows positive cache at one second, reducing cross-process cache reuse.
+Attribution waits up to 500 ms. A selected hint chooses tunnel DNS; an attributed unlisted query chooses physical DNS. A query that repeats a name and type answered within the previous three seconds, with no newer attribution event, reuses that answer's route: this covers the Windows DNS Client's own retransmissions and TCP fallback, which raise no new event. Any other missing or inaccessible attribution is blocked with `SERVFAIL`. Responses have TTLs zeroed, and the controller temporarily caps the Windows positive cache at one second, reducing cross-process cache reuse.
 
 Selected attribution takes precedence whenever it arrives before forwarding begins. DNS packets and ETW events do not share a transaction identifier, so delayed or simultaneous events for the same name and record type cannot always be paired uniquely. See [Limitations](limitations.md).
 

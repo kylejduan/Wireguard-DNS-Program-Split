@@ -205,7 +205,12 @@ std::vector<BYTE> eventProperty(EVENT_RECORD* event, const wchar_t* name) {
 
 class Hints {
 public:
-    explicit Hints(std::unordered_set<std::wstring> included) : included_(std::move(included)) {}
+    // A repeated query for a name and type answered within reuseWindow, carrying no
+    // newer attribution event, reuses that answer's route: the Windows DNS Client
+    // retransmits and falls back to TCP without raising a new query event.
+    explicit Hints(std::unordered_set<std::wstring> included,
+                   std::chrono::milliseconds reuseWindow = std::chrono::milliseconds(3000))
+        : included_(std::move(included)), reuseWindow_(reuseWindow) {}
 
     void add(const std::wstring& name, uint16_t type, DWORD pid, long long eventQpc,
              long long deliveryMilliseconds, USHORT eventId) {
@@ -235,8 +240,9 @@ public:
         changed_.notify_all();
     }
 
-    std::optional<bool> take(const std::wstring& name, uint16_t type) {
+    std::optional<bool> take(const std::wstring& name, uint16_t type, bool* reused = nullptr) {
         const auto key = makeKey(name, type);
+        if (reused) *reused = false;
         if (const HANDLE flush = gTraceFlushRequested.load()) SetEvent(flush);
         std::unique_lock lock(mutex_);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
@@ -246,6 +252,11 @@ public:
             if (found != hints_.end()) {
                 auto& pending = found->second;
                 if (pending.answered) {
+                    if (pending.decision != Decision::Pending &&
+                        std::chrono::steady_clock::now() - pending.answeredAt < reuseWindow_) {
+                        if (reused) *reused = true;
+                        return pending.decision == Decision::Tunnel;
+                    }
                     hints_.erase(found);
                     continue;
                 }
@@ -267,7 +278,10 @@ public:
     void complete(const std::wstring& name, uint16_t type) {
         std::lock_guard lock(mutex_);
         auto found = hints_.find(makeKey(name, type));
-        if (found != hints_.end()) found->second.answered = true;
+        if (found != hints_.end()) {
+            found->second.answered = true;
+            found->second.answeredAt = std::chrono::steady_clock::now();
+        }
     }
 
 private:
@@ -280,6 +294,7 @@ private:
         bool answered{};
         Decision decision{Decision::Pending};
         std::chrono::steady_clock::time_point expires{};
+        std::chrono::steady_clock::time_point answeredAt{};
     };
 
     static std::wstring makeKey(const std::wstring& name, uint16_t type) {
@@ -295,6 +310,7 @@ private:
     }
 
     std::unordered_set<std::wstring> included_;
+    std::chrono::milliseconds reuseWindow_;
     std::mutex mutex_;
     std::condition_variable changed_;
     std::unordered_map<std::wstring, Pending> hints_;
@@ -552,9 +568,9 @@ std::optional<std::vector<char>> tcpExchange(const std::vector<char>& packet, so
 }
 
 std::optional<bool> selectRoute(Hints& hints, const Question& question, const wchar_t* transport,
-                                long long queryQpc, long long& waitMilliseconds) {
+                                long long queryQpc, long long& waitMilliseconds, bool& reused) {
     const auto started = std::chrono::steady_clock::now();
-    const auto route = hints.take(question.name, question.type);
+    const auto route = hints.take(question.name, question.type, &reused);
     waitMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - started)
                            .count();
@@ -578,7 +594,8 @@ void handleUdpQuery(Hints& hints, std::vector<char> packet, sockaddr_in client, 
         return;
     }
     long long classifyMilliseconds{};
-    const auto tunnel = selectRoute(hints, *question, L"UDP", queryQpc, classifyMilliseconds);
+    bool reused = false;
+    const auto tunnel = selectRoute(hints, *question, L"UDP", queryQpc, classifyMilliseconds, reused);
     std::optional<std::vector<char>> response;
     if (tunnel) {
         response = udpExchange(packet, *tunnel ? tunnelSource : directSource,
@@ -591,7 +608,7 @@ void handleUdpQuery(Hints& hints, std::vector<char> packet, sockaddr_in client, 
     if (tunnel) {
         hints.complete(question->name, question->type);
         logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
-                (*tunnel ? L"TUNNEL" : L"DIRECT") + (answered ? L"" : L" FAILED") +
+                (*tunnel ? L"TUNNEL" : L"DIRECT") + (reused ? L" (reused)" : L"") + (answered ? L"" : L" FAILED") +
                 L" classify=" + std::to_wstring(classifyMilliseconds) + L"ms query-qpc=" +
                 std::to_wstring(queryQpc), !answered);
     }
@@ -613,7 +630,8 @@ void handleTcpClient(SOCKET client, Hints& hints, sockaddr_in directSource, sock
         const auto question = parseQuestion(packet);
         std::optional<bool> tunnel;
         long long classifyMilliseconds{};
-        if (question) tunnel = selectRoute(hints, *question, L"TCP", queryQpc, classifyMilliseconds);
+    bool reused = false;
+        if (question) tunnel = selectRoute(hints, *question, L"TCP", queryQpc, classifyMilliseconds, reused);
         std::optional<std::vector<char>> response;
         if (question && tunnel) {
             response = tcpExchange(packet, *tunnel ? tunnelSource : directSource,
@@ -633,7 +651,7 @@ void handleTcpClient(SOCKET client, Hints& hints, sockaddr_in directSource, sock
         if (question && tunnel) {
             hints.complete(question->name, question->type);
             logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
-                    (*tunnel ? L"TUNNEL" : L"DIRECT") + L" (TCP)" + (answered ? L"" : L" FAILED") +
+                    (*tunnel ? L"TUNNEL" : L"DIRECT") + L" (TCP)" + (reused ? L" (reused)" : L"") + (answered ? L"" : L" FAILED") +
                     L" classify=" + std::to_wstring(classifyMilliseconds) + L"ms query-qpc=" +
                     std::to_wstring(queryQpc), !answered);
         }
@@ -690,6 +708,21 @@ int selfTest() {
     precedence.addResolved(L"precedence.example", 1, L"c:\\apps\\selected.exe");
     const auto tunnel = precedence.take(L"precedence.example", 1);
     if (!tunnel || !*tunnel) return 11;
+    // A repeat without a new event reuses the answered route inside the window ...
+    precedence.complete(L"precedence.example", 1);
+    bool reused = false;
+    const auto repeat = precedence.take(L"precedence.example", 1, &reused);
+    if (!repeat || !*repeat || !reused) return 19;
+    // ... and a newer direct event after the answer replaces it.
+    precedence.addResolved(L"precedence.example", 1, L"c:\\apps\\direct.exe");
+    const auto replaced = precedence.take(L"precedence.example", 1, &reused);
+    if (!replaced || *replaced || reused) return 20;
+    // Outside the window an answered repeat is still blocked.
+    Hints noReuse({L"c:\\apps\\selected.exe"}, std::chrono::milliseconds(0));
+    noReuse.addResolved(L"blocked.example", 1, L"c:\\apps\\direct.exe");
+    if (!noReuse.take(L"blocked.example", 1).has_value()) return 21;
+    noReuse.complete(L"blocked.example", 1);
+    if (noReuse.take(L"blocked.example", 1, &reused).has_value() || reused) return 22;
     for (unsigned i = 0; i < kMaxWorkers; ++i) {
         if (!acquireWorker()) return 12;
     }
