@@ -3,7 +3,7 @@
 **Status, September 13, 2026:** The seven repository implementation phases are
 complete. Native disposable-VM acceptance, installed-service lifecycle tests,
 and separate positive/failing-guard reboot tests passed. After the scratch
-preemption correction in `75e9b6c`, the full native VM suite, including installed
+preemption correction in `1beb9fd`, the full native VM suite, including installed
 lifecycle gates, and the Linux unit/native checks passed again. Existing Windows
 checks also passed. This closes the implementation plan, not the separate TV deployment or target-workload latency
 gates below. Independent scoped reviews drove regression fixes.

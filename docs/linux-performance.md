@@ -101,7 +101,7 @@ the whole-syscall comparisons measured. Evidence is retained under ignored
 
 This follow-up adds read-only production measurements and a scoped hook census
 on the same reference host, boot and kernel as the final results below. The
-accepted `3ead242` build was running with an empty include list and no test
+accepted `7ced0b9` build was running with an empty include list and no test
 workload. It changes no earlier number. Here CPU means CPU-seconds per second,
 the share of one core. Result SHA-256: E1 rates and controller
 `20e5cab823cf942e35645ef8896ba0943b3fd830798ed0a8f8b5f3c85e990273`; E2 guard
@@ -178,7 +178,7 @@ next section. The final profiler diagnostic follows the stream section.
 
 The same physical reference host, boot and kernel as the stream run (`TV`,
 7.0.0-31-generic, 16 online CPUs, no virtualization) compared plain WireGuard or
-the direct host path, baseline `00b3efd` and candidate `3ead242`. It used six
+the direct host path, baseline `c6af621` and candidate `7ced0b9`. It used six
 balanced rounds of 16 concurrent paced workloads, 10 seconds per condition, with
 the same frozen harness (`3351c2a03d2b61dd8682bf63d7ec18e30e837dbcfe20fb5a77cc154c02fd2722`),
 probe and builds. Evidence identifier: `overhead-3a9e380183`. Summary SHA-256:
@@ -306,7 +306,7 @@ dated sections after it remain the original historical records.
 
 The physical reference host (`TV`, kernel 7.0.0-31-generic, 16 online CPUs, no
 virtualization) compared plain WireGuard or the direct host path, baseline
-`00b3efd` and candidate `3ead242` in six balanced rounds of 16 concurrent paced
+`c6af621` and candidate `7ced0b9` in six balanced rounds of 16 concurrent paced
 workloads, 10 seconds per condition. The harness (combined SHA-256
 `3351c2a03d2b61dd8682bf63d7ec18e30e837dbcfe20fb5a77cc154c02fd2722`), probe binary
 and both builds matched their approved staging hashes. Evidence identifier:
@@ -524,8 +524,8 @@ under ordinary operating-system scheduling.
 
 The physical reference host (Ubuntu 26.04, kernel 7.0.0-31-generic, i9-11900,
 16 logical CPUs) passed **1,944,000 operations** over six balanced rounds and
-18 primary windows with its existing services running. Baseline `00b3efd` was
-compared with `3ead242`, whose compact exact-path tier preserves 4095-byte paths,
+18 primary windows with its existing services running. Baseline `c6af621` was
+compared with `7ced0b9`, whose compact exact-path tier preserves 4095-byte paths,
 1024 combined entries and the same preemption protection. All 15 production
 source hashes and both builds' artifact hashes were verified before execution.
 
@@ -685,7 +685,7 @@ The detailed comparison method and reproduction command follow.
 The first full comparison was rejected when the old implementation produced two
 socket denials and one wrong socket mark. Its per-CPU pathname scratch buffer
 could be overwritten by another task preempting an LSM invocation on the same
-CPU. CPU pinning alone does not prevent that interleaving. Commit `75e9b6c`
+CPU. CPU pinning alone does not prevent that interleaving. Commit `1beb9fd`
 disables preemption only during scratch lookup, pathname resolution and policy
 lookup, then restores it before releasing the executable reference.
 
@@ -711,8 +711,8 @@ The native disposable VM compares three conditions against the same controlled
 WireGuard peer, destination, DNS responder and MTU 1420:
 
 - Plain WireGuard, with no project hooks or controller.
-- The previous implementation at `240b140`, with the `75e9b6c` correctness fix.
-- The optimized production implementation at `75e9b6c`.
+- The previous implementation at `1738da0`, with the `1beb9fd` correctness fix.
+- The optimized production implementation at `1beb9fd`.
 
 The controller stays running in both implementation conditions. Before clients
 start, each controller must finish its own fresh health check. Six rounds use
@@ -750,9 +750,9 @@ continuous peak measurements.
 Use only the explicitly provisioned disposable native VM described in
 [development verification](linux.md#development-verification). Prepare separate
 source directories from the named commits. Before building the baseline, apply
-only the two production-file changes from `75e9b6c` (`policy.bpf.h` and
+only the two production-file changes from `1beb9fd` (`policy.bpf.h` and
 `bpf-loader.cpp`); leave its controller and resolver guard unchanged. The exact
-patch is available with `git show --format= 75e9b6c -- src/linux/bpf/policy.bpf.h src/linux/native/bpf-loader.cpp`.
+patch is available with `git show --format= 1beb9fd -- src/linux/bpf/policy.bpf.h src/linux/native/bpf-loader.cpp`.
 Run `scripts/build-linux.sh` in each source directory. The current checkout
 supplies the benchmark and installed-test helpers;
 the benchmark verifies each production package matches its source and records
@@ -761,8 +761,8 @@ source/artifact hashes before and after the experiment.
 ```sh
 sudo env WG_CLASSIFIER_DISPOSABLE_VM=1 python3 tests/linux/test_overhead.py --vm \
   --baseline-root /path/to/baseline --candidate-root /path/to/candidate \
-  --baseline-revision '240b140 + 75e9b6c correctness backport' \
-  --candidate-revision 75e9b6c
+  --baseline-revision '1738da0 + 1beb9fd correctness backport' \
+  --candidate-revision 1beb9fd
 ```
 
 Results are written under ignored `local/validation/overhead-*`. Keep raw records,

@@ -1,7 +1,7 @@
 # Guarded native Linux validation
 
 `tests/linux/test_native_overhead.py` compares absent/plain WireGuard, validated
-baseline `00b3efd`, and candidate `3ead242` against an owned local peer. It uses
+baseline `c6af621`, and candidate `7ced0b9` against an owned local peer. It uses
 the real installed singleton controller and kernel hooks. This procedure contains
 no measured results; see [performance interpretation](linux-performance.md).
 
@@ -36,7 +36,7 @@ source; the runner copies the probe from the same read that verified its hash.
 
 For each revision, record SHA-256 for exactly the five build files shown below.
 Revision labels do not establish provenance: stage verified builds from those
-revisions and use their actual hashes. Admission enforces baseline `00b3efd` and
+revisions and use their actual hashes. Admission enforces baseline `c6af621` and
 checks all listed artifact/probe hashes; it does not enforce a candidate label.
 
 ## Manifest
@@ -77,7 +77,7 @@ service names and paths must come from refreshed, sanitized root inventory.
   "builds": {
     "baseline": {
       "directory": "/var/lib/wgps-validation/baseline/build/linux",
-      "revision": "00b3efd",
+      "revision": "c6af621",
       "sha256": {
         "wg-program-split.pyz": "<exact-baseline-SHA256>",
         "bpf-loader": "<exact-baseline-SHA256>",
@@ -88,7 +88,7 @@ service names and paths must come from refreshed, sanitized root inventory.
     },
     "candidate": {
       "directory": "/var/lib/wgps-validation/candidate/build/linux",
-      "revision": "3ead242",
+      "revision": "7ced0b9",
       "sha256": {
         "wg-program-split.pyz": "<exact-candidate-SHA256>",
         "bpf-loader": "<exact-candidate-SHA256>",
