@@ -49,7 +49,7 @@ class Kernel:
     def snapshot(self):
         if not self.exists():
             raise RuntimeError('missing pins')
-        return {'abi': 3, 'state': self.state, 'mask': ALLOCATION.mask,
+        return {'abi': 4, 'state': self.state, 'mask': ALLOCATION.mask,
                 'mark': ALLOCATION.mark, 'pins': dict(self.ids), 'paths': sorted(self.paths)}
 
     def set_state(self, state):

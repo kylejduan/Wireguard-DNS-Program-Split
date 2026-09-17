@@ -260,8 +260,8 @@ char LICENSE[] SEC("license")="GPL";
         assert json.loads(control('policy',pins).stdout)==expected
         snapshot=json.loads(control('snapshot',pins).stdout)
         assert snapshot['paths']==expected, 'snapshot must include policy under the same ownership lock'
-        assert snapshot['abi']==3 and snapshot['ready'] is False
-        assert len(snapshot['maps'])==13 and len(snapshot['links'])==12
+        assert snapshot['abi']==4 and snapshot['ready'] is False
+        assert len(snapshot['maps'])==14 and len(snapshot['links'])==12
         assert snapshot['mask']==0x00ff0000 and snapshot['mark']==0x00010000
         foreign=pins/'unexpected'
         run(['bpftool','map','pin','id',snapshot['maps']['paths'],foreign])
@@ -371,6 +371,18 @@ char LICENSE[] SEC("license")="GPL";
             check(included,op,cachefd,pass_fds=(cachefd,)); check(direct,op,cachefd,0,pass_fds=(cachefd,))
         transfer(cachefd,included,0); transfer(cachefd,direct,1)
         passed('cache inode aliases/rename, inherited read/mmap/PROT_NONE and SCM_RIGHTS guarded')
+        # The negative-role cache: a file proved roleless must not stay allowed
+        # after enrollment, a rename into a slot, or a second link into a slot.
+        plain=work/'plain-file'; plain.write_bytes(b'q'*4096)
+        check(included,'open',plain,0); check(included,'open',plain,0)
+        add('cache',plain); check(included,'open',plain); check(direct,'open',plain,0)
+        moving=work/'moving-file'; moving.write_bytes(b'm'*4096); slot=work/'future-cache-slot'; add('cache',slot)
+        check(included,'open',moving,0); check(included,'open',moving,0)
+        moving.rename(slot); check(included,'open',slot); check(direct,'open',slot,0)
+        linked=work/'linked-file'; linked.write_bytes(b'l'*4096); link_slot=work/'future-link-slot'; add('cache',link_slot)
+        check(included,'open',linked,0); check(included,'open',linked,0)
+        os.link(linked,link_slot); check(included,'open',link_slot); check(direct,'open',link_slot,0)
+        passed('cached no-role files are rechecked after enrollment, rename into a slot and a second link')
         private=work/'nscd-private'; private.mkdir(); add('cache-dir',private)
         temporary=private/'dbABC123'; temporary.write_bytes(b't'*4096)
         fd=os.open(temporary,os.O_RDONLY); descriptors.append(fd); temporary.unlink()

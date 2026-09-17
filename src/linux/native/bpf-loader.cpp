@@ -42,7 +42,7 @@ using PathKey = policy_path;
 using Configuration = policy_config;
 static_assert(sizeof(Configuration) == 40);
 struct MapSpec { const char *name; uint32_t key, value, type, entries; };
-const std::array<MapSpec,13> maps{{
+const std::array<MapSpec,14> maps{{
     {"paths",sizeof(PathKey),4,BPF_MAP_TYPE_HASH,1024},
     {"paths_short",sizeof(policy_short_path),4,BPF_MAP_TYPE_HASH,1024},
     {"policy_cfg",4,sizeof(Configuration),BPF_MAP_TYPE_ARRAY,1},
@@ -55,7 +55,8 @@ const std::array<MapSpec,13> maps{{
     {"stream_roles",4,sizeof(stream_label),BPF_MAP_TYPE_SK_STORAGE,0},
     {"role_generation",4,8,BPF_MAP_TYPE_ARRAY,1},
     {"guard_config",4,8,BPF_MAP_TYPE_ARRAY,1},
-    {"guard_stats",4,8,BPF_MAP_TYPE_PERCPU_ARRAY,4}}};
+    {"guard_stats",4,8,BPF_MAP_TYPE_PERCPU_ARRAY,4},
+    {"negative_roles",sizeof(negative_key),8,BPF_MAP_TYPE_LRU_HASH,65536}}};
 struct LinkSpec { const char *pin, *program, *hook; bool cgroup; };
 const std::array<LinkSpec,12> links{{
     {"link","classify","socket_post_create",true},

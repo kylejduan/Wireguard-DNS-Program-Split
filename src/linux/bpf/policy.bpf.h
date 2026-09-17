@@ -4,7 +4,7 @@
 #ifndef WGPS_BPF
 #include <linux/types.h>
 #endif
-#define POLICY_ABI 3
+#define POLICY_ABI 4
 #define PATH_BYTES 4096
 #define SHORT_PATH_BYTES 256
 struct policy_path { char pathname[PATH_BYTES]; };
@@ -18,6 +18,8 @@ struct policy_config {
 
 /* Namespace, filesystem and sockfs identities are deliberately separate. */
 struct object_id { __u64 dev, ino; };
+/* Identity of an inode proved to have no resolver role (negative_roles). */
+struct negative_key { __u64 inode, ino; __u32 dev, generation; };
 struct guard_slot { struct object_id parent; char name[64]; };
 struct endpoint_name { __u32 netns, length; char name[108]; };
 enum object_role { ROLE_SOCKET=1, ROLE_CACHE=2, ROLE_CACHE_DIR=4,

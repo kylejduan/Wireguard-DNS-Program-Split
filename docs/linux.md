@@ -26,7 +26,7 @@ the kernel creates a socket. It sets the selected socket's routing mark before
 userspace receives the socket. Exact path matching is synchronous; there is no
 process polling window, wrapper, process-name match, UID substitution or cached
 classification shared between sockets. Paths of at most 255 filesystem bytes
-use a 256-byte exact-key map; longer paths retain full 4096-byte keys. ABI 3
+use a 256-byte exact-key map; longer paths retain full 4096-byte keys. ABI 4
 requires both maps, with a combined limit of 1024 entries.
 The temporary per-CPU pathname buffer is protected against task preemption
 through resolution and lookup; executable references are released afterward.
@@ -50,7 +50,13 @@ guard configuration change invalidated, is labelled again on its next use from
 its own or its peer's bind address, so a generation change costs one resolution
 per socket rather than one per message, and an included process keeps its
 unrelated streams. Ordinary IP sends and ordinary file operations do not repeat the
-guard's executable-path lookup. The controller checks health every five seconds;
+guard's executable-path lookup. A regular file proved to have no resolver role is
+remembered in a bounded 65,536-entry cache keyed by inode identity, so later opens
+and reads of it skip pathname matching. The cache holds only single-link files
+whose names no built-in rule inspects, is stamped with the guard configuration
+epoch, and is consulted after the positive labels a rename into a protected slot
+sets, so a cached answer is exact; a second link or an enrollment change forces a
+recheck. The controller checks health every five seconds;
 successful health checks do not briefly block new sockets. A failed check (an
 ownership mismatch, a lost handshake, or a DNS probe that fails three attempts)
 blocks new included sockets until the next passing check, at least five seconds
@@ -189,9 +195,9 @@ configuration. Private configuration lives in
 not activate the VPN, alter kernel boot options or convert application services.
 It refuses to overwrite existing installation files. The current update path is
 explicit disable/uninstall followed by installation; retained configuration must
-match the supplied input. For an ABI 2 to ABI 3 update, use the installed old CLI
-to disable/uninstall before replacing artifacts; ABI 3 deliberately refuses old
-pins. Stop affected application trees during that explicit maintenance boundary.
+match the supplied input. For an update to a new policy ABI (ABI 3 to ABI 4 adds
+the negative-role cache map), use the installed old CLI to disable/uninstall before
+replacing artifacts; each ABI deliberately refuses old pins. Stop affected application trees during that explicit maintenance boundary.
 
 ## Operate
 

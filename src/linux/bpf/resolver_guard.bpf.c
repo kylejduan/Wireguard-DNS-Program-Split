@@ -20,6 +20,13 @@ struct {
     __uint(type, BPF_MAP_TYPE_INODE_STORAGE); __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, int); __type(value, __u32);
 } object_roles SEC(".maps");
+/* Bounded cache of inodes proved to have no resolver role, keyed by inode
+ * identity and stamped with the guard configuration epoch. Ordinary file opens
+ * and reads then skip pathname matching; object_role states why a hit is exact. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH); __uint(max_entries, 65536);
+    __type(key, struct negative_key); __type(value, __u64);
+} negative_roles SEC(".maps");
 struct {
     __uint(type, BPF_MAP_TYPE_SK_STORAGE); __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, int); __type(value, struct stream_label);
@@ -52,30 +59,40 @@ static __always_inline int guard_selected(void)
     guard_count(GUARD_DENIES);
     return -EACCES;
 }
+/* Direct typed reads: these run on every uncached file operation, and a
+ * BPF_CORE_READ chain costs one probe helper call per member. */
 static __always_inline struct object_id inode_id(struct inode *inode)
 {
-    return (struct object_id){BPF_CORE_READ(inode,i_sb,s_dev),BPF_CORE_READ(inode,i_ino)};
+    return (struct object_id){inode->i_sb->s_dev,inode->i_ino};
 }
 static __always_inline __u32 directory_role(struct dentry *dentry)
 {
-    struct inode *inode=BPF_CORE_READ(dentry,d_inode);
+    struct inode *inode=dentry->d_inode;
     struct object_id id=inode_id(inode);
     __u32 *role=bpf_map_lookup_elem(&guard_dirs,&id);
     return role ? *role : 0;
 }
-static __always_inline int dentry_role(struct dentry *dentry)
+/* *cacheable reports that the role depends only on the slot map, the inode's
+ * own name and its parent's identity: the name was read completely and none of
+ * the built-in rules that inspect parent names, owners or ancestors applied. */
+static __always_inline int dentry_role(struct dentry *dentry,bool *cacheable)
 {
+    *cacheable=false;
     if (!dentry) return 0;
-    struct dentry *parent=BPF_CORE_READ(dentry,d_parent);
-    struct guard_slot key={.parent=inode_id(BPF_CORE_READ(parent,d_inode))};
-    const unsigned char *name_ptr=BPF_CORE_READ(dentry,d_name.name);
+    struct dentry *parent=dentry->d_parent;
+    struct guard_slot key={.parent=inode_id(parent->d_inode)};
+    const unsigned char *name_ptr=dentry->d_name.name;
     long copied=bpf_probe_read_kernel_str(key.name,sizeof(key.name),name_ptr);
     if (copied<1) return 0;
     if (copied==sizeof(key.name)) {
         /* Exactly 63 bytes fills the slot legitimately; a longer name was
          * truncated and must not match an enrolled 63-byte prefix. */
         char extra=0;
-        if (bpf_probe_read_kernel(&extra,1,name_ptr+sizeof(key.name)-1) || extra) return 0;
+        if (bpf_probe_read_kernel(&extra,1,name_ptr+sizeof(key.name)-1)) return 0;
+        if (extra) {
+            *cacheable=true; /* Longer than any slot or rule name. */
+            return 0;
+        }
     }
     __u32 *slot=bpf_map_lookup_elem(&guard_slots,&key);
     __u32 role=slot ? *slot : 0;
@@ -86,32 +103,34 @@ static __always_inline int dentry_role(struct dentry *dentry)
     if (cache_name && (directory_role(parent)&ROLE_CACHE_DIR)) role|=ROLE_CACHE;
     if (cache_name && !(role&ROLE_CACHE)) {
         char name[6]={};
-        long length=bpf_probe_read_kernel_str(name,sizeof(name),BPF_CORE_READ(parent,d_name.name));
+        long length=bpf_probe_read_kernel_str(name,sizeof(name),parent->d_name.name);
         if (length==5 && name[0]=='n' && name[1]=='s' && name[2]=='c' && name[3]=='d' &&
-            (directory_role(BPF_CORE_READ(parent,d_parent))&ROLE_NSCD_PARENT))
+            (directory_role(parent->d_parent)&ROLE_NSCD_PARENT))
             role|=ROLE_CACHE;
     }
     /* Audited standard child slots survive daemon runtime-directory creation
      * and replacement without a userspace polling/enrollment window. */
-#define NAME_IS(buffer, literal) ({ bool same=true; \
+/* Branch-free: one comparison per literal keeps verifier state bounded. */
+#define NAME_IS(buffer, literal) ({ unsigned char difference=0; \
     _Pragma("clang loop unroll(full)") \
     for (unsigned int byte=0;byte<sizeof(literal);byte++) \
-        if ((buffer)[byte]!=(literal)[byte]) same=false; same; })
-    if (NAME_IS(key.name,"socket") || NAME_IS(key.name,"system_bus_socket") ||
-        NAME_IS(key.name,"io.systemd.Resolve")) {
+        difference|=(unsigned char)((buffer)[byte]^(literal)[byte]); difference==0; })
+    bool socket_name=NAME_IS(key.name,"socket") || NAME_IS(key.name,"system_bus_socket") ||
+                     NAME_IS(key.name,"io.systemd.Resolve");
+    bool bus_name=NAME_IS(key.name,"bus");
+    if (socket_name) {
         char name[20]={};
-        bpf_probe_read_kernel_str(name,sizeof(name),BPF_CORE_READ(parent,d_name.name));
-        __u32 ancestor=directory_role(BPF_CORE_READ(parent,d_parent));
+        bpf_probe_read_kernel_str(name,sizeof(name),parent->d_name.name);
+        __u32 ancestor=directory_role(parent->d_parent);
         if (((ancestor&ROLE_RUNTIME) &&
              ((NAME_IS(key.name,"socket") && (NAME_IS(name,"nscd") || NAME_IS(name,"avahi-daemon"))) ||
               (NAME_IS(key.name,"system_bus_socket") && NAME_IS(name,"dbus")))) ||
             ((ancestor&ROLE_SYSTEMD) && NAME_IS(name,"resolve") && NAME_IS(key.name,"io.systemd.Resolve")))
             role|=ROLE_SOCKET;
     }
-    if (key.name[0]=='b' && key.name[1]=='u' && key.name[2]=='s' && !key.name[3] &&
-        (directory_role(BPF_CORE_READ(parent,d_parent))&ROLE_USER_ROOT)) {
+    if (bus_name && (directory_role(parent->d_parent)&ROLE_USER_ROOT)) {
         char uid[12]={};
-        long length=bpf_probe_read_kernel_str(uid,sizeof(uid),BPF_CORE_READ(parent,d_name.name));
+        long length=bpf_probe_read_kernel_str(uid,sizeof(uid),parent->d_name.name);
         bool valid=length>1 && length<12;
         __u64 number=0;
 #pragma clang loop unroll(full)
@@ -122,15 +141,15 @@ static __always_inline int dentry_role(struct dentry *dentry)
             }
         }
         if (valid && number<=0xffffffff &&
-            number==BPF_CORE_READ(parent,d_inode,i_uid.val)) role|=ROLE_SOCKET;
+            number==parent->d_inode->i_uid.val) role|=ROLE_SOCKET;
     }
     /* systemd may mount each newly created UID runtime directory as tmpfs.
      * Its root has no parent ancestry inside that filesystem. Protect the exact
      * root-level bus slot, including before rename, without a mount watcher.
      * This deliberately also blocks selected custom tmpfs-root bus endpoints. */
-    if (NAME_IS(key.name,"bus") && parent==BPF_CORE_READ(parent,d_parent) &&
-        BPF_CORE_READ(parent,d_inode,i_sb,s_magic)==0x01021994)
+    if (bus_name && parent==parent->d_parent && parent->d_inode->i_sb->s_magic==0x01021994)
         role|=ROLE_SOCKET;
+    *cacheable=!cache_name && !socket_name && !bus_name;
     return role;
 }
 static __always_inline int label_inode(struct inode *inode,__u32 role)
@@ -142,11 +161,42 @@ static __always_inline int label_inode(struct inode *inode,__u32 role)
     }
     return role;
 }
+/* Rename is rare and already inlines two role computations; the uncached form
+ * keeps its verifier state bounded. */
+static __always_inline int object_role_uncached(struct dentry *dentry,struct inode *inode)
+{
+    if (!inode || !dentry) return 0;
+    __u32 *known=bpf_inode_storage_get(&object_roles,inode,0,0);
+    bool unused=false;
+    return known ? *known : label_inode(inode,dentry_role(dentry,&unused));
+}
 static __always_inline int object_role(struct dentry *dentry,struct inode *inode)
 {
     if (!inode || !dentry) return 0;
     __u32 *known=bpf_inode_storage_get(&object_roles,inode,0,0);
-    return known ? *known : label_inode(inode,dentry_role(dentry));
+    if (known) return *known;
+    /* A cached "no role" is exact. It is kept only for an inode with a single
+     * link, so it has exactly one name and parent, and only when that name is
+     * not one the built-in parent, owner or ancestor rules inspect, so the role
+     * came from the slot map alone. The name or parent changes only by rename,
+     * and rename labels an inode moving into a slot positively above, before
+     * this cache is consulted. A second link fails the single-link check, and
+     * guard enrollment changes the epoch (an odd epoch is an update in progress). */
+    __u32 zero=0;
+    __u64 *config=bpf_map_lookup_elem(&guard_config,&zero);
+    __u64 epoch=config ? *config : 1;
+    bool stable=!(epoch&1) && inode->i_nlink==1;
+    struct negative_key key={};
+    if (stable) {
+        key.inode=(__u64)inode; key.ino=inode->i_ino;
+        key.dev=inode->i_sb->s_dev; key.generation=inode->i_generation;
+        __u64 *cached=bpf_map_lookup_elem(&negative_roles,&key);
+        if (cached && *cached==epoch) return 0;
+    }
+    bool cacheable=false;
+    int role=label_inode(inode,dentry_role(dentry,&cacheable));
+    if (!role && cacheable && stable) bpf_map_update_elem(&negative_roles,&key,&epoch,BPF_ANY);
+    return role;
 }
 static __always_inline int unix_role(struct unix_sock *unix)
 {
@@ -206,8 +256,9 @@ int BPF_PROG(guard_rename,struct inode *old_dir,struct dentry *old_dentry,
 {
     (void)ctx; (void)old_dir; (void)new_dir;
     if (ret) return ret;
-    int old_role=object_role(old_dentry,old_dentry->d_inode);
-    int target_role=dentry_role(new_dentry);
+    int old_role=object_role_uncached(old_dentry,old_dentry->d_inode);
+    bool unused=false;
+    int target_role=dentry_role(new_dentry,&unused);
     if (old_role<0 || label_inode(old_dentry->d_inode,target_role)<0) return -EACCES;
     if ((old_role|target_role)&ROLE_SOCKET) {
         __u32 zero=0;
@@ -252,9 +303,12 @@ static __always_inline int file_guard(struct file *file,bool check_stream)
     struct inode *inode=file->f_inode;
     /* Typed CO-RE reads avoid a probe helper on each ordinary file operation.
      * Regular files cannot be sockets; dispatch once, retaining splice checks
-     * for nonregular files on permission/descriptor-receive hooks. */
-    if (!inode || (inode->i_mode&0170000)!=0100000)
-        return check_stream ? stream_guard(bpf_sock_from_file(file)) : 0;
+     * for socket files on permission/descriptor-receive hooks. Pipes, devices
+     * and other nonregular files are never resolver objects. */
+    if (!inode) return 0;
+    __u32 kind=inode->i_mode&0170000;
+    if (kind!=0100000)
+        return check_stream && kind==0140000 ? stream_guard(bpf_sock_from_file(file)) : 0;
     int role=object_role(file->f_path.dentry,inode);
     if (role<0) return -EACCES;
     if (!(role&ROLE_CACHE)) return 0;
@@ -267,7 +321,7 @@ static __always_inline int stream_guard(struct socket *sock)
     struct sock *sk=sock->sk;
     if (!sk) return 0;
     if (sk->__sk_common.skc_family!=AF_UNIX) return 0; /* No executable lookup on any IP payload path. */
-    __u16 type=BPF_CORE_READ(sk,sk_type);
+    __u16 type=sk->sk_type;
     if (type!=SOCK_STREAM && type!=SOCK_SEQPACKET) return 0;
     struct role_version version={};
     if (!role_version(&version)) return guard_selected();
@@ -311,7 +365,7 @@ int BPF_PROG(guard_bind,struct socket *sock,struct sockaddr *address,int length,
     if (ret) return ret;
     struct sock *sk=sock->sk;
     if (!sk || sk->__sk_common.skc_family!=AF_UNIX) return 0;
-    __u16 type=BPF_CORE_READ(sk,sk_type);
+    __u16 type=sk->sk_type;
     if (type!=SOCK_STREAM && type!=SOCK_SEQPACKET) return 0;
     struct stream_label *role=bpf_sk_storage_get(&stream_roles,sk,0,0);
     if (!role || role->role!=STREAM_SAFE) return 0;

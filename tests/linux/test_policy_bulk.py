@@ -246,7 +246,7 @@ def vm_tests():
         assert sorted(observed['paths']) == sorted(values)
         assert observed['state'] == 'blocked' and len(observed['pins']['links']) == 12
         snapshot = json.loads(invoke([loader, 'snapshot', pins]).stdout)
-        assert snapshot['abi'] == 3 and len(snapshot['maps']) == 13
+        assert snapshot['abi'] == 4 and len(snapshot['maps']) == 14
         for name, width in (('paths_short', 256), ('paths', 4096)):
             info = json.loads(invoke(['bpftool', '-j', 'map', 'show', 'pinned', pins / name]).stdout)
             assert info['bytes_key'] == width and info['max_entries'] == 1024
@@ -276,7 +276,7 @@ def vm_tests():
             native.unload(); active = False
         (evidence / 'results.json').write_text(json.dumps({'entries': len(values), 'stdin_bytes': len(payload),
             'malformed_rejections': list(malformed()), 'readback_exact': True, 'empty_and_argv': True,
-            'abi': 3, 'path_key_widths': [256, 4096], 'combined_capacity': 1024,
+            'abi': 4, 'path_key_widths': [256, 4096], 'combined_capacity': 1024,
             'duplicate_add_at_capacity': True, 'exact_delete_and_refill': True}, indent=2))
         print(f'PASS real native stdin load/readback: {len(values)} entries, {len(payload)} bytes; malformed inputs attach nothing')
     finally:
