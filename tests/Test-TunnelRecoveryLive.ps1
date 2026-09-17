@@ -34,9 +34,7 @@ foreach ($function in $functions) { . ([scriptblock]::Create($function.Extent.Te
 $suffix = [guid]::NewGuid().ToString('N').Substring(0, 8)
 $serviceName = "WgpsRecoveryTest$suffix"
 $workDirectory = Join-Path $env:ProgramData "WgpsRecoveryTest-$suffix"
-[IO.Directory]::CreateDirectory($workDirectory) | Out-Null
 $hostExe = Join-Path $workDirectory 'pending-service.exe'
-Copy-Item -LiteralPath $StubService -Destination $hostExe
 $adapterName = "WgpsNoAdapter$suffix"
 $stuckHostSeconds = 8
 
@@ -63,6 +61,8 @@ function Start-StubPending {
 }
 
 try {
+    [IO.Directory]::CreateDirectory($workDirectory) | Out-Null
+    Copy-Item -LiteralPath $StubService -Destination $hostExe
     Write-Output 'Scenario 1: a service that never finishes starting'
     Set-StubMode 'start'
     Start-StubPending

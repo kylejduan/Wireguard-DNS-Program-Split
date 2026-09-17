@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,7 +35,7 @@ std::vector<uint8_t> makeQuery(const std::string& name, uint16_t id) {
     return query;
 }
 
-enum class Outcome { Valid, NoResponse, Rejected };
+enum class Outcome { Valid, NoResponse, Rejected, Failed };
 
 struct Attempt {
     Outcome outcome;
@@ -50,17 +51,18 @@ struct ProbeResult {
 // One lost datagram or one transient refusal is not a failed probe: retry within the check, as the
 // Linux controller does. `keepGoing` lets the caller stop early once its own time budget is spent.
 ProbeResult probe(unsigned attempts, const std::function<Attempt()>& exchange,
-                  const std::function<bool()>& keepGoing) {
+                  const std::function<bool(const Attempt&)>& keepGoing) {
     Attempt last{Outcome::NoResponse, {}};
     unsigned made = 0;
     while (made < attempts) {
         last = exchange();
         ++made;
         if (last.outcome == Outcome::Valid) return {true, made, {}};
-        if (made < attempts && !keepGoing()) break;
+        if (made < attempts && !keepGoing(last)) break;
     }
     const std::string count = std::to_string(made) + (made == 1 ? " attempt" : " attempts");
     if (last.outcome == Outcome::NoResponse) return {false, made, "No DNS response after " + count};
+    if (last.outcome == Outcome::Failed) return {false, made, "DNS probe failed after " + count + ": " + last.detail};
     return {false, made, "DNS response rejected after " + count + ": " + last.detail};
 }
 
@@ -91,12 +93,26 @@ Attempt querySystemDns(const char* name) {
     return {Outcome::Valid, {}};
 }
 
+// The reply must echo the single question that was asked. Names compare without regard to ASCII case;
+// label lengths (at most 63) and the type and class bytes never fall in the letter range.
+bool echoesQuestion(const std::vector<uint8_t>& query, const uint8_t* response, int received) {
+    if (received < static_cast<int>(query.size()) || response[4] != 0 || response[5] != 1) return false;
+    for (size_t index = 12; index < query.size(); ++index) {
+        uint8_t asked = query[index];
+        uint8_t echoed = response[index];
+        if (asked >= 'A' && asked <= 'Z') asked = static_cast<uint8_t>(asked + 32);
+        if (echoed >= 'A' && echoed <= 'Z') echoed = static_cast<uint8_t>(echoed + 32);
+        if (asked != echoed) return false;
+    }
+    return true;
+}
+
 // A reply to this query from the queried server, whatever it says.
 bool matchesQuery(const std::vector<uint8_t>& query, const uint8_t* response, int received,
                   const sockaddr_in& target, const sockaddr_in& peer) {
-    return query.size() >= 2 && received >= 12 && peer.sin_addr.s_addr == target.sin_addr.s_addr &&
+    return query.size() >= 12 && received >= 12 && peer.sin_addr.s_addr == target.sin_addr.s_addr &&
            peer.sin_port == target.sin_port && response[0] == query[0] && response[1] == query[1] &&
-           (response[2] & 0x80);
+           (response[2] & 0x80) && echoesQuestion(query, response, received);
 }
 
 bool validDnsResponse(const std::vector<uint8_t>& query, const uint8_t* response, int received,
@@ -111,7 +127,7 @@ Attempt exchangeOnce(SOCKET socketHandle, const std::vector<uint8_t>& query, con
                      DWORD timeout, int& receivedBytes) {
     if (sendto(socketHandle, reinterpret_cast<const char*>(query.data()), static_cast<int>(query.size()), 0,
                reinterpret_cast<const sockaddr*>(&target), sizeof(target)) == SOCKET_ERROR) {
-        return {Outcome::Rejected, "sendto failed: " + std::to_string(WSAGetLastError())};
+        return {Outcome::Failed, "sendto failed: " + std::to_string(WSAGetLastError())};
     }
     const ULONGLONG deadline = GetTickCount64() + timeout;
     while (true) {
@@ -128,7 +144,11 @@ Attempt exchangeOnce(SOCKET socketHandle, const std::vector<uint8_t>& query, con
         if (received == SOCKET_ERROR) {
             const int error = WSAGetLastError();
             if (error == WSAETIMEDOUT) return {Outcome::NoResponse, {}};
-            return {Outcome::Rejected, "recvfrom failed: " + std::to_string(error)};
+            // Windows reports an ICMP port-unreachable for an earlier datagram as a reset on the next
+            // receive, and an oversized stray datagram as a size error. Neither is a reply: keep
+            // listening for the rest of this attempt instead of giving up while an answer is in flight.
+            if (error == WSAECONNRESET || error == WSAEMSGSIZE) continue;
+            return {Outcome::Failed, "recvfrom failed: " + std::to_string(error)};
         }
         if (!matchesQuery(query, response, received, target, peer)) continue;
         if (!validDnsResponse(query, response, received, target, peer)) {
@@ -148,9 +168,7 @@ int main(int argc, char** argv) {
             const auto query = makeQuery("example.com", 0x1234);
             if (query.size() != 29 || query[0] != 0x12 || query[1] != 0x34 || query[12] != 7) return 2;
             if (parseTimeout("750") != 750) return 3;
-            std::vector<uint8_t> response(12);
-            response[0] = query[0];
-            response[1] = query[1];
+            std::vector<uint8_t> response(query);
             response[2] = 0x80;
             response[7] = 1;
             sockaddr_in target{};
@@ -166,7 +184,7 @@ int main(int argc, char** argv) {
             peer = target;
             response[7] = 0;
             if (validDnsResponse(query, response.data(), static_cast<int>(response.size()), target, peer)) return 7;
-            const auto always = [] { return true; };
+            const auto always = [](const Attempt&) { return true; };
             const auto scripted = [](std::vector<Attempt> script, unsigned& calls) {
                 return [script, &calls]() {
                     const Attempt next = script.at(calls);
@@ -199,8 +217,30 @@ int main(int argc, char** argv) {
             if (!result.passed || calls != 1) return 13;
             calls = 0;
             result = probe(3, scripted({{Outcome::NoResponse, {}}, {Outcome::Valid, {}}}, calls),
-                           [] { return false; });
+                           [](const Attempt&) { return false; });
             if (result.passed || calls != 1) return 14;
+            // The caller decides how long to pause from what the last attempt was: a refusal or a socket
+            // error returns at once, so retrying it immediately would protect nothing.
+            std::vector<Outcome> seen;
+            calls = 0;
+            result = probe(3, scripted({{Outcome::Rejected, "rcode 2"}, {Outcome::Failed, "sendto failed: 10051"},
+                                        {Outcome::Valid, {}}}, calls),
+                           [&seen](const Attempt& last) { seen.push_back(last.outcome); return true; });
+            if (!result.passed || seen.size() != 2 || seen[0] != Outcome::Rejected || seen[1] != Outcome::Failed) return 17;
+            calls = 0;
+            result = probe(2, scripted({{Outcome::Failed, "sendto failed: 10051"},
+                                        {Outcome::Failed, "sendto failed: 10051"}}, calls), always);
+            if (result.passed ||
+                result.error.find("DNS probe failed after 2 attempts: sendto failed: 10051") == std::string::npos) return 18;
+            // A reply must echo the question that was asked, compared without regard to letter case.
+            auto echoed = query;
+            echoed[2] = 0x80;
+            echoed[7] = 1;
+            if (!validDnsResponse(query, echoed.data(), static_cast<int>(echoed.size()), target, target)) return 19;
+            echoed[13] = 'E';
+            if (!validDnsResponse(query, echoed.data(), static_cast<int>(echoed.size()), target, target)) return 20;
+            echoed[13] = 'x';
+            if (validDnsResponse(query, echoed.data(), static_cast<int>(echoed.size()), target, target)) return 21;
             if (parseAttempts("3") != 3) return 15;
             for (const char* invalid : {"0", "11", "2x"}) {
                 bool rejected = false;
@@ -212,10 +252,11 @@ int main(int argc, char** argv) {
         }
         if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--system") {
             const unsigned attempts = argc == 4 ? parseAttempts(argv[3]) : 1;
-            // Callers bound this process at eight seconds, so stop retrying once five have passed.
+            // Callers bound this process at eight seconds and one refused query can itself take four
+            // (the dispatcher's upstream timeout), so start no new attempt once three have passed.
             const ULONGLONG started = GetTickCount64();
-            const ProbeResult result = probe(attempts, [&] { return querySystemDns(argv[2]); }, [&] {
-                if (GetTickCount64() - started >= 5000) return false;
+            const ProbeResult result = probe(attempts, [&] { return querySystemDns(argv[2]); }, [&](const Attempt&) {
+                if (GetTickCount64() - started >= 3000) return false;
                 Sleep(300);
                 return true;
             });
@@ -243,11 +284,17 @@ int main(int argc, char** argv) {
         if (InetPtonA(AF_INET, argv[1], &target.sin_addr) != 1) throw std::runtime_error("Invalid DNS IPv4 address");
 
         // Every attempt retransmits the same query, so a late reply to an earlier datagram still counts.
-        const uint16_t id = static_cast<uint16_t>(GetTickCount64());
+        std::random_device entropy;
+        const uint16_t id = static_cast<uint16_t>(entropy());
         const auto query = makeQuery(name, id);
         int received = 0;
         const ProbeResult result = probe(attempts,
-            [&] { return exchangeOnce(socketHandle, query, target, timeout, received); }, [] { return true; });
+            [&] { return exchangeOnce(socketHandle, query, target, timeout, received); },
+            [](const Attempt& last) {
+                // A timed-out attempt already waited; a refusal or socket error returned at once.
+                if (last.outcome != Outcome::NoResponse) Sleep(300);
+                return true;
+            });
         closesocket(socketHandle);
         WSACleanup();
         if (!result.passed) {

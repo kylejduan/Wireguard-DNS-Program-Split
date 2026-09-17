@@ -144,14 +144,23 @@ function Save-HealthFailureEvidence([string] $Reason) {
         $evidenceRoot = Join-Path $logs 'health-failures'
         $folder = Join-Path $evidenceRoot (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
         [IO.Directory]::CreateDirectory($folder) | Out-Null
-        [IO.File]::WriteAllText((Join-Path $folder 'reason.txt'), "$(Get-Date -Format o) $Reason")
+        $reasonFile = Join-Path $folder 'reason.txt'
+        [IO.File]::WriteAllText($reasonFile, "$(Get-Date -Format o) $Reason")
+        $tailBytes = 2MB
         foreach ($file in Get-ChildItem -LiteralPath $logs -File -Filter '*.log') {
-            # The supervisor logs are append-only and large; everything else is what a restart overwrites.
-            if ($file.Name -in 'controller.log', 'controller-service.log' -or $file.Length -gt 5MB) { continue }
+            # The supervisor logs are append-only and never rewritten; everything else is what a restart overwrites.
+            if ($file.Name -in 'controller.log', 'controller-service.log') { continue }
             try {
                 # Running components hold their logs open for writing; share that access instead of failing.
                 $source = [IO.FileStream]::new($file.FullName, 'Open', 'Read', 'ReadWrite, Delete')
                 try {
+                    # Take the size from the open stream, since a directory listing can lag a file that is
+                    # still being written, and keep only the tail of a long-running log: the newest lines
+                    # are the evidence, and an unbounded copy would delay the restart it precedes.
+                    if ($source.Length -gt $tailBytes) {
+                        $null = $source.Seek(-$tailBytes, [IO.SeekOrigin]::End)
+                        [IO.File]::AppendAllText($reasonFile, "`r`n$($file.Name) truncated to its last $tailBytes bytes")
+                    }
                     $target = [IO.File]::Create((Join-Path $folder $file.Name))
                     try { $source.CopyTo($target) } finally { $target.Dispose() }
                 } finally { $source.Dispose() }

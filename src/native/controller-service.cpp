@@ -2,6 +2,7 @@
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
 
+#include <cstdlib>
 #include <cwchar>
 #include <filesystem>
 #include <iostream>
@@ -19,6 +20,7 @@ SERVICE_STATUS_HANDLE gStatusHandle{};
 SERVICE_STATUS gStatus{};
 HANDLE gStopEvent{};
 HANDLE gShutdownEvent{};
+HANDLE gServiceMainDone{};
 std::wstring gControllerScript;
 
 // Pre-shutdown is delivered before Windows starts ending processes, so the host learns of a shutdown
@@ -59,6 +61,7 @@ std::filesystem::path hostLogPath() {
            L"controller-service.log";
 }
 
+// Messages are ASCII by construction (describeStop), so narrowing each character is lossless here.
 void appendHostLog(const std::wstring& message) {
     HANDLE log = CreateFileW(hostLogPath().c_str(), FILE_APPEND_DATA,
                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
@@ -66,9 +69,16 @@ void appendHostLog(const std::wstring& message) {
     if (log == INVALID_HANDLE_VALUE) return;
     SYSTEMTIME now{};
     GetLocalTime(&now);
-    wchar_t stamp[32]{};
-    swprintf(stamp, 32, L"%04u-%02u-%02uT%02u:%02u:%02u", now.wYear, now.wMonth, now.wDay, now.wHour,
-             now.wMinute, now.wSecond);
+    TIME_ZONE_INFORMATION zone{};
+    const DWORD mode = GetTimeZoneInformation(&zone);
+    const LONG bias = zone.Bias + (mode == TIME_ZONE_ID_DAYLIGHT   ? zone.DaylightBias
+                                   : mode == TIME_ZONE_ID_STANDARD ? zone.StandardBias
+                                                                   : 0);
+    const LONG east = -bias;
+    wchar_t stamp[48]{};
+    swprintf(stamp, 48, L"%04u-%02u-%02uT%02u:%02u:%02u%ls%02ld:%02ld", now.wYear, now.wMonth, now.wDay,
+             now.wHour, now.wMinute, now.wSecond, east < 0 ? L"-" : L"+", std::labs(east) / 60,
+             std::labs(east) % 60);
     const std::wstring line = std::wstring(stamp) + L" controller-service: " + message + L"\r\n";
     std::string narrow(line.begin(), line.end());
     DWORD written{};
@@ -208,6 +218,11 @@ DWORD WINAPI controlHandler(DWORD control, DWORD, void*, void*) {
 }
 
 void WINAPI serviceMain(DWORD, wchar_t**) {
+    // Once stopped is reported the dispatcher returns and the process exits; wmain waits on this so the
+    // shutdown path, which reports first to avoid delaying shutdown, can still finish its log line.
+    struct Done {
+        ~Done() { if (gServiceMainDone) SetEvent(gServiceMainDone); }
+    } done;
     gStatusHandle = RegisterServiceCtrlHandlerExW(kServiceName, controlHandler, nullptr);
     if (!gStatusHandle) return;
     reportStatus(SERVICE_START_PENDING, NO_ERROR, 0, 30000);
@@ -282,20 +297,21 @@ void WINAPI serviceMain(DWORD, wchar_t**) {
             stopFailure = childExitCode;
         }
         if (forced && stopFailure == NO_ERROR) stopFailure = ERROR_PROCESS_ABORTED;
-        if (stopFailure == NO_ERROR) reportStatus(SERVICE_STOPPED);
-        else reportStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, stopFailure);
+        // Record the outcome before reporting stopped: after that the process may end at any moment.
         appendHostLog(describeStop(forced ? StopPath::ServiceStopForced
                                    : stopFailure == NO_ERROR ? StopPath::ServiceStop
                                                              : StopPath::ServiceStopFailed, stopFailure));
+        if (stopFailure == NO_ERROR) reportStatus(SERVICE_STOPPED);
+        else reportStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, stopFailure);
     } else {
         DWORD childExitCode = 1;
         GetExitCodeProcess(child, &childExitCode);
         // The shutdown control can arrive just after the system has already ended the child.
         const bool duringShutdown = systemShuttingDown(kShutdownGraceMilliseconds);
         const ExitReport report = unrequestedExitReport(duringShutdown, childExitCode);
-        reportStatus(SERVICE_STOPPED, report.win32ExitCode, report.serviceExitCode);
         appendHostLog(describeStop(duringShutdown ? StopPath::ChildEndedByShutdown : StopPath::ChildExited,
                                    childExitCode));
+        reportStatus(SERVICE_STOPPED, report.win32ExitCode, report.serviceExitCode);
     }
     CloseHandle(child);
     CloseHandle(job);
@@ -345,5 +361,8 @@ int wmain(int argc, wchar_t** argv) {
     }
     gControllerScript = argv[2];
     SERVICE_TABLE_ENTRYW services[] = {{const_cast<wchar_t*>(kServiceName), serviceMain}, {nullptr, nullptr}};
-    return StartServiceCtrlDispatcherW(services) ? 0 : 3;
+    gServiceMainDone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!StartServiceCtrlDispatcherW(services)) return 3;
+    if (gServiceMainDone) WaitForSingleObject(gServiceMainDone, 2000);
+    return 0;
 }

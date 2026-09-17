@@ -64,6 +64,26 @@ try {
         'evidence snapshot skips the append-only supervisor logs'
     Assert-True (($controllerLog -join ' ') -match 'evidence saved') 'evidence snapshot location is written to the controller log'
 
+    # A long-running dispatcher log can be far larger than anything worth copying whole, and it is the
+    # file a DNS failure most needs. Keep its tail instead of skipping it.
+    $largeLog = Join-Path $logs 'dns-dispatcher.log'
+    $stream = [IO.File]::Create($largeLog)
+    try {
+        $filler = [byte[]]::new(1MB)
+        foreach ($chunk in 1..3) { $stream.Write($filler, 0, $filler.Length) }
+        $tail = [Text.Encoding]::ASCII.GetBytes("`nFAILED final-line-before-the-restart`n")
+        $stream.Write($tail, 0, $tail.Length)
+    } finally { $stream.Dispose() }
+    Save-HealthFailureEvidence -Reason 'large log'
+    $largeSnapshot = Get-ChildItem -LiteralPath (Join-Path $logs 'health-failures') -Directory | Sort-Object Name | Select-Object -Last 1
+    $copied = Get-Item -LiteralPath (Join-Path $largeSnapshot.FullName 'dns-dispatcher.log')
+    Assert-True ($copied.Length -gt 0 -and $copied.Length -le 2MB) 'an oversized log is snapshotted as a bounded tail, not skipped or copied whole'
+    Assert-True ((Get-Content -LiteralPath $copied.FullName -Raw) -match 'final-line-before-the-restart') `
+        'the snapshot of an oversized log keeps its most recent lines'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $largeSnapshot.FullName 'reason.txt') -Raw) -match 'dns-dispatcher\.log.*truncated') `
+        'the snapshot records which logs were truncated'
+    Remove-Item -LiteralPath $largeLog -Force
+
     foreach ($index in 1..12) {
         [IO.Directory]::CreateDirectory((Join-Path $logs ("health-failures\20000101-0000{0:d2}-000" -f $index))) | Out-Null
     }
@@ -80,5 +100,22 @@ try {
 } finally {
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+$hostSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\native\controller-service.cpp'))
+$stopBranch = $hostSource.Substring($hostSource.IndexOf('if (forced && stopFailure == NO_ERROR)'))
+$stopBranch = $stopBranch.Substring(0, $stopBranch.IndexOf('} else {'))
+Assert-True ($stopBranch.IndexOf('appendHostLog(') -ge 0 -and
+    $stopBranch.IndexOf('appendHostLog(') -lt $stopBranch.IndexOf('reportStatus(SERVICE_STOPPED')) `
+    'service host records a service stop before reporting stopped, after which the process may end at any moment'
+$exitBranch = $hostSource.Substring($hostSource.IndexOf('const bool duringShutdown'))
+$exitBranch = $exitBranch.Substring(0, $exitBranch.IndexOf('CloseHandle(child);'))
+Assert-True ($exitBranch.IndexOf('appendHostLog(') -ge 0 -and
+    $exitBranch.IndexOf('appendHostLog(') -lt $exitBranch.IndexOf('reportStatus(SERVICE_STOPPED')) `
+    'service host records an unrequested controller exit before reporting stopped'
+Assert-True ($hostSource -match '(?s)StartServiceCtrlDispatcherW\(services\).*?WaitForSingleObject\(gServiceMainDone, 2000\)') `
+    'service host lets the shutdown path finish its log line before the process exits'
+$probeSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\native\dns-probe.cpp'))
+Assert-True ($probeSource -match 'GetTickCount64\(\) - started >= 3000') `
+    'system-mode probe starts no new attempt late enough to overrun its callers'' eight-second wait'
 
 Write-Output 'PASS: controller health checks retry their probes and preserve failure evidence.'

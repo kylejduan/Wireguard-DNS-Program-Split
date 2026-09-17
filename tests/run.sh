@@ -38,6 +38,7 @@ if [[ "${1:-}" == "--live" ]]; then
   cp "$repo_root/src/powershell/Invoke-Tunnel.ps1" "$repo_root/tests/Test-TunnelRecoveryLive.ps1" \
     "$repo_root/build/test-pending-service.exe" "$stage/"
   stage_windows=$(wslpath -w "$stage")
+  stage_windows=${stage_windows//\'/\'\'}  # the path is embedded in single-quoted PowerShell strings
   powershell.exe -NoLogo -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command',\"& '$stage_windows\\Test-TunnelRecoveryLive.ps1' -TunnelScript '$stage_windows\\Invoke-Tunnel.ps1' -StubService '$stage_windows\\test-pending-service.exe' *>&1 | Out-File -FilePath '$stage_windows\\result.txt' -Encoding utf8\""
   result=$(tr -d '\r' < "$stage/result.txt" 2>/dev/null || true)
   rm -rf "$stage"
