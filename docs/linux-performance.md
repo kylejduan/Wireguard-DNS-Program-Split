@@ -5,6 +5,42 @@ CPU cost. This is separate from total VPN or Internet round-trip time. A VM
 measurement cannot establish a worst-case bound or the actual bot's behavior on
 TV. See [Linux operation](linux.md) for the supported traffic and host context.
 
+## Resolver guard file-path cache — September 17, 2026
+
+The reference host (same kernel, build `1eab0ac`, policy ABI 4) was measured
+before and after the guard learned to remember regular files that have no
+resolver role. Each window enabled `kernel.bpf_stats_enabled`, ran one pinned
+workload, and restored it to 0; the kernel's per-program accounting gives the
+in-hook cost per call. Calls from other host processes during a window are
+included, so figures are for the host as it ran, not a synthetic minimum.
+
+| Hook cost per call, workload | Before | After |
+|---|---:|---:|
+| `file_permission`, `pread` of a cached 512-byte range (500,000 calls) | 235 ns | 52 ns |
+| `file_open`, open, read and close loop (500,000 cycles) | 265 ns | 66 ns |
+| `file_permission`, same loop | 258 ns | 63 ns |
+| `socket_sendmsg` / `socket_recvmsg` / `file_permission`, Unix stream socketpair echo | 63–71 ns | 38–46 ns |
+| `socket_post_create` classification, per new socket | 1.5 us | 0.8–2.7 us |
+
+Before the change every open and read of a regular file recomputed its role from
+the pathname with about eight probe helpers and an 80-byte hash lookup. It now
+reads the inode's cached "no role" entry, a single-link check and the guard
+epoch. The `pread` system call as a whole fell from 975 ns to 546 ns, and the
+open, read and close cycle from 4.20 us to 2.65 us; part of that second change is
+host variation between the two runs. The classifier's per-socket cost did not
+change; its spread reflects how few sockets other processes created in each
+window. The cache is bounded at 65,536 entries.
+
+The same session repeated the isolated per-packet benchmark from September 15.
+The host was busier (an 11.7 us base loopback round trip against 6.8 us), and the
+paired differences did not resolve a change: rules present added +3.8 us
+[+2.6, +4.9] to an unlisted round trip and +2.2 us [+0.4, +3.7] to an included
+one, and the mark-dependent part came out negative. Unlisted packets traverse
+the same rule sequence as before, so the September 15 figures below remain the
+clean per-packet measurement. Evidence is retained under ignored
+`local/validation/linux-guard-cache-20260917`; after-change summary SHA-256
+`55497e53856cdac9a92f1708428d09666c169d1d695fdfcf3fd856b747e86387`.
+
 ## Reference-host end-to-end check — September 15, 2026
 
 This check re-verified the activated reference host with the accepted build
