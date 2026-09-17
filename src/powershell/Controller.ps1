@@ -56,9 +56,11 @@ function Complete-Component($component) {
     $process.WaitForExit()
     $output = @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue)
     $errors = @(Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue)
+    # Log what the component reported before judging its exit: a failed run's output records actions
+    # it already took, such as resetting a stuck tunnel host, and the next run overwrites the file.
+    if ($output) { Write-ControllerLog ($output -join ' ') }
     if ($process.ExitCode -ne 0) { throw "$name $action exited with code $($process.ExitCode): $($errors -join ' ')" }
     if ($errors) { throw "$name $action failed: $($errors -join ' ')" }
-    if ($output) { Write-ControllerLog ($output -join ' ') }
     $timer.Stop()
     try {
         $elapsedMilliseconds = [long][Math]::Round(($process.ExitTime - $process.StartTime).TotalMilliseconds)
@@ -335,6 +337,7 @@ $repairDelaySeconds = 2
 $nextCleanup = [DateTime]::MinValue
 $cleanupDelaySeconds = 2
 $stopRequestedAt = $null
+$stopCleanupWindow = [TimeSpan]::FromSeconds(150)
 $networkWaitLogged = $false
 $networkRetryMilliseconds = 250
 $stopEvent = $null
@@ -350,18 +353,20 @@ try {
                 Write-ControllerLog 'Controller service stop requested.'
                 $stopRequestedAt = Get-Date
             }
-            # The service host allows four minutes; retry incomplete cleanup until shortly before
-            # that, then report the failure to SCM instead of failing on the first stuck component.
-            $stopDeadlinePassed = (Get-Date) - $stopRequestedAt -ge [TimeSpan]::FromSeconds(200)
+            # The service host force-ends this process four minutes after the stop control. Retry
+            # incomplete cleanup, but check the window after each attempt, which can itself take most
+            # of a minute, so the failure is thrown and logged here instead of arriving as a forced end.
             try { Stop-Stack -RestoreCache -ThrowOnFailure }
             catch {
-                if ($stopDeadlinePassed) { throw }
+                if ((Get-Date) - $stopRequestedAt -ge $stopCleanupWindow) { throw }
                 Write-ControllerLog 'Service-stop cleanup incomplete; retrying.'
                 Start-Sleep -Seconds 2
                 continue
             }
             if (Test-StackPresent) {
-                if ($stopDeadlinePassed) { throw 'Stack cleanup failed: the managed stack remains present.' }
+                if ((Get-Date) - $stopRequestedAt -ge $stopCleanupWindow) {
+                    throw 'Stack cleanup failed: the managed stack remains present.'
+                }
                 Write-ControllerLog 'Managed stack remains present; retrying service-stop cleanup.'
                 Start-Sleep -Seconds 1
                 continue
@@ -370,6 +375,8 @@ try {
         }
         $desired = Test-Path -LiteralPath $enabledFile -PathType Leaf
         if ($desired) {
+            $nextCleanup = [DateTime]::MinValue
+            $cleanupDelaySeconds = 2
             try { Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile }
             catch {
                 Write-ControllerLog $_.Exception.Message
@@ -381,12 +388,18 @@ try {
             if ((Test-StackPresent) -and (Get-Date) -ge $nextCleanup) {
                 try {
                     Stop-Stack -RestoreCache -ThrowOnFailure
+                    if ($cleanupDelaySeconds -gt 2) {
+                        Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
+                        Write-ControllerLog 'Disable cleanup completed after retry.'
+                    }
                     $cleanupDelaySeconds = 2
                 } catch {
                     # Keep supervising: exiting here only makes SCM restart the controller into the
-                    # same failure. Record it for the tray and retry with bounded backoff.
-                    [IO.File]::WriteAllText($errorFile, ($_ | Out-String))
-                    Write-ControllerLog "Disable cleanup incomplete; retrying in $cleanupDelaySeconds s."
+                    # same failure. Record it for the tray and retry with bounded backoff. Recording
+                    # is best effort so a log or state write error cannot end supervision either.
+                    $cleanupFailure = $_ | Out-String
+                    try { [IO.File]::WriteAllText($errorFile, $cleanupFailure) } catch { }
+                    try { Write-ControllerLog "Disable cleanup incomplete; retrying in $cleanupDelaySeconds s." } catch { }
                     $nextCleanup = (Get-Date).AddSeconds($cleanupDelaySeconds)
                     $cleanupDelaySeconds = [Math]::Min(60, $cleanupDelaySeconds * 2)
                 }

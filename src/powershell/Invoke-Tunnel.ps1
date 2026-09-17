@@ -19,6 +19,8 @@ $tunnelAddress = $configuration.TunnelAddress
 $tunnelDns = $configuration.TunnelDns
 $tunnelDefaultMetric = $configuration.TunnelDefaultMetric
 $endpointState = Join-Path $root 'state\endpoint-route.txt'
+# A pending tunnel host older than this has outlived any plausible start, including a first driver install.
+$stuckHostSeconds = 90
 
 function Assert-Inputs {
     foreach ($path in @($config, $hostExe, (Join-Path $bin 'tunnel.dll'), (Join-Path $bin 'wireguard.dll'))) {
@@ -54,15 +56,20 @@ function Get-OwnedServiceProcess {
     $record = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
     if (-not $record -or -not $record.ProcessId) { return $null }
     $process = Get-Process -Id $record.ProcessId -ErrorAction SilentlyContinue
-    if ($process -and [string]$process.Path -eq $hostExe) { return $process }
+    if (-not $process) { return $null }
+    # Pin the process before checking its image so the identifier cannot be reused underneath the check.
+    try { $null = $process.Handle } catch { return $null }
+    if ([string]$process.Path -eq $hostExe) { return $process }
     return $null
 }
 
 function Reset-PendingService([int] $SettleSeconds) {
-    # A tunnel service that stays in StartPending or StopPending cannot accept a stop control, so
-    # Stop-Service fails until reboot and every later start waits on the same stuck host. After a
-    # bounded settle window, terminate only the owned host process; Service Control Manager then
-    # records the service as stopped and the next start begins from a clean state.
+    # A tunnel service that stays in StartPending or StopPending cannot accept a stop control, so a
+    # stop fails until reboot and every later start waits on the same stuck host. After a bounded
+    # settle window, terminate only the owned host process; Service Control Manager then records the
+    # service as stopped and the next start begins from a clean state. A start that is merely slow is
+    # never terminated, whichever action asks: the controller runs Stop as cleanup after a start
+    # timeout, and ending a young host there would make a slow tunnel unable to ever come up.
     $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
     if (-not $service) { return }
     $deadline = [DateTime]::UtcNow.AddSeconds($SettleSeconds)
@@ -74,15 +81,46 @@ function Reset-PendingService([int] $SettleSeconds) {
     if ($service.Status -ne 'StartPending' -and $service.Status -ne 'StopPending') { return }
     $process = Get-OwnedServiceProcess
     if (-not $process) { throw "The tunnel service is stuck in $($service.Status) without an owned host process." }
+    if ($service.Status -eq 'StartPending') {
+        $hostAge = [int]([DateTime]::Now - $process.StartTime).TotalSeconds
+        if ($hostAge -lt $stuckHostSeconds) {
+            throw "The tunnel service is still starting (host age $hostAge s); it is left to finish and is reset only after $stuckHostSeconds seconds."
+        }
+    }
     Write-Output "Tunnel service stuck in $($service.Status); terminating owned host process $($process.Id)."
-    Stop-Process -Id $process.Id -Force -ErrorAction Stop
-    $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
-    $adapterDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    $process.Kill()
+    $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(10))
+    $adapterDeadline = [DateTime]::UtcNow.AddSeconds(3)
     while ((Get-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue) -and
         [DateTime]::UtcNow -lt $adapterDeadline) { Start-Sleep -Milliseconds 500 }
     if (Get-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue) {
-        Write-Output "The $adapterName adapter remains after the host process ended; the next start will report it."
+        Write-Output "The $adapterName adapter is still present after the host process ended."
     }
+}
+
+function Wait-ServiceRunning([int] $TimeoutSeconds = 20) {
+    # Poll rather than WaitForStatus so a service that fails fast is reported at once. A start that
+    # is merely slow is left running: the next repair attempt adopts the same pending service and
+    # keeps waiting. Only a host that has outlived any plausible start is treated as stuck and reset.
+    $service = Get-Service -Name $serviceName
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $service.Refresh()
+        if ($service.Status -eq 'Running') { return }
+        if ($service.Status -eq 'Stopped') {
+            throw 'The tunnel service stopped while starting; check the profile and the matched runtime DLL pair.'
+        }
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    $status = $service.Status
+    $process = Get-OwnedServiceProcess
+    $hostAge = if ($process) { [int]([DateTime]::Now - $process.StartTime).TotalSeconds } else { 0 }
+    if ($process -and $hostAge -ge $stuckHostSeconds) {
+        Reset-PendingService -SettleSeconds 0
+        throw "The tunnel service stayed $status for $hostAge seconds; its host process was reset so the next attempt starts clean."
+    }
+    throw "The tunnel service is still $status after $TimeoutSeconds seconds (host age $hostAge s); leaving it to finish so the next attempt can adopt it."
 }
 
 function Add-ActiveRoute([string] $prefix, [uint32] $index, [string] $nextHop, [uint16] $metric) {
@@ -170,8 +208,15 @@ if ($Action -eq 'Stop') {
         Reset-PendingService -SettleSeconds 10
         $service.Refresh()
         if ($service.Status -ne 'Stopped') {
-            Stop-Service -Name $serviceName -Force
-            $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
+            # ServiceController.Stop returns once the control is issued. A stop that does not finish
+            # inside the wait is reset here instead of consuming the controller's whole component budget.
+            try { $service.Stop() }
+            catch [InvalidOperationException] {
+                $service.Refresh()
+                if ($service.Status -ne 'Stopped' -and $service.Status -ne 'StopPending') { throw }
+            }
+            try { $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20)) }
+            catch [System.ServiceProcess.TimeoutException] { Reset-PendingService -SettleSeconds 0 }
         }
     }
     if ($service) { Set-Service -Name $serviceName -StartupType Manual }
@@ -246,16 +291,14 @@ if ($serviceState.Status -eq 'StopPending') {
     $serviceState.Refresh()
 }
 if ($serviceState.Status -eq 'Stopped') {
-    # ServiceController.Start returns once the control is issued; the readiness wait below bounds it.
-    $serviceState.Start()
+    # ServiceController.Start returns once the control is issued; Wait-ServiceRunning bounds the rest.
+    try { $serviceState.Start() }
+    catch [InvalidOperationException] {
+        $serviceState.Refresh()
+        if ($serviceState.Status -eq 'Stopped') { throw }
+    }
 }
-try { $serviceState.WaitForStatus('Running', [TimeSpan]::FromSeconds(20)) }
-catch [System.ServiceProcess.TimeoutException] {
-    # The service never reported Running, so adapter creation did not complete. Reset the stuck host
-    # now so the controller's next repair attempt starts from Stopped instead of the same pending host.
-    Reset-PendingService -SettleSeconds 0
-    throw 'The tunnel service did not report Running within 20 seconds; its host process was reset for the next attempt.'
-}
+Wait-ServiceRunning
 $adapter = Wait-Adapter
 
 if (-not (Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -IPAddress $tunnelAddress -ErrorAction SilentlyContinue)) {
