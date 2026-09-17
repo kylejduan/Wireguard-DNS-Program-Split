@@ -14,6 +14,10 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
   -RepositoryRoot "$(wslpath -w "$repo_root")"
 
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  -File "$(wslpath -w "$repo_root/tests/Test-TunnelRecovery.ps1")" \
+  -RepositoryRoot "$(wslpath -w "$repo_root")"
+
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
   -File "$(wslpath -w "$repo_root/tests/Test-InstallLayout.ps1")" \
   -RepositoryRoot "$(wslpath -w "$repo_root")"
 
