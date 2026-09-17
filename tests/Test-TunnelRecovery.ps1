@@ -23,8 +23,8 @@ Assert-True ($tunnelSource -match '(?s)\$serviceState\.Start\(\).*?\nWait-Servic
     'tunnel start issues a non-blocking start control bounded by the readiness wait'
 Assert-True ($tunnelSource -match '(?s)catch \[System\.ServiceProcess\.TimeoutException\] \{ Reset-PendingService -SettleSeconds 0 \}') `
     'tunnel stop resets a stop that does not finish inside its wait'
-Assert-True ($tunnelSource -match '(?s)if \(\$serviceState\.Status -eq ''StopPending''\) \{.*?Reset-PendingService -SettleSeconds 10.*?if \(\$serviceState\.Status -eq ''Stopped''\)') `
-    'tunnel start clears a stuck stop before deciding whether to start the service'
+Assert-True ($tunnelSource -match '(?s)if \(\$serviceState\.Status -eq ''StopPending''\) \{.*?Reset-PendingService -SettleSeconds 5\s.*?if \(\$serviceState\.Status -eq ''Stopped''\)') `
+    'tunnel start clears a stuck stop inside a budget that leaves the readiness wait within the controller limit'
 $tunnelTokens = $null
 $tunnelParseErrors = $null
 $tunnelAst = [Management.Automation.Language.Parser]::ParseFile(

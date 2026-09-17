@@ -21,11 +21,66 @@ HANDLE gStopEvent{};
 HANDLE gShutdownEvent{};
 std::wstring gControllerScript;
 
+// Pre-shutdown is delivered before Windows starts ending processes, so the host learns of a shutdown
+// before the controller is killed by it. Plain shutdown stays accepted as a second signal.
+DWORD acceptedControls(DWORD state) {
+    return state == SERVICE_RUNNING
+               ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PRESHUTDOWN
+               : 0;
+}
+
+bool isShutdownControl(DWORD control) {
+    return control == SERVICE_CONTROL_SHUTDOWN || control == SERVICE_CONTROL_PRESHUTDOWN;
+}
+
+enum class StopPath { ShutdownControl, ChildEndedByShutdown, ChildExited, ServiceStop, ServiceStopFailed, ServiceStopForced };
+
+// The host has no other record of why it stopped; one line per stop makes a failure report explicable.
+std::wstring describeStop(StopPath path, DWORD code) {
+    switch (path) {
+    case StopPath::ShutdownControl:
+        return L"stopped cleanly for system shutdown (shutdown control received); stack left for boot-time adoption";
+    case StopPath::ChildEndedByShutdown:
+        return L"stopped cleanly for system shutdown (controller ended first with code " + std::to_wstring(code) + L")";
+    case StopPath::ChildExited:
+        return L"controller exited unexpectedly with code " + std::to_wstring(code) + L"; reporting failure so SCM restarts it";
+    case StopPath::ServiceStop:
+        return L"service stop completed with clean stack cleanup";
+    case StopPath::ServiceStopFailed:
+        return L"service stop failed with code " + std::to_wstring(code);
+    case StopPath::ServiceStopForced:
+        return L"service stop forced after the cleanup window expired";
+    }
+    return L"stopped";
+}
+
+std::filesystem::path hostLogPath() {
+    return std::filesystem::path(gControllerScript).parent_path().parent_path() / L"logs" /
+           L"controller-service.log";
+}
+
+void appendHostLog(const std::wstring& message) {
+    HANDLE log = CreateFileW(hostLogPath().c_str(), FILE_APPEND_DATA,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (log == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t stamp[32]{};
+    swprintf(stamp, 32, L"%04u-%02u-%02uT%02u:%02u:%02u", now.wYear, now.wMonth, now.wDay, now.wHour,
+             now.wMinute, now.wSecond);
+    const std::wstring line = std::wstring(stamp) + L" controller-service: " + message + L"\r\n";
+    std::string narrow(line.begin(), line.end());
+    DWORD written{};
+    WriteFile(log, narrow.data(), static_cast<DWORD>(narrow.size()), &written, nullptr);
+    CloseHandle(log);
+}
+
 void reportStatus(DWORD state, DWORD win32ExitCode = NO_ERROR, DWORD serviceExitCode = 0,
                   DWORD waitHint = 0) {
     gStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     gStatus.dwCurrentState = state;
-    gStatus.dwControlsAccepted = state == SERVICE_RUNNING ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN : 0;
+    gStatus.dwControlsAccepted = acceptedControls(state);
     gStatus.dwWin32ExitCode = win32ExitCode;
     gStatus.dwServiceSpecificExitCode = serviceExitCode;
     gStatus.dwWaitHint = waitHint;
@@ -129,8 +184,8 @@ struct ExitReport {
     DWORD serviceExitCode;
 };
 
-ExitReport unrequestedExitReport(bool systemShuttingDown, DWORD childExitCode) {
-    if (systemShuttingDown) return {NO_ERROR, 0};
+ExitReport unrequestedExitReport(bool duringShutdown, DWORD childExitCode) {
+    if (duringShutdown) return {NO_ERROR, 0};
     return {ERROR_SERVICE_SPECIFIC_ERROR, childExitCode ? childExitCode : 1};
 }
 
@@ -143,7 +198,7 @@ DWORD WINAPI controlHandler(DWORD control, DWORD, void*, void*) {
     if (control == SERVICE_CONTROL_INTERROGATE) return NO_ERROR;
     // Shutdown keeps the stack for boot-time adoption, exactly as before; it only stops the
     // supervisor from reporting the shutdown-terminated controller as a failure.
-    if (control == SERVICE_CONTROL_SHUTDOWN) {
+    if (isShutdownControl(control)) {
         if (gShutdownEvent) SetEvent(gShutdownEvent);
         return NO_ERROR;
     }
@@ -202,6 +257,7 @@ void WINAPI serviceMain(DWORD, wchar_t**) {
     if (result == WAIT_OBJECT_0 + 2) {
         // Report stopped at once so shutdown is not delayed; closing the job ends the controller.
         reportStatus(SERVICE_STOPPED);
+        appendHostLog(describeStop(StopPath::ShutdownControl, 0));
     } else if (result == WAIT_OBJECT_0) {
         reportStatus(SERVICE_STOP_PENDING, NO_ERROR, 0, kStopTimeoutMilliseconds);
         const ULONGLONG deadline = GetTickCount64() + kStopTimeoutMilliseconds;
@@ -228,13 +284,18 @@ void WINAPI serviceMain(DWORD, wchar_t**) {
         if (forced && stopFailure == NO_ERROR) stopFailure = ERROR_PROCESS_ABORTED;
         if (stopFailure == NO_ERROR) reportStatus(SERVICE_STOPPED);
         else reportStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, stopFailure);
+        appendHostLog(describeStop(forced ? StopPath::ServiceStopForced
+                                   : stopFailure == NO_ERROR ? StopPath::ServiceStop
+                                                             : StopPath::ServiceStopFailed, stopFailure));
     } else {
         DWORD childExitCode = 1;
         GetExitCodeProcess(child, &childExitCode);
         // The shutdown control can arrive just after the system has already ended the child.
-        const ExitReport report = unrequestedExitReport(systemShuttingDown(kShutdownGraceMilliseconds),
-                                                        childExitCode);
+        const bool duringShutdown = systemShuttingDown(kShutdownGraceMilliseconds);
+        const ExitReport report = unrequestedExitReport(duringShutdown, childExitCode);
         reportStatus(SERVICE_STOPPED, report.win32ExitCode, report.serviceExitCode);
+        appendHostLog(describeStop(duringShutdown ? StopPath::ChildEndedByShutdown : StopPath::ChildExited,
+                                   childExitCode));
     }
     CloseHandle(child);
     CloseHandle(job);
@@ -255,6 +316,21 @@ int selfTest() {
     if (failure.win32ExitCode != ERROR_SERVICE_SPECIFIC_ERROR || failure.serviceExitCode != 1) return 5;
     const ExitReport zeroExit = unrequestedExitReport(false, 0);
     if (zeroExit.win32ExitCode != ERROR_SERVICE_SPECIFIC_ERROR || zeroExit.serviceExitCode != 1) return 6;
+    // Pre-shutdown is delivered before Windows starts ending processes, so the host learns of the
+    // shutdown before the controller is killed instead of racing it.
+    const DWORD running = acceptedControls(SERVICE_RUNNING);
+    if (!(running & SERVICE_ACCEPT_STOP) || !(running & SERVICE_ACCEPT_SHUTDOWN) ||
+        !(running & SERVICE_ACCEPT_PRESHUTDOWN)) return 7;
+    if (acceptedControls(SERVICE_STOP_PENDING) != 0 || acceptedControls(SERVICE_START_PENDING) != 0) return 8;
+    if (!isShutdownControl(SERVICE_CONTROL_PRESHUTDOWN) || !isShutdownControl(SERVICE_CONTROL_SHUTDOWN) ||
+        isShutdownControl(SERVICE_CONTROL_STOP) || isShutdownControl(SERVICE_CONTROL_INTERROGATE)) return 9;
+    if (describeStop(StopPath::ShutdownControl, 0).find(L"system shutdown") == std::wstring::npos) return 10;
+    if (describeStop(StopPath::ChildEndedByShutdown, 1).find(L"system shutdown") == std::wstring::npos) return 11;
+    const std::wstring crashLine = describeStop(StopPath::ChildExited, 3);
+    if (crashLine.find(L"unexpectedly") == std::wstring::npos || crashLine.find(L"code 3") == std::wstring::npos) return 12;
+    if (describeStop(StopPath::ServiceStopFailed, 5).find(L"code 5") == std::wstring::npos) return 13;
+    if (describeStop(StopPath::ServiceStopForced, 0).find(L"forced") == std::wstring::npos) return 14;
+    if (describeStop(StopPath::ServiceStop, 0).find(L"clean") == std::wstring::npos) return 15;
     std::wcout << L"PASS: controller service command-line setup and exit reporting.\n";
     return 0;
 }

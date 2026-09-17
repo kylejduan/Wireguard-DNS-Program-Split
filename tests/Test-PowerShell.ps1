@@ -79,7 +79,7 @@ Assert-True ($stackHealthSource -match 'Assert-ProgramSplitNoIpv6DefaultRoute') 
 $tunnelProbeSource = $controllerSource.Substring(
     $controllerSource.IndexOf('function Test-TunnelDns'),
     $controllerSource.IndexOf('function Invoke-Repair') - $controllerSource.IndexOf('function Test-TunnelDns'))
-Assert-True ($tunnelProbeSource -match '(?s)\.Handle.*?WaitForExit\(\$TimeoutMilliseconds \+ 3000\).*?WaitForExit\(\)') `
+Assert-True ($tunnelProbeSource -match '(?s)\.Handle.*?WaitForExit\(\$TimeoutMilliseconds \* \$Attempts \+ 3000\).*?WaitForExit\(\)') `
     'tunnel DNS probe drains redirected output before evaluating it'
 $startStackSource = $controllerSource.Substring(
     $controllerSource.IndexOf('function Start-Stack'),
@@ -417,11 +417,14 @@ try {
             $controllerServiceSource.IndexOf('DWORD WINAPI controlHandler'))
     Assert-True ($controllerHandlerSource -notmatch 'reportStatus') `
         'controller service serializes status updates on its service-main thread'
-    Assert-True ($controllerServiceSource -match 'SERVICE_ACCEPT_STOP \| SERVICE_ACCEPT_SHUTDOWN' -and
-        $controllerHandlerSource -match '(?s)SERVICE_CONTROL_SHUTDOWN\) \{\s*if \(gShutdownEvent\) SetEvent\(gShutdownEvent\);\s*return NO_ERROR;') `
-        'controller service accepts shutdown without signalling stack cleanup'
+    Assert-True ($controllerServiceSource -match 'SERVICE_ACCEPT_STOP \| SERVICE_ACCEPT_SHUTDOWN \| SERVICE_ACCEPT_PRESHUTDOWN' -and
+        $controllerServiceSource -match 'control == SERVICE_CONTROL_SHUTDOWN \|\| control == SERVICE_CONTROL_PRESHUTDOWN' -and
+        $controllerHandlerSource -match '(?s)isShutdownControl\(control\)\) \{\s*if \(gShutdownEvent\) SetEvent\(gShutdownEvent\);\s*return NO_ERROR;') `
+        'controller service accepts shutdown and pre-shutdown without signalling stack cleanup'
+    Assert-True ([regex]::Matches($controllerServiceSource, 'appendHostLog\(describeStop\(').Count -eq 3) `
+        'controller service records which path ended it on every stop'
     Assert-True ($controllerServiceSource -match '(?s)HANDLE waits\[\] = \{gStopEvent, child, gShutdownEvent\};.*?WAIT_OBJECT_0 \+ 2\) \{\s*//[^\r\n]*\s*reportStatus\(SERVICE_STOPPED\);' -and
-        $controllerServiceSource -match '(?s)unrequestedExitReport\(systemShuttingDown\(kShutdownGraceMilliseconds\)') `
+        $controllerServiceSource -match '(?s)duringShutdown = systemShuttingDown\(kShutdownGraceMilliseconds\);.*?unrequestedExitReport\(duringShutdown') `
         'controller service reports a shutdown-ended controller as a clean stop and other exits as failures'
     Assert-True ($controllerServiceSource -notmatch 'Global\\\\WireGuardProgramSplitControllerStop' -and
         $controllerServiceSource -match 'CreateEventW\(&eventAttributes, TRUE, FALSE, nullptr\)' -and

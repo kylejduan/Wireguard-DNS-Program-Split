@@ -137,16 +137,44 @@ function Stop-Stack([switch] $RestoreCache, [switch] $ThrowOnFailure) {
     }
 }
 
-function Test-TunnelDns([int] $TimeoutMilliseconds = 5000) {
+function Save-HealthFailureEvidence([string] $Reason) {
+    # The restart that follows a failed health check rewrites every component log, which destroys the
+    # only record of why the check failed. Snapshot them first. Best effort: this must never throw.
+    try {
+        $evidenceRoot = Join-Path $logs 'health-failures'
+        $folder = Join-Path $evidenceRoot (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
+        [IO.Directory]::CreateDirectory($folder) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $folder 'reason.txt'), "$(Get-Date -Format o) $Reason")
+        foreach ($file in Get-ChildItem -LiteralPath $logs -File -Filter '*.log') {
+            # The supervisor logs are append-only and large; everything else is what a restart overwrites.
+            if ($file.Name -in 'controller.log', 'controller-service.log' -or $file.Length -gt 5MB) { continue }
+            try {
+                # Running components hold their logs open for writing; share that access instead of failing.
+                $source = [IO.FileStream]::new($file.FullName, 'Open', 'Read', 'ReadWrite, Delete')
+                try {
+                    $target = [IO.File]::Create((Join-Path $folder $file.Name))
+                    try { $source.CopyTo($target) } finally { $target.Dispose() }
+                } finally { $source.Dispose() }
+            } catch { }
+        }
+        Get-ChildItem -LiteralPath $evidenceRoot -Directory | Sort-Object Name -Descending |
+            Select-Object -Skip 10 | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Write-ControllerLog "Health-failure evidence saved to $folder."
+    } catch { }
+}
+
+function Test-TunnelDns([int] $TimeoutMilliseconds = 5000, [int] $Attempts = 1) {
     $probe = Join-Path $root 'bin\dns-probe.exe'
     $stdout = Join-Path $logs 'dns-health.log'
     $stderr = Join-Path $logs 'dns-health-error.log'
+    # The probe retransmits within one run: a lost datagram is not a dead tunnel, and restarting the
+    # stack over it would leave the included applications on the direct route for the whole restart.
     $process = Start-Process -FilePath $probe -ArgumentList @(
-        $configuration.TunnelDns, 'example.com', $TimeoutMilliseconds
+        $configuration.TunnelDns, 'example.com', $TimeoutMilliseconds, $Attempts
     ) `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
     $null = $process.Handle
-    if (-not $process.WaitForExit($TimeoutMilliseconds + 3000)) {
+    if (-not $process.WaitForExit($TimeoutMilliseconds * $Attempts + 3000)) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         throw 'Tunnel DNS health probe timed out.'
     }
@@ -164,7 +192,7 @@ function Test-LocalDns {
     $probe = Join-Path $root 'bin\dns-probe.exe'
     $stdout = Join-Path $logs 'dns-dispatcher-health.log'
     $stderr = Join-Path $logs 'dns-dispatcher-health-error.log'
-    $process = Start-Process -FilePath $probe -ArgumentList @('--system', 'example.com') `
+    $process = Start-Process -FilePath $probe -ArgumentList @('--system', 'example.com', 3) `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
     $null = $process.Handle
     if (-not $process.WaitForExit(8000)) {
@@ -184,7 +212,7 @@ function Test-StackHealth {
     Assert-ProgramSplitNoIpv6DefaultRoute
     Invoke-Component 'Invoke-LocalNrpt.ps1' 'Validate'
     Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Validate'
-    Test-TunnelDns -TimeoutMilliseconds 1000
+    Test-TunnelDns -TimeoutMilliseconds 1000 -Attempts 3
 }
 
 function Invoke-Repair {
@@ -427,6 +455,7 @@ try {
                 catch { Start-Sleep -Milliseconds 250; Test-StackHealth }
             } catch {
                 Write-ControllerLog "Stack health check failed; restarting the stack: $($_.Exception.Message)"
+                Save-HealthFailureEvidence -Reason $_.Exception.Message
                 Stop-Stack
                 Invoke-Repair
             }

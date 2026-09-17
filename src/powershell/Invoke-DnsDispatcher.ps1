@@ -130,7 +130,7 @@ if ($Action -eq 'Validate') {
         throw 'The active physical route, source address, or DNS resolver changed.'
     }
     $probe = Join-Path $root 'bin\dns-probe.exe'
-    $health = Start-Process -FilePath $probe -ArgumentList @('--system', 'example.com') `
+    $health = Start-Process -FilePath $probe -ArgumentList @('--system', 'example.com', 3) `
         -RedirectStandardOutput $healthOut -RedirectStandardError $healthError -WindowStyle Hidden -PassThru
     $null = $health.Handle
     if (-not $health.WaitForExit(8000)) {

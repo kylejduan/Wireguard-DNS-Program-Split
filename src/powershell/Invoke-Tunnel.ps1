@@ -286,8 +286,9 @@ if (-not $existingEndpointRoute) {
 }
 $serviceState = Get-Service -Name $serviceName
 if ($serviceState.Status -eq 'StopPending') {
-    # A stop that never completed would otherwise hold this start for the full readiness wait.
-    Reset-PendingService -SettleSeconds 10
+    # A stop that never completed would otherwise hold this start for the full readiness wait. The
+    # settle window is short so that reset plus the readiness wait stays inside the controller's limit.
+    Reset-PendingService -SettleSeconds 5
     $serviceState.Refresh()
 }
 if ($serviceState.Status -eq 'Stopped') {
