@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Windows controller: keep supervising when an interactive disable cannot complete cleanup (record the failure in `last-error.txt` and retry with bounded backoff), retry service-stop cleanup within the host deadline before reporting failure, and log why a health check restarts the stack. The tunnel component resets a service stuck in `StartPending`/`StopPending` by terminating only the owned `tunnel-host.exe`, and issues a non-blocking start bounded by its readiness wait. A stuck tunnel previously made the controller exit with code 1 on every disable, leaving SCM restarting it in a loop.
+- Windows controller service: accept the shutdown notification and report a controller ended by system shutdown as a clean stop. Every restart and shutdown previously logged the service as failed with service-specific error 1 ("Incorrect function").
 - Windows dispatcher: reuse the route of a name and type answered within the previous three seconds when a repeated query carries no new DNS Client attribution event, instead of answering `SERVFAIL`. Retransmissions and TCP fallback by the Windows DNS Client no longer fail; never-attributed queries still do.
 - Add the experimental Linux include mode: a BPF LSM classifier marks new IPv4 sockets of enrolled executable paths, kernel policy routing and nftables send them and their ordinary DNS through WireGuard, and unlisted programs keep host routing and DNS. See [docs/linux.md](docs/linux.md). Updating from policy ABI 2 requires an explicit disable/uninstall with the old CLI before installing ABI 3 artifacts.
 - Add a Linux CI job for the unprivileged suite, a manual privileged disposable-VM job, and the guarded native overhead measurement harness.

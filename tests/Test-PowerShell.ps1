@@ -111,10 +111,12 @@ Assert-True ($controllerSource -match '(?s)StopEventHandle.*?SafeWaitHandle.*?Wa
 Assert-True ($controllerSource -match '(?s)Stop-Stack -RestoreCache.*?Test-StackPresent.*?continue.*?break') `
     'controller verifies cleanup before completing a service stop'
 Assert-True ($controllerSource -match '(?s)function Stop-Stack.*?ThrowOnFailure.*?cleanupErrors.*?throw' -and
-    $controllerSource -match 'Stop-Stack -RestoreCache -ThrowOnFailure') `
-    'service stop reports component cleanup failures to SCM'
-Assert-True ($controllerSource -match '(?s)if \(-not \$desired\).*?Stop-Stack -RestoreCache -ThrowOnFailure') `
-    'interactive disable also reports component cleanup failures'
+    $controllerSource -match '(?s)\$stopRequestedAt = Get-Date.*?FromSeconds\(200\).*?try \{ Stop-Stack -RestoreCache -ThrowOnFailure \}.*?catch \{.*?if \(\$stopDeadlinePassed\) \{ throw \}.*?continue') `
+    'service stop retries component cleanup within the host deadline before reporting failure to SCM'
+Assert-True ($controllerSource -match '(?s)if \(-not \$desired\).*?try \{.*?Stop-Stack -RestoreCache -ThrowOnFailure.*?\} catch \{.*?WriteAllText\(\$errorFile.*?\$nextCleanup = \(Get-Date\)\.AddSeconds\(\$cleanupDelaySeconds\).*?\[Math\]::Min\(60, \$cleanupDelaySeconds \* 2\)') `
+    'interactive disable records cleanup failures and retries with bounded backoff instead of exiting'
+Assert-True ($controllerSource -match '(?s)catch \{\s*Write-ControllerLog "Stack health check failed.*?\$_\.Exception\.Message.*?Stop-Stack\s*Invoke-Repair') `
+    'controller logs why a health check failed before restarting the stack'
 Assert-True ($controllerSource -match 'Test-Path -LiteralPath \(Join-Path \$state ''endpoint-route\.txt''\)') `
     'controller treats endpoint-route recovery state as a managed stack component'
 Assert-True ($controllerSource -match '(?s)if \(-not \$StopEventHandle\).*?Global\\WireGuardProgramSplitController') `
@@ -388,6 +390,69 @@ try {
         $tunnelSource -notmatch 'Add-ActiveRoute -prefix "\$endpoint/32"' -and
         $tunnelSource -match 'Test-ProgramSplitEndpointRouteOwnership') `
         'tunnel cleanup removes only a recorded exact endpoint-route tuple'
+    Assert-True ($tunnelSource -match '(?s)function Get-OwnedServiceProcess.*?\[string\]\$process\.Path -eq \$hostExe' -and
+        $tunnelSource -match '(?s)function Reset-PendingService.*?StartPending.*?StopPending.*?Get-OwnedServiceProcess.*?Stop-Process -Id \$process\.Id -Force.*?WaitForStatus\(''Stopped''') `
+        'pending tunnel-service reset terminates only the owned host process'
+    $tunnelStopBranch = $tunnelSource.IndexOf("if (`$Action -eq 'Stop')")
+    $tunnelStopReset = $tunnelSource.IndexOf('Reset-PendingService -SettleSeconds 10', $tunnelStopBranch)
+    Assert-True ($tunnelStopBranch -ge 0 -and $tunnelStopReset -gt $tunnelStopBranch -and
+        $tunnelStopReset -lt $tunnelSource.IndexOf('Stop-Service', $tunnelStopBranch)) `
+        'tunnel stop resets a pending service before issuing a stop control'
+    Assert-True ($tunnelSource -match '(?s)\$serviceState\.Start\(\).*?try \{ \$serviceState\.WaitForStatus\(''Running''.*?catch \[System\.ServiceProcess\.TimeoutException\] \{.*?Reset-PendingService -SettleSeconds 0.*?throw' -and
+        $tunnelSource -notmatch 'Start-Service -Name \$serviceName') `
+        'tunnel start issues a non-blocking start control and resets a service that never reports Running'
+    Assert-True ($tunnelSource -match '(?s)if \(\$serviceState\.Status -eq ''StopPending''\) \{.*?Reset-PendingService -SettleSeconds 10.*?if \(\$serviceState\.Status -eq ''Stopped''\)') `
+        'tunnel start clears a stuck stop before deciding whether to start the service'
+    $tunnelTokens = $null
+    $tunnelParseErrors = $null
+    $tunnelAst = [Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $RepositoryRoot 'src\powershell\Invoke-Tunnel.ps1'), [ref] $tunnelTokens, [ref] $tunnelParseErrors)
+    $resetFunctions = @($tunnelAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -in @('Get-OwnedServiceProcess', 'Reset-PendingService')
+    }, $true))
+    Assert-True ($resetFunctions.Count -eq 2) 'tunnel pending-service reset helpers are each defined once'
+    $resetHarness = [scriptblock]::Create((@'
+param([string[]] $Statuses, [string] $ProcessPath, [int] $SettleSeconds)
+$serviceName = 'WireGuardTunnel$WireGuardSplit'
+$hostExe = 'C:\ProgramData\WireGuardProgramSplit\bin\tunnel-host.exe'
+$adapterName = 'WireGuardSplit'
+$killed = [Collections.Generic.List[int]]::new()
+$queue = [Collections.Generic.Queue[string]]::new([string[]] $Statuses)
+$fake = [pscustomobject]@{ Status = $queue.Dequeue(); Queue = $queue }
+$fake | Add-Member -MemberType ScriptMethod -Name Refresh -Value {
+    if ($this.Queue.Count) { $this.Status = $this.Queue.Dequeue() }
+}
+$fake | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value { param($status, $timeout) $this.Status = $status }
+function Get-Service { $fake }
+function Get-CimInstance { [pscustomobject]@{ ProcessId = 4242 } }
+function Get-Process { [pscustomobject]@{ Id = 4242; Path = $ProcessPath } }
+function Stop-Process { param($Id, [switch] $Force, $ErrorAction) $killed.Add([int] $Id) }
+function Get-NetAdapter { $null }
+function Start-Sleep { }
+
+'@) + (($resetFunctions | ForEach-Object { $_.Extent.Text }) -join "`n") + (@'
+
+$failure = $null
+$output = @()
+try { $output = @(Reset-PendingService -SettleSeconds $SettleSeconds) } catch { $failure = $_.Exception.Message }
+[pscustomobject]@{ Killed = @($killed); Failure = $failure; Output = $output; FinalStatus = $fake.Status }
+'@))
+    $ownedHost = 'C:\ProgramData\WireGuardProgramSplit\bin\tunnel-host.exe'
+    $stuckStart = & $resetHarness -Statuses @('StartPending') -ProcessPath $ownedHost -SettleSeconds 0
+    Assert-True (-not $stuckStart.Failure -and @($stuckStart.Killed).Count -eq 1 -and $stuckStart.Killed[0] -eq 4242 -and
+        $stuckStart.FinalStatus -eq 'Stopped' -and ($stuckStart.Output -join ' ') -match 'terminating owned host process 4242') `
+        'a tunnel service stuck in StartPending is reset by terminating its owned host process'
+    $foreignHost = & $resetHarness -Statuses @('StopPending') -ProcessPath 'C:\Other\tunnel-host.exe' -SettleSeconds 0
+    Assert-True (@($foreignHost.Killed).Count -eq 0 -and $foreignHost.Failure -like '*without an owned host process*') `
+        'pending-service reset refuses to terminate a process outside the installed host path'
+    $runningService = & $resetHarness -Statuses @('Running') -ProcessPath $ownedHost -SettleSeconds 0
+    Assert-True (-not $runningService.Failure -and @($runningService.Killed).Count -eq 0 -and
+        $runningService.FinalStatus -eq 'Running') 'pending-service reset leaves a running tunnel service alone'
+    $settledService = & $resetHarness -Statuses @('StartPending', 'Running') -ProcessPath $ownedHost -SettleSeconds 5
+    Assert-True (-not $settledService.Failure -and @($settledService.Killed).Count -eq 0 -and
+        $settledService.FinalStatus -eq 'Running') 'pending-service reset lets a service settle inside its window before terminating anything'
     Assert-True ($tunnelSource -match 'DestinationPrefix\s*=\s*"\$endpoint/32"' -and
         $tunnelSource -match 'InterfaceIndex\s*=\s*\[uint32\]\s*\$physical\.InterfaceIndex' -and
         $tunnelSource -match 'NextHop\s*=\s*\[string\]\s*\$physical\.NextHop' -and
@@ -408,6 +473,12 @@ try {
             $controllerServiceSource.IndexOf('DWORD WINAPI controlHandler'))
     Assert-True ($controllerHandlerSource -notmatch 'reportStatus') `
         'controller service serializes status updates on its service-main thread'
+    Assert-True ($controllerServiceSource -match 'SERVICE_ACCEPT_STOP \| SERVICE_ACCEPT_SHUTDOWN' -and
+        $controllerHandlerSource -match '(?s)SERVICE_CONTROL_SHUTDOWN\) \{\s*if \(gShutdownEvent\) SetEvent\(gShutdownEvent\);\s*return NO_ERROR;') `
+        'controller service accepts shutdown without signalling stack cleanup'
+    Assert-True ($controllerServiceSource -match '(?s)HANDLE waits\[\] = \{gStopEvent, child, gShutdownEvent\};.*?WAIT_OBJECT_0 \+ 2\) \{\s*//[^\r\n]*\s*reportStatus\(SERVICE_STOPPED\);' -and
+        $controllerServiceSource -match '(?s)unrequestedExitReport\(systemShuttingDown\(kShutdownGraceMilliseconds\)') `
+        'controller service reports a shutdown-ended controller as a clean stop and other exits as failures'
     Assert-True ($controllerServiceSource -notmatch 'Global\\\\WireGuardProgramSplitControllerStop' -and
         $controllerServiceSource -match 'CreateEventW\(&eventAttributes, TRUE, FALSE, nullptr\)' -and
         $controllerServiceSource -match '-StopEventHandle') `

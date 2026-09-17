@@ -332,6 +332,9 @@ if (-not $StopEventHandle) {
 $lastHealth = [DateTime]::MinValue
 $nextRepair = [DateTime]::MinValue
 $repairDelaySeconds = 2
+$nextCleanup = [DateTime]::MinValue
+$cleanupDelaySeconds = 2
+$stopRequestedAt = $null
 $networkWaitLogged = $false
 $networkRetryMilliseconds = 250
 $stopEvent = $null
@@ -343,9 +346,22 @@ try {
     }
     while ($true) {
         if ($stopEvent -and $stopEvent.WaitOne(0)) {
-            Write-ControllerLog 'Controller service stop requested.'
-            Stop-Stack -RestoreCache -ThrowOnFailure
+            if (-not $stopRequestedAt) {
+                Write-ControllerLog 'Controller service stop requested.'
+                $stopRequestedAt = Get-Date
+            }
+            # The service host allows four minutes; retry incomplete cleanup until shortly before
+            # that, then report the failure to SCM instead of failing on the first stuck component.
+            $stopDeadlinePassed = (Get-Date) - $stopRequestedAt -ge [TimeSpan]::FromSeconds(200)
+            try { Stop-Stack -RestoreCache -ThrowOnFailure }
+            catch {
+                if ($stopDeadlinePassed) { throw }
+                Write-ControllerLog 'Service-stop cleanup incomplete; retrying.'
+                Start-Sleep -Seconds 2
+                continue
+            }
             if (Test-StackPresent) {
+                if ($stopDeadlinePassed) { throw 'Stack cleanup failed: the managed stack remains present.' }
                 Write-ControllerLog 'Managed stack remains present; retrying service-stop cleanup.'
                 Start-Sleep -Seconds 1
                 continue
@@ -362,7 +378,19 @@ try {
             }
         }
         if (-not $desired) {
-            if (Test-StackPresent) { Stop-Stack -RestoreCache -ThrowOnFailure }
+            if ((Test-StackPresent) -and (Get-Date) -ge $nextCleanup) {
+                try {
+                    Stop-Stack -RestoreCache -ThrowOnFailure
+                    $cleanupDelaySeconds = 2
+                } catch {
+                    # Keep supervising: exiting here only makes SCM restart the controller into the
+                    # same failure. Record it for the tray and retry with bounded backoff.
+                    [IO.File]::WriteAllText($errorFile, ($_ | Out-String))
+                    Write-ControllerLog "Disable cleanup incomplete; retrying in $cleanupDelaySeconds s."
+                    $nextCleanup = (Get-Date).AddSeconds($cleanupDelaySeconds)
+                    $cleanupDelaySeconds = [Math]::Min(60, $cleanupDelaySeconds * 2)
+                }
+            }
             if (-not (Test-StackPresent)) {
                 if (-not (Test-Path -LiteralPath $stackStoppedFile -PathType Leaf)) {
                     try { [IO.File]::WriteAllText($stackStoppedFile, (Get-Date -Format o)) }
@@ -384,7 +412,11 @@ try {
             try {
                 try { Test-StackHealth }
                 catch { Start-Sleep -Milliseconds 250; Test-StackHealth }
-            } catch { Stop-Stack; Invoke-Repair }
+            } catch {
+                Write-ControllerLog "Stack health check failed; restarting the stack: $($_.Exception.Message)"
+                Stop-Stack
+                Invoke-Repair
+            }
             $lastHealth = Get-Date
         }
         $loopWaitMilliseconds = if ($desired -and $script:networkWaitLogged) {

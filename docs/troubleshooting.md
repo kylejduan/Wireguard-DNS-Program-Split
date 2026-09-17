@@ -48,6 +48,10 @@ Unlisted payload should not traverse the tunnel. Confirm the physical default ro
 
 Runtime DLLs are a matched dependency pair. Restore the pair that previously worked or obtain a compatible current pair, reinstall, and rerun the acceptance checks. Never replace only one DLL.
 
+## Controller restarts or the tunnel service stays pending
+
+`controller-service.log` records `Stack cleanup failed` when a component could not be stopped. The usual cause is the tunnel service stuck in `StartPending` or `StopPending`: Windows refuses a stop control in those states, and the WireGuard adapter was never created or removed. The tunnel component terminates its own `tunnel-host.exe` after a short settle window and the controller retries; `controller.log` shows `Tunnel service stuck in` lines and `last-error.txt` holds the last failure. If that reset also fails, the network stack is wedged below the service (the same session usually cannot create other virtual adapters either) and a reboot is required. Health-check restarts are logged as `Stack health check failed`; `dns-health-error.log` holds the last tunnel DNS probe error.
+
 ## Startup is slow
 
 Both `WireGuardProgramSplitController` and the tunnel service should report `Automatic`. Compare the boot timestamp to the first `Stack active after tunnel readiness check` line. The controller has no fixed post-success delay; remaining time is physical-network readiness, adapter creation, endpoint handshake, and the first successful DNS probe. Inspect `controller-service.log` if the controller service itself repeatedly restarts.

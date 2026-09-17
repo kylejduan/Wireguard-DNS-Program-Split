@@ -13,16 +13,19 @@ namespace {
 constexpr wchar_t kServiceName[] = L"WireGuardProgramSplitController";
 constexpr DWORD kStopTimeoutMilliseconds = 240000;
 
+constexpr DWORD kShutdownGraceMilliseconds = 2000;
+
 SERVICE_STATUS_HANDLE gStatusHandle{};
 SERVICE_STATUS gStatus{};
 HANDLE gStopEvent{};
+HANDLE gShutdownEvent{};
 std::wstring gControllerScript;
 
 void reportStatus(DWORD state, DWORD win32ExitCode = NO_ERROR, DWORD serviceExitCode = 0,
                   DWORD waitHint = 0) {
     gStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     gStatus.dwCurrentState = state;
-    gStatus.dwControlsAccepted = state == SERVICE_RUNNING ? SERVICE_ACCEPT_STOP : 0;
+    gStatus.dwControlsAccepted = state == SERVICE_RUNNING ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN : 0;
     gStatus.dwWin32ExitCode = win32ExitCode;
     gStatus.dwServiceSpecificExitCode = serviceExitCode;
     gStatus.dwWaitHint = waitHint;
@@ -119,7 +122,31 @@ bool launchController(HANDLE job, HANDLE& child) {
     return true;
 }
 
+// A child that exits during system shutdown was ended by the shutdown, not by a controller
+// failure; Windows does not send a stop control, so the exit code must not be reported to SCM.
+struct ExitReport {
+    DWORD win32ExitCode;
+    DWORD serviceExitCode;
+};
+
+ExitReport unrequestedExitReport(bool systemShuttingDown, DWORD childExitCode) {
+    if (systemShuttingDown) return {NO_ERROR, 0};
+    return {ERROR_SERVICE_SPECIFIC_ERROR, childExitCode ? childExitCode : 1};
+}
+
+bool systemShuttingDown(DWORD graceMilliseconds) {
+    if (GetSystemMetrics(SM_SHUTTINGDOWN)) return true;
+    return gShutdownEvent && WaitForSingleObject(gShutdownEvent, graceMilliseconds) == WAIT_OBJECT_0;
+}
+
 DWORD WINAPI controlHandler(DWORD control, DWORD, void*, void*) {
+    if (control == SERVICE_CONTROL_INTERROGATE) return NO_ERROR;
+    // Shutdown keeps the stack for boot-time adoption, exactly as before; it only stops the
+    // supervisor from reporting the shutdown-terminated controller as a failure.
+    if (control == SERVICE_CONTROL_SHUTDOWN) {
+        if (gShutdownEvent) SetEvent(gShutdownEvent);
+        return NO_ERROR;
+    }
     if (control != SERVICE_CONTROL_STOP) return ERROR_CALL_NOT_IMPLEMENTED;
     if (gStopEvent) SetEvent(gStopEvent);
     return NO_ERROR;
@@ -139,6 +166,14 @@ void WINAPI serviceMain(DWORD, wchar_t**) {
         return;
     }
     ResetEvent(gStopEvent);
+    gShutdownEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!gShutdownEvent) {
+        const DWORD error = GetLastError();
+        CloseHandle(gStopEvent);
+        gStopEvent = nullptr;
+        reportStatus(SERVICE_STOPPED, error);
+        return;
+    }
 
     SECURITY_ATTRIBUTES jobAttributes{};
     jobAttributes.nLength = sizeof(jobAttributes);
@@ -155,14 +190,19 @@ void WINAPI serviceMain(DWORD, wchar_t**) {
         if (job) CloseHandle(job);
         CloseHandle(gStopEvent);
         gStopEvent = nullptr;
+        CloseHandle(gShutdownEvent);
+        gShutdownEvent = nullptr;
         reportStatus(SERVICE_STOPPED, error ? error : ERROR_SERVICE_SPECIFIC_ERROR, 1);
         return;
     }
 
     reportStatus(SERVICE_RUNNING);
-    HANDLE waits[] = {gStopEvent, child};
-    const DWORD result = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-    if (result == WAIT_OBJECT_0) {
+    HANDLE waits[] = {gStopEvent, child, gShutdownEvent};
+    const DWORD result = WaitForMultipleObjects(3, waits, FALSE, INFINITE);
+    if (result == WAIT_OBJECT_0 + 2) {
+        // Report stopped at once so shutdown is not delayed; closing the job ends the controller.
+        reportStatus(SERVICE_STOPPED);
+    } else if (result == WAIT_OBJECT_0) {
         reportStatus(SERVICE_STOP_PENDING, NO_ERROR, 0, kStopTimeoutMilliseconds);
         const ULONGLONG deadline = GetTickCount64() + kStopTimeoutMilliseconds;
         while (WaitForSingleObject(child, 1000) == WAIT_TIMEOUT && GetTickCount64() < deadline) {
@@ -191,12 +231,17 @@ void WINAPI serviceMain(DWORD, wchar_t**) {
     } else {
         DWORD childExitCode = 1;
         GetExitCodeProcess(child, &childExitCode);
-        reportStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, childExitCode ? childExitCode : 1);
+        // The shutdown control can arrive just after the system has already ended the child.
+        const ExitReport report = unrequestedExitReport(systemShuttingDown(kShutdownGraceMilliseconds),
+                                                        childExitCode);
+        reportStatus(SERVICE_STOPPED, report.win32ExitCode, report.serviceExitCode);
     }
     CloseHandle(child);
     CloseHandle(job);
     CloseHandle(gStopEvent);
     gStopEvent = nullptr;
+    CloseHandle(gShutdownEvent);
+    gShutdownEvent = nullptr;
 }
 
 int selfTest() {
@@ -204,7 +249,13 @@ int selfTest() {
     if (quoteArgument(L"C:\\Program Files\\WireGuard\\Controller.ps1") !=
         L"\"C:\\Program Files\\WireGuard\\Controller.ps1\"") return 2;
     if (quoteArgument(L"C:\\ends-with-slash\\") != L"\"C:\\ends-with-slash\\\\\"") return 3;
-    std::wcout << L"PASS: controller service command-line setup.\n";
+    const ExitReport shutdown = unrequestedExitReport(true, 1);
+    if (shutdown.win32ExitCode != NO_ERROR || shutdown.serviceExitCode != 0) return 4;
+    const ExitReport failure = unrequestedExitReport(false, 1);
+    if (failure.win32ExitCode != ERROR_SERVICE_SPECIFIC_ERROR || failure.serviceExitCode != 1) return 5;
+    const ExitReport zeroExit = unrequestedExitReport(false, 0);
+    if (zeroExit.win32ExitCode != ERROR_SERVICE_SPECIFIC_ERROR || zeroExit.serviceExitCode != 1) return 6;
+    std::wcout << L"PASS: controller service command-line setup and exit reporting.\n";
     return 0;
 }
 
