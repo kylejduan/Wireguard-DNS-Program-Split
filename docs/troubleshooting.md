@@ -44,6 +44,24 @@ Firefox also has its own proxy control under Settings → Network Settings; use 
 
 Unlisted payload should not traverse the tunnel. Confirm the physical default route wins and the tunnel route remains metric `9999`. Compare the same server, browser, protocol, and time window; multi-gigabit browser tests are sensitive to CPU, server capacity, extensions, and HTTP implementation.
 
+To decide whether the stack is involved at all, measure the same workload with it removed. Take a paired sample of new connections to fixed addresses, stop the split, repeat the sample, and start it again:
+
+- Windows: `Stop-Service WireGuardProgramSplitController` removes the NRPT rule, ends `dns-dispatcher.exe`, destroys the dynamic WFP session with all payload filters, and stops the tunnel service; `Start-Service` restores them. Confirm `wfp-probe`, `dns-dispatcher`, the NRPT rule and the tunnel address are absent during the window.
+- Linux: `wg-program-split disable` removes `wgps0`, the `wg_program_split` nftables table, the routing rule and the BPF pins; `wg-program-split activate` restores them. Unlisted traffic is untouched either way, so the only cost of the window is that enrolled programs lose the tunnel.
+
+Selected applications leave through the physical path while the split is stopped, so keep the window short and do not use it as a workaround.
+
+A paired run on both reference hosts on September 17, 2026 measured TCP handshake latency to three fixed public addresses, about 130 to 190 samples per phase:
+
+| Phase | Median | p90 | Max | Samples at or above 100 ms |
+|---|---:|---:|---:|---:|
+| Linux host, split active | 7 ms | 138 ms | 1026 ms | 16.3% |
+| Linux host, split disabled | 7 ms | 280 ms | 442 ms | 24.8% |
+| Windows host, split active | 8 ms | 269 ms | 455 ms | 20.1% |
+| Windows host, split disabled | 8 ms | 295 ms | 510 ms | 18.5% |
+
+Removing the split did not remove the stalls on either operating system, and a Linux probe that overlapped the Windows disabled window spiked in the same ten-second buckets on both hosts (14 of 14 buckets agreed). Connection setup delays of this size are upstream of the host; the measured local cost is microseconds per packet and per socket, and connections that terminate on the local network traverse the same hooks without spiking. Compare a local destination before suspecting the stack.
+
 ## Tunnel does not start after an update
 
 Runtime DLLs are a matched dependency pair. Restore the pair that previously worked or obtain a compatible current pair, reinstall, and rerun the acceptance checks. Never replace only one DLL.
