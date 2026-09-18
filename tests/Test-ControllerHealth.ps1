@@ -26,6 +26,16 @@ Assert-True ($controllerSource -match '(?s)Stack health check failed.*?Save-Heal
     'controller snapshots component logs before the restart that overwrites them'
 Assert-True ($controllerSource -match '(?s)catch \{\s*if \(-not \(Test-ProgramSplitPhysicalInputs.*?holding the stack.*?\} else \{.*?Stop-Stack') `
     'a health failure without physical uplink inputs holds the stack instead of stopping it'
+Assert-True ($controllerSource -match '(?s)function Test-LocalDns.*?if \(-not \(Test-PhysicalResolverAnswers\)\).*?not answering; keeping the stack in place.*?return') `
+    'a local split-DNS probe failure holds the stack when the physical resolver itself is silent'
+Assert-True ($controllerSource -match '(?s)function Test-LocalDns.*?\$script:resolverHoldLogged = \$true.*?\}\s*return') `
+    'the resolver hold logs once instead of on every retry'
+Assert-True ($controllerSource -match '(?s)function Test-LocalDns.*?\$script:resolverHoldLogged = \$false\s*Write-ControllerLog ''Local split-DNS health probe passed') `
+    'the resolver hold flag resets once the probe passes again'
+Assert-True ($controllerSource -match '(?s)function Test-PhysicalResolverAnswers.*?Get-ProgramSplitPhysicalResolver.*?if \(-not \$resolver\) \{ return \$false \}') `
+    'an unknown physical resolver counts as unanswered rather than healthy'
+Assert-True ($controllerSource -match 'Test-ProgramSplitPhysicalInputs -AdapterName \$configuration\.AdapterName `\s*-TunnelDns \$configuration\.TunnelDns\) -or -not \(Test-PhysicalResolverAnswers\)') `
+    'the periodic health path holds for a silent physical resolver as well as missing uplink inputs'
 Assert-True ($controllerSource -match '(?s)try \{ Test-StackHealth \}.*?\$script:physicalHoldLogged = \$false') `
     'a passing health check clears the hold notice so a later outage is logged again'
 
@@ -51,6 +61,12 @@ $inputsFunction = @($commonAst.FindAll({
 }, $true))
 Assert-True ($inputsFunction.Count -eq 1) 'Common defines the physical-input test once'
 . ([scriptblock]::Create($inputsFunction[0].Extent.Text))
+$resolverFunction = @($commonAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ProgramSplitPhysicalResolver'
+}, $true))
+Assert-True ($resolverFunction.Count -eq 1) 'Common defines the physical-resolver lookup once'
+. ([scriptblock]::Create($resolverFunction[0].Extent.Text))
 $script:physicalRoute = [pscustomobject]@{ InterfaceIndex = 15 }
 $script:addresses = @([pscustomobject]@{ AddressState = 'Preferred'; IPAddress = '192.168.1.100' })
 $script:servers = @([pscustomobject]@{ ServerAddresses = @('192.168.1.1') })
@@ -70,6 +86,16 @@ $script:addresses = @([pscustomobject]@{ AddressState = 'Preferred'; IPAddress =
 $script:servers = @([pscustomobject]@{ ServerAddresses = @('127.0.0.1', '10.2.0.1') })
 Assert-True (-not (Test-ProgramSplitPhysicalInputs -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1')) `
     'only loopback and tunnel resolvers report unusable uplink inputs'
+Assert-True ($null -eq (Get-ProgramSplitPhysicalResolver -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1')) `
+    'loopback and tunnel resolvers alone yield no forwarding resolver'
+$script:servers = @([pscustomobject]@{ ServerAddresses = @('127.0.0.1', '192.168.1.1', '10.2.0.1') })
+Assert-True ((Get-ProgramSplitPhysicalResolver -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1') -eq '192.168.1.1') `
+    'the forwarding resolver is the first address that is neither loopback nor the tunnel'
+$script:physicalRoute = $null
+Assert-True ($null -eq (Get-ProgramSplitPhysicalResolver -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1')) `
+    'a missing physical default route yields no forwarding resolver'
+$script:physicalRoute = [pscustomobject]@{ InterfaceIndex = 15 }
+$script:servers = @([pscustomobject]@{ ServerAddresses = @('192.168.1.1') })
 
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("wgps-health-{0}" -f [guid]::NewGuid())
 try {

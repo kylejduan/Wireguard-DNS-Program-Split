@@ -197,6 +197,31 @@ function Test-TunnelDns([int] $TimeoutMilliseconds = 5000, [int] $Attempts = 1) 
     Write-ControllerLog 'Tunnel DNS health probe passed.'
 }
 
+function Test-PhysicalResolverAnswers {
+    # The dispatcher answers unlisted names by forwarding them to the physical resolver,
+    # so a dead LAN resolver fails the local probe no matter how healthy this stack is.
+    # Restarting cannot fix that, and each restart removes the payload filters, so the
+    # caller holds instead. Returns $false when the resolver is unknown or silent.
+    $resolver = Get-ProgramSplitPhysicalResolver -AdapterName $configuration.AdapterName `
+        -TunnelDns $configuration.TunnelDns
+    if (-not $resolver) { return $false }
+    $probe = Join-Path $root 'bin\dns-probe.exe'
+    $stdout = Join-Path $logs 'physical-resolver-probe.log'
+    $stderr = Join-Path $logs 'physical-resolver-probe-error.log'
+    try {
+        $process = Start-Process -FilePath $probe -ArgumentList @($resolver, 'example.com', 1000, 2) `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
+        $null = $process.Handle
+        if (-not $process.WaitForExit(5000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+        $process.WaitForExit()
+        return $process.ExitCode -eq 0 -and
+            (@(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue) -match '^PASS:')
+    } catch { return $false }
+}
+
 function Test-LocalDns {
     $probe = Join-Path $root 'bin\dns-probe.exe'
     $stdout = Join-Path $logs 'dns-dispatcher-health.log'
@@ -212,8 +237,21 @@ function Test-LocalDns {
     $output = @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue)
     $errors = @(Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue)
     if ($process.ExitCode -ne 0 -or -not ($output -match '^PASS:')) {
-        throw "Local split-DNS health probe failed: $($output + $errors -join ' ')"
+        $detail = $output + $errors -join ' '
+        if (-not (Test-PhysicalResolverAnswers)) {
+            # Hold: the dispatcher is forwarding to a resolver that is not answering, so the
+            # probe cannot pass and a restart would only strip the payload filters and leave
+            # selected applications on the physical path while unlisted names fail anyway.
+            if (-not $script:resolverHoldLogged) {
+                Write-ControllerLog ("Local split-DNS probe failed while the physical resolver is " +
+                    "not answering; keeping the stack in place: $detail")
+                $script:resolverHoldLogged = $true
+            }
+            return
+        }
+        throw "Local split-DNS health probe failed: $detail"
     }
+    $script:resolverHoldLogged = $false
     Write-ControllerLog 'Local split-DNS health probe passed.'
 }
 
@@ -377,6 +415,7 @@ $stopRequestedAt = $null
 $stopCleanupWindow = [TimeSpan]::FromSeconds(150)
 $networkWaitLogged = $false
 $physicalHoldLogged = $false
+$resolverHoldLogged = $false
 $networkRetryMilliseconds = 250
 $stopEvent = $null
 try {
@@ -466,13 +505,13 @@ try {
                 $script:physicalHoldLogged = $false
             } catch {
                 if (-not (Test-ProgramSplitPhysicalInputs -AdapterName $configuration.AdapterName `
-                        -TunnelDns $configuration.TunnelDns)) {
+                        -TunnelDns $configuration.TunnelDns) -or -not (Test-PhysicalResolverAnswers)) {
                     # Hold: keep the filters, NRPT rule, dispatcher and tunnel in place so selected
                     # applications stay fail-closed, and re-validate on the next interval. Validation
                     # still restarts the stack once the uplink returns with different inputs.
                     if (-not $script:physicalHoldLogged) {
-                        Write-ControllerLog ("Physical uplink inputs are unavailable; holding the stack " +
-                            "and retrying: $($_.Exception.Message)")
+                        Write-ControllerLog ("Physical uplink inputs or the physical resolver are " +
+                            "unavailable; holding the stack and retrying: $($_.Exception.Message)")
                         $script:physicalHoldLogged = $true
                     }
                 } else {

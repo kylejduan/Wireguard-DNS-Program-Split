@@ -340,9 +340,21 @@ function Test-ProgramSplitPhysicalInputs {
         $source = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $physical.InterfaceIndex -ErrorAction Stop |
             Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -notlike '169.254.*' } |
             Select-Object -First 1 -ExpandProperty IPAddress
-        $resolver = (Get-DnsClientServerAddress -AddressFamily IPv4 `
-            -InterfaceIndex $physical.InterfaceIndex -ErrorAction Stop).ServerAddresses |
-            Where-Object { $_ -notin @('127.0.0.1', $TunnelDns) } | Select-Object -First 1
+        $resolver = Get-ProgramSplitPhysicalResolver -AdapterName $AdapterName -TunnelDns $TunnelDns
         return [bool] ($source -and $resolver)
     } catch { return $false }
+}
+
+function Get-ProgramSplitPhysicalResolver {
+    # The resolver the dispatcher forwards unlisted names to: the first address on the
+    # physical interface that is neither the loopback dispatcher nor the tunnel resolver.
+    # Returns $null when the host has no such address.
+    param([Parameter(Mandatory)] [string] $AdapterName, [string] $TunnelDns)
+
+    try {
+        $physical = Get-ProgramSplitPhysicalDefault -AdapterName $AdapterName
+        return (Get-DnsClientServerAddress -AddressFamily IPv4 `
+            -InterfaceIndex $physical.InterfaceIndex -ErrorAction Stop).ServerAddresses |
+            Where-Object { $_ -notin @('127.0.0.1', $TunnelDns) } | Select-Object -First 1
+    } catch { return $null }
 }

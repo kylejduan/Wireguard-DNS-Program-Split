@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Windows controller: a local split-DNS probe failure now holds the stack when the physical resolver itself is not answering, instead of failing the startup gate and retrying in a loop. The dispatcher answers unlisted names by forwarding them to that resolver, so when a LAN resolver stops responding the probe cannot pass however healthy this stack is; the previous behaviour aborted `Start-Stack` before the payload filters started and cycled, at one point leaving the NRPT rule pointing at a dispatcher that had been stopped, which fails every lookup on the host. The same condition is now also a hold reason in the periodic health path, and `Get-ProgramSplitPhysicalResolver` reports the forwarding resolver for both checks. A dead resolver observed in the field took the whole LAN's DNS down for about ten minutes and cost several restart cycles, each one a fail-open window for the selected applications.
+
 - Windows controller: a periodic health failure while the host has no physical default route, source address or pre-dispatch resolver now holds the stack and retries instead of restarting it. Losing the uplink used to remove the payload filters and the NRPT rule, so selected applications could leave through the physical path while the tunnel could not work anyway; a gateway reboot produced seven such cycles over four and a half minutes. Validation still restarts the stack once the uplink returns with a different route, address or resolver.
 
 ## 0.2.0 - 2026-09-17
