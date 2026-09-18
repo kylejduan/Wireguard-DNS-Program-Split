@@ -122,7 +122,7 @@ $completeComponent = $controllerSource.Substring($controllerSource.IndexOf('func
 Assert-True ($completeComponent.IndexOf('Write-ControllerLog ($output') -ge 0 -and
     $completeComponent.IndexOf('Write-ControllerLog ($output') -lt $completeComponent.IndexOf('$process.ExitCode -ne 0')) `
     'controller logs a component''s output before judging its exit so a failed run keeps its action record'
-Assert-True ($controllerSource -match '(?s)catch \{\s*Write-ControllerLog "Stack health check failed.*?\$_\.Exception\.Message.*?Stop-Stack\s*Invoke-Repair') `
+Assert-True ($controllerSource -match '(?s)Write-ControllerLog "Stack health check failed.*?\$_\.Exception\.Message.*?Stop-Stack\s*Invoke-Repair') `
     'controller logs why a health check failed before restarting the stack'
 Assert-True ($controllerSource -match 'Test-Path -LiteralPath \(Join-Path \$state ''endpoint-route\.txt''\)') `
     'controller treats endpoint-route recovery state as a managed stack component'

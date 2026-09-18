@@ -376,6 +376,7 @@ $cleanupDelaySeconds = 2
 $stopRequestedAt = $null
 $stopCleanupWindow = [TimeSpan]::FromSeconds(150)
 $networkWaitLogged = $false
+$physicalHoldLogged = $false
 $networkRetryMilliseconds = 250
 $stopEvent = $null
 try {
@@ -462,11 +463,25 @@ try {
             try {
                 try { Test-StackHealth }
                 catch { Start-Sleep -Milliseconds 250; Test-StackHealth }
+                $script:physicalHoldLogged = $false
             } catch {
-                Write-ControllerLog "Stack health check failed; restarting the stack: $($_.Exception.Message)"
-                Save-HealthFailureEvidence -Reason $_.Exception.Message
-                Stop-Stack
-                Invoke-Repair
+                if (-not (Test-ProgramSplitPhysicalInputs -AdapterName $configuration.AdapterName `
+                        -TunnelDns $configuration.TunnelDns)) {
+                    # Hold: keep the filters, NRPT rule, dispatcher and tunnel in place so selected
+                    # applications stay fail-closed, and re-validate on the next interval. Validation
+                    # still restarts the stack once the uplink returns with different inputs.
+                    if (-not $script:physicalHoldLogged) {
+                        Write-ControllerLog ("Physical uplink inputs are unavailable; holding the stack " +
+                            "and retrying: $($_.Exception.Message)")
+                        $script:physicalHoldLogged = $true
+                    }
+                } else {
+                    $script:physicalHoldLogged = $false
+                    Write-ControllerLog "Stack health check failed; restarting the stack: $($_.Exception.Message)"
+                    Save-HealthFailureEvidence -Reason $_.Exception.Message
+                    Stop-Stack
+                    Invoke-Repair
+                }
             }
             $lastHealth = Get-Date
         }

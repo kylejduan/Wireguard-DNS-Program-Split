@@ -326,3 +326,23 @@ function Get-ProgramSplitPhysicalDefault {
     if (-not $winner) { throw 'No physical IPv4 default gateway found.' }
     return $winner.Route
 }
+
+function Test-ProgramSplitPhysicalInputs {
+    # True while the host still has the physical default route, source address and
+    # pre-dispatch resolver the dispatcher needs. A health failure without them is an
+    # uplink outage, not a fault in this stack: stopping the stack would remove the
+    # payload filters and the NRPT rule while the tunnel cannot work anyway, which
+    # lets selected applications leave through the physical path.
+    param([Parameter(Mandatory)] [string] $AdapterName, [string] $TunnelDns)
+
+    try {
+        $physical = Get-ProgramSplitPhysicalDefault -AdapterName $AdapterName
+        $source = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $physical.InterfaceIndex -ErrorAction Stop |
+            Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -notlike '169.254.*' } |
+            Select-Object -First 1 -ExpandProperty IPAddress
+        $resolver = (Get-DnsClientServerAddress -AddressFamily IPv4 `
+            -InterfaceIndex $physical.InterfaceIndex -ErrorAction Stop).ServerAddresses |
+            Where-Object { $_ -notin @('127.0.0.1', $TunnelDns) } | Select-Object -First 1
+        return [bool] ($source -and $resolver)
+    } catch { return $false }
+}

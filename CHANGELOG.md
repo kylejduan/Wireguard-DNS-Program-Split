@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Windows controller: a periodic health failure while the host has no physical default route, source address or pre-dispatch resolver now holds the stack and retries instead of restarting it. Losing the uplink used to remove the payload filters and the NRPT rule, so selected applications could leave through the physical path while the tunnel could not work anyway; a gateway reboot produced seven such cycles over four and a half minutes. Validation still restarts the stack once the uplink returns with a different route, address or resolver.
 ## 0.2.0 - 2026-09-17
 
 ### Linux (new, experimental)

@@ -24,6 +24,10 @@ Assert-True ($controllerSource -match 'Wait-ProgramSplitProbe -Probe \{ Test-Tun
     'startup gate keeps single-shot probes because its own loop already retries'
 Assert-True ($controllerSource -match '(?s)Stack health check failed.*?Save-HealthFailureEvidence -Reason \$_\.Exception\.Message\s*Stop-Stack') `
     'controller snapshots component logs before the restart that overwrites them'
+Assert-True ($controllerSource -match '(?s)catch \{\s*if \(-not \(Test-ProgramSplitPhysicalInputs.*?holding the stack.*?\} else \{.*?Stop-Stack') `
+    'a health failure without physical uplink inputs holds the stack instead of stopping it'
+Assert-True ($controllerSource -match '(?s)try \{ Test-StackHealth \}.*?\$script:physicalHoldLogged = \$false') `
+    'a passing health check clears the hold notice so a later outage is logged again'
 
 $tokens = $null
 $parseErrors = $null
@@ -36,6 +40,36 @@ Assert-True ($evidenceFunction.Count -eq 1) 'controller defines the health-failu
 . ([scriptblock]::Create($evidenceFunction[0].Extent.Text))
 $controllerLog = [Collections.Generic.List[string]]::new()
 function Write-ControllerLog([string] $message) { $controllerLog.Add($message) }
+
+# Behaviour of the uplink-input test itself, with the network cmdlets stubbed.
+$commonPath = Join-Path $RepositoryRoot 'src\powershell\Common.ps1'
+$commonTokens = $null; $commonErrors = $null
+$commonAst = [Management.Automation.Language.Parser]::ParseFile($commonPath, [ref] $commonTokens, [ref] $commonErrors)
+$inputsFunction = @($commonAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-ProgramSplitPhysicalInputs'
+}, $true))
+Assert-True ($inputsFunction.Count -eq 1) 'Common defines the physical-input test once'
+. ([scriptblock]::Create($inputsFunction[0].Extent.Text))
+$script:physicalRoute = [pscustomobject]@{ InterfaceIndex = 15 }
+$script:addresses = @([pscustomobject]@{ AddressState = 'Preferred'; IPAddress = '192.168.1.100' })
+$script:servers = @([pscustomobject]@{ ServerAddresses = @('192.168.1.1') })
+function Get-ProgramSplitPhysicalDefault { param([string] $AdapterName) if (-not $script:physicalRoute) { throw 'No physical IPv4 default gateway found.' } $script:physicalRoute }
+function Get-NetIPAddress { param($AddressFamily, $InterfaceIndex, $ErrorAction) $script:addresses }
+function Get-DnsClientServerAddress { param($AddressFamily, $InterfaceIndex, $ErrorAction) $script:servers }
+Assert-True (Test-ProgramSplitPhysicalInputs -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1') `
+    'a preferred physical address and a foreign resolver count as usable uplink inputs'
+$script:physicalRoute = $null
+Assert-True (-not (Test-ProgramSplitPhysicalInputs -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1')) `
+    'a missing physical default route reports unusable uplink inputs'
+$script:physicalRoute = [pscustomobject]@{ InterfaceIndex = 15 }
+$script:addresses = @([pscustomobject]@{ AddressState = 'Preferred'; IPAddress = '169.254.9.9' })
+Assert-True (-not (Test-ProgramSplitPhysicalInputs -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1')) `
+    'an APIPA-only physical address reports unusable uplink inputs'
+$script:addresses = @([pscustomobject]@{ AddressState = 'Preferred'; IPAddress = '192.168.1.100' })
+$script:servers = @([pscustomobject]@{ ServerAddresses = @('127.0.0.1', '10.2.0.1') })
+Assert-True (-not (Test-ProgramSplitPhysicalInputs -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1')) `
+    'only loopback and tunnel resolvers report unusable uplink inputs'
 
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("wgps-health-{0}" -f [guid]::NewGuid())
 try {
