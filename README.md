@@ -84,7 +84,7 @@ The tested kernel target is native Ubuntu 26.04 with Linux 7.0 and active BPF LS
 
 Bot agents can manage their own entries using the [application enrollment workflow](docs/linux-agents.md). It covers native programs, Python, Node, Java, .NET and shell applications through their actual runtime/helper executables, with guidance for dedicated runtimes and shared interpreters.
 
-Design history: [Windows design](docs/design.md), [Linux include-mode design](docs/superpowers/specs/2026-09-12-linux-include-mode-design.md) and its [implementation](docs/superpowers/plans/2026-09-12-linux-include-mode.md) and [optimization](docs/superpowers/plans/2026-09-14-linux-latency-and-activation.md) plans.
+Design: [Windows architecture](docs/design.md) and [Linux operating model](docs/linux.md).
 
 Contributions are welcome under [GPL-3.0-or-later](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
