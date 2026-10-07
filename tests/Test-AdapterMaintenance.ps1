@@ -85,6 +85,10 @@ function Remove-ProgramSplitStrayDevice([string] $InstanceId, [string] $LogDirec
     $script:removed.Add($InstanceId)
     $script:devicePresent = $false
 }
+function Get-PnpDevice { param($Class, $ErrorAction)
+    if ($script:devicePresent) { [pscustomobject]@{InstanceId='ROOT\WIREGUARD\0007'} }
+    [pscustomobject]@{InstanceId='SWD\WireGuard\{11111111-1111-1111-1111-111111111111}'}
+}
 try {
     $script:registryPresent = $false
     Invoke-ProgramSplitAdapterMaintenance -Root $temporary -Repair | Out-Null
@@ -105,6 +109,21 @@ try {
     Assert-True ($evidence.InstanceId -eq 'ROOT\WIREGUARD\0007') 'retains the pre-removal device snapshot'
     Invoke-ProgramSplitAdapterMaintenance -Root $temporary -Repair | Out-Null
     Assert-True ($script:removed.Count -eq 1) 'repeat maintenance is a no-op after removal'
+
+    $script:devicePresent = $true; $script:reads = 0; $script:change = 'remove-failure'
+    $blocked = $false
+    try { Assert-ProgramSplitAdapterPreflight -Root $temporary | Out-Null }
+    catch { $blocked = $_.Exception.Message -match 'creation deferred' }
+    Assert-True $blocked 'preflight blocks new creation when an orphan could not be removed'
+    $script:change = 'traffic'; $script:reads = 0
+    $blocked = $false
+    try { Assert-ProgramSplitAdapterPreflight -Root $temporary | Out-Null }
+    catch { $blocked = $_.Exception.Message -match 'creation deferred' }
+    Assert-True $blocked 'preflight preserves a newly active device and blocks creation'
+    $script:change = ''; $script:reads = 0
+    $output = Assert-ProgramSplitAdapterPreflight -Root $temporary
+    Assert-True ($script:removed.Count -eq 2 -and ($output -join ' ') -match 'PASS:') `
+        'preflight succeeds only after the root device is gone, preserving the SWD tunnel inventory'
 } finally {
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $temporary -Recurse -Force
 }

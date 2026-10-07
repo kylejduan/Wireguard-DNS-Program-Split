@@ -136,3 +136,15 @@ function Invoke-ProgramSplitAdapterMaintenance([string] $Root, [switch] $Repair)
         if ($attemptedRemoval) { break }
     }
 }
+
+function Assert-ProgramSplitAdapterPreflight([string] $Root) {
+    Invoke-ProgramSplitAdapterMaintenance -Root $Root -Repair
+    # Registry-only remnants are not network adapters and remain outside this guard's ownership.
+    # A visible root device that cannot be safely removed blocks new adapter creation instead.
+    $remaining = @(Get-PnpDevice -Class Net -ErrorAction Stop |
+        Where-Object { $_.InstanceId -match '^ROOT\\WIREGUARD\\[0-9]{4}$' })
+    if ($remaining.Count) {
+        throw "Tunnel creation deferred: root WireGuard devices remain ($($remaining.InstanceId -join ', ')). Inspect the maintenance log before retrying."
+    }
+    Write-Output 'PASS: no enumerated root WireGuard devices remain before tunnel creation.'
+}

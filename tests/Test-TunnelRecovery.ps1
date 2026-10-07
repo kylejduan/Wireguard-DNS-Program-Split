@@ -18,12 +18,12 @@ Assert-True ($tunnelStopBranch -ge 0 -and $tunnelStopReset -gt $tunnelStopBranch
     $tunnelStopReset -lt $tunnelSource.IndexOf('$service.Stop()', $tunnelStopBranch) -and
     $tunnelSource -notmatch 'Stop-Service -Name \$serviceName') `
     'tunnel stop resets a pending service first and issues a non-blocking stop control'
-Assert-True ($tunnelSource -match '(?s)\$serviceState\.Start\(\).*?\nWait-ServiceRunning\s*\n\$adapter = Wait-Adapter' -and
+Assert-True ($tunnelSource -match '(?s)Start-TunnelAfterPreflight -ServiceState \$serviceState\s*\nWait-ServiceRunning\s*\n\$adapter = Wait-Adapter' -and
     $tunnelSource -notmatch 'Start-Service -Name \$serviceName') `
     'tunnel start issues a non-blocking start control bounded by the readiness wait'
 Assert-True ($tunnelSource -match '(?s)catch \[System\.ServiceProcess\.TimeoutException\] \{ Reset-PendingService -SettleSeconds 0 \}') `
     'tunnel stop resets a stop that does not finish inside its wait'
-Assert-True ($tunnelSource -match '(?s)if \(\$serviceState\.Status -eq ''StopPending''\) \{.*?Reset-PendingService -SettleSeconds 5\s.*?if \(\$serviceState\.Status -eq ''Stopped''\)') `
+Assert-True ($tunnelSource -match '(?s)if \(\$serviceState\.Status -eq ''StopPending''\) \{.*?Reset-PendingService -SettleSeconds 5\s.*?Start-TunnelAfterPreflight -ServiceState \$serviceState') `
     'tunnel start clears a stuck stop inside a budget that leaves the readiness wait within the controller limit'
 $tunnelTokens = $null
 $tunnelParseErrors = $null

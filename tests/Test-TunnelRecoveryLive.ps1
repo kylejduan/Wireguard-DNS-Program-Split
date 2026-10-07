@@ -26,9 +26,9 @@ $ast = [Management.Automation.Language.Parser]::ParseFile($TunnelScript, [ref] $
 $functions = @($ast.FindAll({
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -in @('Get-OwnedServiceProcess', 'Reset-PendingService', 'Wait-ServiceRunning')
+        $node.Name -in @('Get-OwnedServiceProcess', 'Reset-PendingService', 'Wait-ServiceRunning', 'Start-TunnelAfterPreflight')
 }, $true))
-if ($functions.Count -ne 3) { throw 'The tunnel recovery functions were not found.' }
+if ($functions.Count -ne 4) { throw 'The tunnel recovery functions were not found.' }
 foreach ($function in $functions) { . ([scriptblock]::Create($function.Extent.Text)) }
 
 $suffix = [guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -37,6 +37,14 @@ $workDirectory = Join-Path $env:ProgramData "WgpsRecoveryTest-$suffix"
 $hostExe = Join-Path $workDirectory 'pending-service.exe'
 $adapterName = "WgpsNoAdapter$suffix"
 $stuckHostSeconds = 8
+$preflightFixture = Join-Path $PSScriptRoot 'Invoke-AdapterMaintenance.ps1'
+$preflightFixtureCreated = $false
+# AST-extracted functions have no file-bound PSScriptRoot. Redirect only their helper lookup
+# to the isolated fixture; every other path uses the normal cmdlet.
+function Join-Path { param($Path, $ChildPath)
+    if ($ChildPath -eq 'Invoke-AdapterMaintenance.ps1') { return $preflightFixture }
+    Microsoft.PowerShell.Management\Join-Path $Path $ChildPath
+}
 
 function Set-StubMode([string] $mode) {
     $command = '"{0}" {1}' -f $hostExe, $mode
@@ -108,8 +116,29 @@ try {
     Assert-True ((Get-Service -Name $serviceName).Status -eq 'Stopped' -and -not (Get-StubProcess) -and
         ($output -join ' ') -match 'terminating owned host process') 'a hung stop is reset regardless of host age'
 
+    Write-Output 'Scenario 3: preflight gates real SCM startup and repeated starts reuse the same host'
+    if (Test-Path -LiteralPath $preflightFixture) { throw 'Unexpected preflight fixture already exists.' }
+    [IO.File]::WriteAllText($preflightFixture, "param([string] `$Action)`nthrow 'Test orphan remains'")
+    $preflightFixtureCreated = $true
+    $failure = $null
+    try { Start-TunnelAfterPreflight -ServiceState (Get-Service -Name $serviceName) }
+    catch { $failure = $_.Exception.Message }
+    Assert-True ($failure -match 'Test orphan remains' -and
+        (Get-Service -Name $serviceName).Status -eq 'Stopped' -and -not (Get-StubProcess)) `
+        "failed preflight never starts the real service (failure: $failure)"
+    $global:wgpsLivePreflightCalls = 0
+    [IO.File]::WriteAllText($preflightFixture, 'param($Action); if ($Action -ne "BeforeStart") { throw "Bad action" }; $global:wgpsLivePreflightCalls++')
+    Start-TunnelAfterPreflight -ServiceState (Get-Service -Name $serviceName)
+    (Get-Service -Name $serviceName).WaitForStatus('Running', [TimeSpan]::FromSeconds(15))
+    $firstHost = Get-StubProcess
+    Start-TunnelAfterPreflight -ServiceState (Get-Service -Name $serviceName)
+    Assert-True ($global:wgpsLivePreflightCalls -eq 1 -and (Get-StubProcess).Id -eq $firstHost.Id) `
+        'successful preflight starts once and subsequent starts preserve the same host'
+
     Write-Output 'PASS: tunnel recovery works against the real Service Control Manager.'
 } finally {
+    if ($preflightFixtureCreated) { Remove-Item -LiteralPath $preflightFixture -Force }
+    Remove-Variable -Scope Global -Name wgpsLivePreflightCalls -ErrorAction SilentlyContinue
     Get-StubProcess | ForEach-Object { try { $_.Kill() } catch { } }
     Start-Sleep -Milliseconds 500
     & sc.exe delete $serviceName | Out-Null

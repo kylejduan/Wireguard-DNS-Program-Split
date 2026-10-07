@@ -29,6 +29,10 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
   -File "$(wslpath -w "$repo_root/tests/Test-AdapterMaintenance.ps1")" \
   -RepositoryRoot "$(wslpath -w "$repo_root")"
 
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  -File "$(wslpath -w "$repo_root/tests/Test-TunnelPreflight.ps1")" \
+  -RepositoryRoot "$(wslpath -w "$repo_root")"
+
 "$repo_root/tests/check-public-tree.sh"
 
 # Opt-in: exercise tunnel recovery against the real Service Control Manager. Prompts for elevation and

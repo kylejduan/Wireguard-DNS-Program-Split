@@ -19,7 +19,7 @@ unlisted executable ────────────────────
 - `dns-dispatcher.exe` listens on loopback port 53. It owns a unique per-launch Microsoft-Windows-DNS-Client ETW session, resolves each event's process path, and binds the upstream query to either the physical or tunnel source address.
 - A narrowly owned NRPT `.` rule sends ordinary Windows resolver queries to the dispatcher.
 - `controller-service.exe` starts `Controller.ps1` as an automatic SYSTEM service, cooperates with ordered service stop, accepts shutdown and pre-shutdown so that a controller ended by system shutdown is reported as a clean stop, records which path ended it in `controller-service.log`, and lets Service Control Manager restart a failed controller.
-- `Controller.ps1` owns startup, recovery, and 30-second tunnel plus end-to-end split-DNS health checks.
+- `Controller.ps1` owns startup, recovery, and 30-second tunnel plus end-to-end split-DNS health checks. The controller service is Automatic; the tunnel service is Manual. `Invoke-Tunnel.ps1` serializes stopped-service starts and completes orphan-adapter preflight before starting the host, while adopting a service already Running/StartPending.
 - `Tray.ps1`, running as the interactive user, changes the desired state, executable list, and profile.
 
 ## Route invariant

@@ -42,6 +42,32 @@ function Assert-Administrator {
     }
 }
 
+function Start-TunnelAfterPreflight($ServiceState) {
+    # Serialize our creation attempts. Repeated starts adopt Running/StartPending rather than
+    # invoking the DLL again. Manual SCM startup prevents Windows from racing the boot preflight.
+    $startMutex = [Threading.Mutex]::new($false, 'Global\WireGuardProgramSplitTunnelStart')
+    $startHeld = $false
+    try {
+        try { $startHeld = $startMutex.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $startHeld = $true }
+        if (-not $startHeld) { throw 'Another tunnel start is already in progress.' }
+        $ServiceState.Refresh()
+        if ($ServiceState.Status -ne 'Stopped') { return }
+        & (Join-Path $PSScriptRoot 'Invoke-AdapterMaintenance.ps1') -Action BeforeStart
+        $ServiceState.Refresh()
+        if ($ServiceState.Status -ne 'Stopped') { throw 'Tunnel state changed during adapter preflight.' }
+        # Start issues the control without blocking; the caller bounds the readiness wait.
+        try { $ServiceState.Start() }
+        catch [InvalidOperationException] {
+            $ServiceState.Refresh()
+            if ($ServiceState.Status -eq 'Stopped') { throw }
+        }
+    } finally {
+        if ($startHeld) { $startMutex.ReleaseMutex() }
+        $startMutex.Dispose()
+    }
+}
+
 function Wait-Adapter {
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     do {
@@ -258,7 +284,7 @@ if (-not $ownedEndpointRoute) { Remove-OwnedEndpointRoute }
 $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
 $expectedCommand = '{0} /service {1}' -f $hostExe, $config
 if (-not $service) {
-    $createOutput = & sc.exe create $serviceName 'binPath=' $expectedCommand 'type=' 'own' 'start=' 'auto' 'error=' 'normal' 'depend=' 'Nsi/TcpIp' 'DisplayName=' 'WireGuard Program Split' 2>&1
+    $createOutput = & sc.exe create $serviceName 'binPath=' $expectedCommand 'type=' 'own' 'start=' 'demand' 'error=' 'normal' 'depend=' 'Nsi/TcpIp' 'DisplayName=' 'WireGuard Program Split' 2>&1
     if ($LASTEXITCODE -ne 0) { throw "Failed to create the tunnel service: $($createOutput -join ' ')" }
     & sc.exe sidtype $serviceName unrestricted | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to configure the tunnel service SID.' }
@@ -266,7 +292,7 @@ if (-not $service) {
     throw 'An unexpected service already uses the WireGuard Program Split tunnel name.'
 }
 
-Set-Service -Name $serviceName -StartupType Automatic
+Set-Service -Name $serviceName -StartupType Manual
 
 $existingEndpointRoute = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix "$endpoint/32" `
     -InterfaceIndex $physical.InterfaceIndex -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
@@ -292,14 +318,7 @@ if ($serviceState.Status -eq 'StopPending') {
     Reset-PendingService -SettleSeconds 5
     $serviceState.Refresh()
 }
-if ($serviceState.Status -eq 'Stopped') {
-    # ServiceController.Start returns once the control is issued; Wait-ServiceRunning bounds the rest.
-    try { $serviceState.Start() }
-    catch [InvalidOperationException] {
-        $serviceState.Refresh()
-        if ($serviceState.Status -eq 'Stopped') { throw }
-    }
-}
+Start-TunnelAfterPreflight -ServiceState $serviceState
 Wait-ServiceRunning
 $adapter = Wait-Adapter
 

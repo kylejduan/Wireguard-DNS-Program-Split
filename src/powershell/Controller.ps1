@@ -506,7 +506,7 @@ try {
             Invoke-Repair
             $lastHealth = Get-Date
         } elseif (-not (Test-StackActive)) {
-            # Cold boot may have pre-started the WireGuard service; Start-Stack adopts it.
+            # Adopt an existing owned tunnel; a stopped tunnel gets adapter preflight before start.
             Invoke-Repair
             $lastHealth = Get-Date
         } elseif ((Get-Date) - $lastHealth -gt [TimeSpan]::FromSeconds(30)) {

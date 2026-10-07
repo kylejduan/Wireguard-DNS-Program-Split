@@ -83,7 +83,7 @@ try {
     $plan = [pscustomobject]@{
         DestinationRoot = $DestinationRoot
         ServiceName = 'WireGuardTunnel$WireGuardSplit'
-        ServiceStartType = 'Automatic'
+        ServiceStartType = 'Manual'
         ControllerServiceName = 'WireGuardProgramSplitController'
         ControllerServiceStartType = 'Automatic'
         LegacyControllerTask = 'WireGuard Program Split Controller'

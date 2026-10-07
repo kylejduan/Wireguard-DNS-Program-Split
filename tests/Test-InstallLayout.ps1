@@ -54,7 +54,7 @@ Endpoint = 198.51.100.10:51820
     Assert-True ($plan.DestinationRoot -eq 'C:\ProgramData\WireGuardProgramSplit') `
         'installer normalizes the destination root before planning resource ownership'
     Assert-True ($plan.ServiceName -eq 'WireGuardTunnel$WireGuardSplit') 'installer plans the neutral tunnel service'
-    Assert-True ($plan.ServiceStartType -eq 'Automatic') 'installer pre-starts WireGuard at boot'
+    Assert-True ($plan.ServiceStartType -eq 'Manual') 'controller owns tunnel startup after adapter preflight'
     Assert-True ($plan.ControllerServiceName -eq 'WireGuardProgramSplitController') `
         'installer plans the controller service'
     Assert-True ($plan.ControllerServiceStartType -eq 'Automatic') `
