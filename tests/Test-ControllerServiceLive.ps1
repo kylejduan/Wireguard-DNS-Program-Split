@@ -13,6 +13,14 @@ $exe = Join-Path $RepositoryRoot 'build\controller-service.exe'
 $command = '"{0}" /service "{1}"' -f $exe, $script
 $created = $false
 $process = $null
+function Read-SharedText([string] $Path) {
+    try { $stream = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete') }
+    catch [IO.FileNotFoundException] { return '' } # Rotation may be between rename and reopen.
+    try {
+        $reader = [IO.StreamReader]::new($stream)
+        try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
+}
 function Wait-Until([scriptblock] $Condition, [string] $Description) {
     $deadline = [DateTime]::UtcNow.AddSeconds(40)
     do {
@@ -43,11 +51,11 @@ $event.Dispose()
     $log = Join-Path $root 'logs\controller-service.log'
     Wait-Until {
         (Test-Path -LiteralPath "$log.1") -and
-        ([IO.File]::ReadAllText($log) -match 'OUTPUT-DRAINED')
+        ((Read-SharedText $log) -match 'OUTPUT-DRAINED')
     } 'child output rotation and drain'
     Stop-Service -Name $name
     if (-not $process.WaitForExit(10000)) { throw 'Stopped controller service host remained alive.' }
-    $text = [IO.File]::ReadAllText($log)
+    $text = (Read-SharedText $log)
     if ($text -notmatch 'FINAL-CHILD-ERROR' -or $text -notmatch 'service stop completed with clean stack cleanup') {
         throw 'Ordered service stop lost child stderr or the host exit record.'
     }
@@ -58,7 +66,7 @@ $event.Dispose()
     try { Start-Service -Name $name } catch { } # The deliberate child exit may race Start-Service.
     Wait-Until {
         (Get-Service -Name $name).Status -eq 'Stopped' -and
-        ([IO.File]::ReadAllText($log) -match 'controller exited unexpectedly with code 7')
+        ((Read-SharedText $log) -match 'controller exited unexpectedly with code 7')
     } 'unexpected child exit reporting'
     $record = Get-CimInstance Win32_Service -Filter "Name='$name'"
     if ($record.ExitCode -ne 1066 -or $record.ServiceSpecificExitCode -ne 7) {

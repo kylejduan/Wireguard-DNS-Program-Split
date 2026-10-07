@@ -14,6 +14,14 @@ $zone = "wgps-$id.invalid"
 $trace = "WireGuardProgramSplitDnsEtw-$id"
 $children = [Collections.Generic.List[object]]::new()
 $rule = $null
+function Read-SharedText([string] $Path) {
+    try { $stream = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete') }
+    catch [IO.FileNotFoundException] { return '' } # Rotation may be between rename and reopen.
+    try {
+        $reader = [IO.StreamReader]::new($stream)
+        try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
+}
 function Launch([string] $Exe, [string[]] $Arguments, [string] $Label) {
     $p = Start-Process -FilePath $Exe -ArgumentList $Arguments -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $root "$Label.out") -RedirectStandardError (Join-Path $root "$Label.err")
@@ -25,7 +33,7 @@ function Wait-Ready($Process, [string] $Label) {
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
         if ($Process.HasExited) { throw "$Label exited: $([IO.File]::ReadAllText((Join-Path $root "$Label.err")))" }
-        if ([IO.File]::ReadAllText((Join-Path $root "$Label.out")) -match 'READY') { return }
+        if ((Read-SharedText (Join-Path $root "$Label.out")) -match 'READY') { return }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "$Label did not become ready."
@@ -56,7 +64,7 @@ try {
             }
         }
     }
-    $observed = [IO.File]::ReadAllText((Join-Path $root 'resolver.out'))
+    $observed = (Read-SharedText (Join-Path $root 'resolver.out'))
     foreach ($index in 1..10) {
         if ($observed -notmatch "TUNNEL selected-$index\.$zone" -or $observed -notmatch "DIRECT direct-$index\.$zone") {
             throw "Missing selected/direct forwarding proof for pair $index."
