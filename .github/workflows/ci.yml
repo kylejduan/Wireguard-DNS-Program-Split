@@ -54,6 +54,7 @@ jobs:
           ./tests/Test-TunnelRecovery.ps1 -RepositoryRoot $PWD
           ./tests/Test-ControllerHealth.ps1 -RepositoryRoot $PWD
           ./tests/Test-InstallLayout.ps1 -RepositoryRoot $PWD
+          ./tests/Test-AdapterMaintenance.ps1 -RepositoryRoot $PWD
       - name: Check public tree
         shell: msys2 {0}
         run: ./tests/check-public-tree.sh

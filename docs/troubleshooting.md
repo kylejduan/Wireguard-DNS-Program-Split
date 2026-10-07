@@ -62,6 +62,25 @@ A paired run on both reference hosts on September 17, 2026 measured TCP handshak
 
 Removing the split did not remove the stalls on either operating system, and a Linux probe that overlapped the Windows disabled window spiked in the same ten-second buckets on both hosts (14 of 14 buckets agreed). Connection setup delays of this size are upstream of the host; the measured local cost is microseconds per packet and per socket, and connections that terminate on the local network traverse the same hooks without spiking. Compare a local destination before suspecting the stack.
 
+## Extra WireGuard network adapter
+
+One active `WireGuardSplit` adapter is expected. Other VPNs may legitimately have their own adapters; the display name or a `#2` suffix alone does not establish an orphan.
+
+Windows servicing can create stray `ROOT\WIREGUARD` devices from older driver-installation records. WireGuard documents this in its [upstream cleanup fix](https://github.com/WireGuard/wireguard-nt/commit/b0d305a1865c9b23fa677d9ddeb564a60d315973). Working Windows 11 tunnels use the `SWD\WireGuard` namespace. This project's compatibility maintenance checks after activation and every five minutes while enabled, so an older, compatible runtime pair can remain in use.
+
+The guard requires the owned software-enumerated tunnel to be up and its service to be running. It only removes a root-enumerated network device with WireGuard hardware/service/provider identity, disconnected status, zero sent/received bytes, no manually configured or routable address, and no routes beyond automatic local/multicast routes. It reinspects identity and activity immediately before invoking `pnputil /remove-device` for that exact instance. At most one removal is attempted per pass. Software-enumerated devices, ambiguous/inaccessible devices, registry-only remnants, and shared driver packages are left alone. No service restart, driver removal, or reboot is requested.
+
+From elevated PowerShell, inspect or run maintenance immediately:
+
+```powershell
+& 'C:\ProgramData\WireGuardProgramSplit\src\Invoke-AdapterMaintenance.ps1' -Action Status
+& 'C:\ProgramData\WireGuardProgramSplit\src\Invoke-AdapterMaintenance.ps1' -Action Repair
+```
+
+`Status` does not change devices. The controller records outcomes in `controller.log`; `adapter-removal-before.json` and `adapter-removal-{output,error}.log` retain the latest attempted removal. An incomplete inspection/removal is logged and retried on the next interval without restarting the VPN. A device that has traffic, configuration, or uncertain ownership needs manual investigation instead of wider automatic deletion.
+
+For an existing installation, deploy `AdapterMaintenance.ps1`, `Invoke-AdapterMaintenance.ps1`, and the updated `Controller.ps1` together into the protected `src` directory. The running controller reads its script at launch: the periodic check becomes active on its next service start. The manual command works immediately and does not require restarting the tunnel. A fresh install includes the scripts automatically.
+
 ## Tunnel does not start after an update
 
 Runtime DLLs are a matched dependency pair. Restore the pair that previously worked or obtain a compatible current pair, reinstall, and rerun the acceptance checks. Never replace only one DLL.

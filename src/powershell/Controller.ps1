@@ -72,6 +72,16 @@ function Invoke-Component([string] $name, [string] $action) {
     Complete-Component (Start-Component -name $name -action $action)
 }
 
+function Invoke-AdapterMaintenance {
+    if ((Get-Date) -lt $script:nextAdapterMaintenance) { return }
+    $script:nextAdapterMaintenance = (Get-Date).AddMinutes(5)
+    try { Invoke-Component 'Invoke-AdapterMaintenance.ps1' 'Repair' }
+    catch {
+        try { Write-ControllerLog "Adapter maintenance incomplete; keeping the stack active: $($_.Exception.Message)" }
+        catch { } # Even a logging failure must not turn housekeeping into a VPN restart.
+    }
+}
+
 function Get-ManagedProcess([string] $pidName, [string] $processName, [string] $expectedPath) {
     $path = Join-Path $state $pidName
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
@@ -407,6 +417,7 @@ if (-not $StopEventHandle) {
 [IO.Directory]::CreateDirectory($state) | Out-Null
 [IO.Directory]::CreateDirectory($logs) | Out-Null
 $lastHealth = [DateTime]::MinValue
+$nextAdapterMaintenance = [DateTime]::MinValue
 $nextRepair = [DateTime]::MinValue
 $repairDelaySeconds = 2
 $nextCleanup = [DateTime]::MinValue
@@ -523,6 +534,9 @@ try {
                 }
             }
             $lastHealth = Get-Date
+        }
+        if ($desired -and (Get-Date) -ge $nextAdapterMaintenance -and (Test-StackActive)) {
+            Invoke-AdapterMaintenance
         }
         $loopWaitMilliseconds = if ($desired -and $script:networkWaitLogged) {
             $script:networkRetryMilliseconds
