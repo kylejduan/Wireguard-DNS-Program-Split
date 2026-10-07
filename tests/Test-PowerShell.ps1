@@ -112,11 +112,11 @@ Assert-True ($controllerSource -match '(?s)Stop-Stack -RestoreCache.*?Test-Stack
     'controller verifies cleanup before completing a service stop'
 Assert-True ($controllerSource -match '(?s)function Stop-Stack.*?ThrowOnFailure.*?cleanupErrors.*?throw' -and
     $controllerSource -match '\$stopCleanupWindow = \[TimeSpan\]::FromSeconds\(150\)' -and
-    $controllerSource -match '(?s)\$stopRequestedAt = Get-Date.*?try \{ Stop-Stack -RestoreCache -ThrowOnFailure \}\s*catch \{\s*if \(\(Get-Date\) - \$stopRequestedAt -ge \$stopCleanupWindow\) \{ throw \}.*?continue') `
+    $controllerSource -match '(?s)\$stopRequestedAt = Get-ControllerElapsed.*?try \{ Stop-Stack -RestoreCache -ThrowOnFailure \}\s*catch \{\s*if \(\(Get-ControllerElapsed\) - \$stopRequestedAt -ge \$stopCleanupWindow\) \{ throw \}.*?continue') `
     'service stop retries cleanup and checks its window after each attempt, well inside the host deadline'
-Assert-True ($controllerSource -match '(?s)if \(-not \$desired\).*?try \{.*?Stop-Stack -RestoreCache -ThrowOnFailure.*?\} catch \{.*?try \{ \[IO\.File\]::WriteAllText\(\$errorFile, \$cleanupFailure\) \} catch \{ \}.*?\$nextCleanup = \(Get-Date\)\.AddSeconds\(\$cleanupDelaySeconds\).*?\[Math\]::Min\(60, \$cleanupDelaySeconds \* 2\)') `
+Assert-True ($controllerSource -match '(?s)if \(-not \$desired\).*?try \{.*?Stop-Stack -RestoreCache -ThrowOnFailure.*?\} catch \{.*?try \{ \[IO\.File\]::WriteAllText\(\$errorFile, \$cleanupFailure\) \} catch \{ \}.*?\$nextCleanup = \(Get-ControllerElapsed\) \+ \[TimeSpan\]::FromSeconds\(\$cleanupDelaySeconds\).*?\[Math\]::Min\(60, \$cleanupDelaySeconds \* 2\)') `
     'interactive disable records cleanup failures best-effort and retries with bounded backoff instead of exiting'
-Assert-True ($controllerSource -match '(?s)if \(\$desired\) \{\s*\$nextCleanup = \[DateTime\]::MinValue\s*\$cleanupDelaySeconds = 2') `
+Assert-True ($controllerSource -match '(?s)if \(\$desired\) \{\s*\$nextCleanup = \[TimeSpan\]::Zero\s*\$cleanupDelaySeconds = 2') `
     'enabling the stack clears disable-cleanup backoff so a later disable is not deferred'
 $completeComponent = $controllerSource.Substring($controllerSource.IndexOf('function Complete-Component'))
 Assert-True ($completeComponent.IndexOf('Write-ControllerLog ($output') -ge 0 -and

@@ -36,6 +36,7 @@ static_assert(kProcessTraceMode & PROCESS_TRACE_MODE_RAW_TIMESTAMP);
 std::atomic_bool gRunning{true};
 std::atomic<HANDLE> gTraceFlushRequested{nullptr};
 std::atomic_uint gActiveWorkers{};
+std::atomic_uint gHintWaiters{};
 SOCKET gUdpListener{INVALID_SOCKET};
 SOCKET gTcpListener{INVALID_SOCKET};
 std::mutex gLogMutex;
@@ -256,7 +257,9 @@ public:
             flusher_ = std::thread([this] {
                 auto* current = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(properties_.data());
                 while (!stopping_) {
-                    WaitForSingleObject(flushRequested_, 10);
+                    // Queries request an immediate flush. Keep the low-latency retry cadence
+                    // only while attribution is pending; idle DNS does not need 100 flushes/s.
+                    WaitForSingleObject(flushRequested_, gHintWaiters.load() ? 10 : 1000);
                     if (stopping_) break;
                     FlushTraceW(session_, traceName_.c_str(), current);
                 }

@@ -157,6 +157,7 @@ int selfTest() {
     if (!recovered || !*recovered) return 27;
     if (!socketDeadlineTest()) return 28;
     if (!exchangeTest(query, false) || !exchangeTest(query, true)) return 29;
+    if (gHintWaiters.load()) return 30;
     std::wcout << L"PASS: DNS parsing, attribution capacity/recovery, and real socket deadlines.\n";
     return 0;
 }

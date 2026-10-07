@@ -18,6 +18,11 @@ $errorFile = Join-Path $state 'last-error.txt'
 $logFile = Join-Path $logs 'controller.log'
 $includeFile = Join-Path $state 'included-apps.txt'
 
+function Get-ControllerElapsed {
+    # Monotonic scheduling survives daylight-saving changes and wall-clock corrections.
+    [TimeSpan]::FromSeconds([Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency)
+}
+
 function Write-ControllerLog([string] $message) {
     # A log write failure must not become a routing failure or crash loop.
     try {
@@ -84,8 +89,8 @@ function Invoke-Component([string] $name, [string] $action) {
 }
 
 function Invoke-AdapterMaintenance {
-    if ((Get-Date) -lt $script:nextAdapterMaintenance) { return }
-    $script:nextAdapterMaintenance = (Get-Date).AddMinutes(5)
+    if ((Get-ControllerElapsed) -lt $script:nextAdapterMaintenance) { return }
+    $script:nextAdapterMaintenance = (Get-ControllerElapsed) + [TimeSpan]::FromMinutes(5)
     try { Invoke-Component 'Invoke-AdapterMaintenance.ps1' 'Repair' }
     catch {
         try { Write-ControllerLog "Adapter maintenance incomplete; keeping the stack active: $($_.Exception.Message)" }
@@ -294,7 +299,7 @@ function Test-StackHealth {
 }
 
 function Invoke-Repair {
-    if ((Get-Date) -lt $script:nextRepair) { return }
+    if ((Get-ControllerElapsed) -lt $script:nextRepair) { return }
     try {
         Get-ProgramSplitPhysicalDefault -AdapterName $configuration.AdapterName | Out-Null
         $script:networkWaitLogged = $false
@@ -309,9 +314,9 @@ function Invoke-Repair {
     try {
         Start-Stack
         $script:repairDelaySeconds = 2
-        $script:nextRepair = [DateTime]::MinValue
+        $script:nextRepair = [TimeSpan]::Zero
     } catch {
-        $script:nextRepair = (Get-Date).AddSeconds($script:repairDelaySeconds)
+        $script:nextRepair = (Get-ControllerElapsed) + [TimeSpan]::FromSeconds($script:repairDelaySeconds)
         $script:repairDelaySeconds = [Math]::Min(60, $script:repairDelaySeconds * 2)
     }
 }
@@ -437,11 +442,11 @@ if (-not $StopEventHandle) {
 
 [IO.Directory]::CreateDirectory($state) | Out-Null
 [IO.Directory]::CreateDirectory($logs) | Out-Null
-$lastHealth = [DateTime]::MinValue
-$nextAdapterMaintenance = [DateTime]::MinValue
-$nextRepair = [DateTime]::MinValue
+$lastHealth = [TimeSpan]::Zero
+$nextAdapterMaintenance = [TimeSpan]::Zero
+$nextRepair = [TimeSpan]::Zero
 $repairDelaySeconds = 2
-$nextCleanup = [DateTime]::MinValue
+$nextCleanup = [TimeSpan]::Zero
 $cleanupDelaySeconds = 2
 $stopRequestedAt = $null
 $stopCleanupWindow = [TimeSpan]::FromSeconds(150)
@@ -460,20 +465,20 @@ try {
         if ($stopEvent -and $stopEvent.WaitOne(0)) {
             if (-not $stopRequestedAt) {
                 Write-ControllerLog 'Controller service stop requested.'
-                $stopRequestedAt = Get-Date
+                $stopRequestedAt = Get-ControllerElapsed
             }
             # The service host force-ends this process four minutes after the stop control. Retry
             # incomplete cleanup, but check the window after each attempt, which can itself take most
             # of a minute, so the failure is thrown and logged here instead of arriving as a forced end.
             try { Stop-Stack -RestoreCache -ThrowOnFailure }
             catch {
-                if ((Get-Date) - $stopRequestedAt -ge $stopCleanupWindow) { throw }
+                if ((Get-ControllerElapsed) - $stopRequestedAt -ge $stopCleanupWindow) { throw }
                 Write-ControllerLog 'Service-stop cleanup incomplete; retrying.'
                 Start-Sleep -Seconds 2
                 continue
             }
             if (Test-StackPresent) {
-                if ((Get-Date) - $stopRequestedAt -ge $stopCleanupWindow) {
+                if ((Get-ControllerElapsed) - $stopRequestedAt -ge $stopCleanupWindow) {
                     throw 'Stack cleanup failed: the managed stack remains present.'
                 }
                 Write-ControllerLog 'Managed stack remains present; retrying service-stop cleanup.'
@@ -484,7 +489,7 @@ try {
         }
         $desired = Test-Path -LiteralPath $enabledFile -PathType Leaf
         if ($desired) {
-            $nextCleanup = [DateTime]::MinValue
+            $nextCleanup = [TimeSpan]::Zero
             $cleanupDelaySeconds = 2
             try { Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile }
             catch {
@@ -494,7 +499,7 @@ try {
             }
         }
         if (-not $desired) {
-            if ((Test-StackPresent) -and (Get-Date) -ge $nextCleanup) {
+            if ((Test-StackPresent) -and (Get-ControllerElapsed) -ge $nextCleanup) {
                 try {
                     Stop-Stack -RestoreCache -ThrowOnFailure
                     if ($cleanupDelaySeconds -gt 2) {
@@ -509,7 +514,7 @@ try {
                     $cleanupFailure = $_ | Out-String
                     try { [IO.File]::WriteAllText($errorFile, $cleanupFailure) } catch { }
                     try { Write-ControllerLog "Disable cleanup incomplete; retrying in $cleanupDelaySeconds s." } catch { }
-                    $nextCleanup = (Get-Date).AddSeconds($cleanupDelaySeconds)
+                    $nextCleanup = (Get-ControllerElapsed) + [TimeSpan]::FromSeconds($cleanupDelaySeconds)
                     $cleanupDelaySeconds = [Math]::Min(60, $cleanupDelaySeconds * 2)
                 }
             }
@@ -525,12 +530,12 @@ try {
             Remove-Item -LiteralPath $reloadFile -Force -ErrorAction SilentlyContinue
             Stop-Stack
             Invoke-Repair
-            $lastHealth = Get-Date
+            $lastHealth = Get-ControllerElapsed
         } elseif (-not (Test-StackActive)) {
             # Adopt an existing owned tunnel; a stopped tunnel gets adapter preflight before start.
             Invoke-Repair
-            $lastHealth = Get-Date
-        } elseif ((Get-Date) - $lastHealth -gt [TimeSpan]::FromSeconds(30)) {
+            $lastHealth = Get-ControllerElapsed
+        } elseif ((Get-ControllerElapsed) - $lastHealth -gt [TimeSpan]::FromSeconds(30)) {
             try {
                 try { Test-StackHealth }
                 catch { Start-Sleep -Milliseconds 250; Test-StackHealth }
@@ -554,9 +559,9 @@ try {
                     Invoke-Repair
                 }
             }
-            $lastHealth = Get-Date
+            $lastHealth = Get-ControllerElapsed
         }
-        if ($desired -and (Get-Date) -ge $nextAdapterMaintenance -and (Test-StackActive)) {
+        if ($desired -and (Get-ControllerElapsed) -ge $nextAdapterMaintenance -and (Test-StackActive)) {
             Invoke-AdapterMaintenance
         }
         $loopWaitMilliseconds = if ($desired -and $script:networkWaitLogged) {

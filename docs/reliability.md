@@ -5,6 +5,8 @@ As of October 7, 2026, the repository has been audited for lifecycle recovery, a
 ## Repairs
 
 - Windows controller, dispatcher, and service-output logs rotate automatically. Failure snapshots copy a finite tail even while the source grows.
+- Controller scheduling uses monotonic time so daylight-saving transitions and clock corrections do not defer health checks or cleanup.
+- Idle ETW flushing uses a one-second cadence; waiting queries trigger immediate flushing and retain 10 ms retries.
 - DNS attribution expires on event ingestion as well as lookup and has a hard capacity. Overflow fails closed until the attribution lifetime has elapsed.
 - TCP connect and partial transfers have total deadlines. Client connections have bounded request counts, sockets close on exceptions, and DNS workers finish before shared state is destroyed.
 - ETW names are read within their returned buffer, property allocation is bounded, callback exceptions cannot unwind through the Windows callback ABI, and partial trace startup is cleaned up.

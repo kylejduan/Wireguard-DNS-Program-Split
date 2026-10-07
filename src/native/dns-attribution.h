@@ -50,6 +50,10 @@ public:
     std::optional<bool> take(const std::wstring& name, uint16_t type, bool* reused = nullptr) {
         const auto key = makeKey(name, type);
         if (reused) *reused = false;
+        struct Waiting {
+            Waiting() { gHintWaiters.fetch_add(1); }
+            ~Waiting() { gHintWaiters.fetch_sub(1); }
+        } waiting;
         if (const HANDLE flush = gTraceFlushRequested.load()) SetEvent(flush);
         std::unique_lock lock(mutex_);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);

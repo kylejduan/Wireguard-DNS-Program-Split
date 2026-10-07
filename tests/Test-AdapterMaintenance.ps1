@@ -138,17 +138,22 @@ $function = @($ast.FindAll({param($node)
 }, $true))
 Assert-True ($function.Count -eq 1) 'controller defines one maintenance scheduler'
 . ([scriptblock]::Create($function[0].Extent.Text))
+$script:elapsed = [TimeSpan]::Zero
+function Get-ControllerElapsed { $script:elapsed }
 $script:calls = 0
 $script:messages = [Collections.Generic.List[string]]::new()
 function Invoke-Component { param($name,$action) $script:calls++; throw 'Mock maintenance failure' }
 function Write-ControllerLog([string] $message) { $script:messages.Add($message) }
-$script:nextAdapterMaintenance = [DateTime]::MinValue
+$script:nextAdapterMaintenance = [TimeSpan]::Zero
 Invoke-AdapterMaintenance
 Invoke-AdapterMaintenance
 Assert-True ($script:calls -eq 1 -and $script:messages[0] -match 'keeping the stack active' -and
-    $script:nextAdapterMaintenance -gt (Get-Date).AddMinutes(4)) 'failure stays nonfatal and backs off for five minutes'
+    $script:nextAdapterMaintenance -eq [TimeSpan]::FromMinutes(5)) 'failure stays nonfatal and backs off for five minutes'
 function Write-ControllerLog([string] $message) { throw 'Mock disk failure' }
-$script:nextAdapterMaintenance = [DateTime]::MinValue
+$script:nextAdapterMaintenance = [TimeSpan]::Zero
 Invoke-AdapterMaintenance
 Assert-True ($script:calls -eq 2) 'even a maintenance logging failure does not escape into service recovery'
+$script:elapsed = [TimeSpan]::FromMinutes(6)
+Invoke-AdapterMaintenance
+Assert-True ($script:calls -eq 3) 'maintenance resumes when the monotonic five-minute deadline passes'
 Write-Output 'PASS: adapter maintenance preserves active/foreign devices, rechecks identity, and isolates failures.'
