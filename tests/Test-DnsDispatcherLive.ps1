@@ -3,10 +3,15 @@
 param([Parameter(Mandatory)] [string] $RepositoryRoot)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-if ((Get-Service -Name WireGuardProgramSplitController -ErrorAction SilentlyContinue) -or
-    (Get-NetUDPEndpoint -LocalPort 53 -ErrorAction SilentlyContinue) -or
-    (Get-NetTCPConnection -LocalPort 53 -State Listen -ErrorAction SilentlyContinue)) {
-    throw 'DNS integration test requires a disposable host without the project or a DNS listener.'
+$addresses = @('0.0.0.0', '127.0.0.1', '127.0.0.2', '127.0.0.3')
+$existingService = Get-Service -Name WireGuardProgramSplitController -ErrorAction SilentlyContinue
+$udp = @(Get-NetUDPEndpoint -LocalPort 53 -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in $addresses })
+$tcp = @(Get-NetTCPConnection -LocalPort 53 -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in $addresses })
+if ($existingService -or $udp.Count -or $tcp.Count) {
+    $existingService | Format-Table Name, Status
+    $udp | Format-Table LocalAddress, LocalPort, OwningProcess
+    $tcp | Format-Table LocalAddress, LocalPort, OwningProcess
+    throw 'DNS integration test requires a disposable host without the project or a conflicting loopback DNS listener.'
 }
 $id = [guid]::NewGuid().ToString('N')
 $root = Join-Path $RepositoryRoot "local\test-temp\dns live $id"
