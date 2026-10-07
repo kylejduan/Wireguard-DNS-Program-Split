@@ -8,6 +8,9 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <memory>
+#include "log-pipe.h"
+#include "log-self-test.h"
 
 namespace {
 
@@ -22,6 +25,7 @@ HANDLE gStopEvent{};
 HANDLE gShutdownEvent{};
 HANDLE gServiceMainDone{};
 std::wstring gControllerScript;
+std::unique_ptr<wgps::BoundedLog> gHostLog;
 
 // Pre-shutdown is delivered before Windows starts ending processes, so the host learns of a shutdown
 // before the controller is killed by it. Plain shutdown stays accepted as a second signal.
@@ -63,10 +67,7 @@ std::filesystem::path hostLogPath() {
 
 // Messages are ASCII by construction (describeStop), so narrowing each character is lossless here.
 void appendHostLog(const std::wstring& message) {
-    HANDLE log = CreateFileW(hostLogPath().c_str(), FILE_APPEND_DATA,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
-                             FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (log == INVALID_HANDLE_VALUE) return;
+    if (!gHostLog) return;
     SYSTEMTIME now{};
     GetLocalTime(&now);
     TIME_ZONE_INFORMATION zone{};
@@ -81,9 +82,7 @@ void appendHostLog(const std::wstring& message) {
              std::labs(east) % 60);
     const std::wstring line = std::wstring(stamp) + L" controller-service: " + message + L"\r\n";
     std::string narrow(line.begin(), line.end());
-    DWORD written{};
-    WriteFile(log, narrow.data(), static_cast<DWORD>(narrow.size()), &written, nullptr);
-    CloseHandle(log);
+    gHostLog->write(narrow);
 }
 
 void reportStatus(DWORD state, DWORD win32ExitCode = NO_ERROR, DWORD serviceExitCode = 0,
@@ -128,35 +127,25 @@ std::wstring powerShellPath() {
             L"powershell.exe").wstring();
 }
 
-bool launchController(HANDLE job, HANDLE& child) {
+bool launchController(HANDLE job, HANDLE& child, HANDLE log) {
     const std::filesystem::path script(gControllerScript);
     const std::filesystem::path logDirectory = script.parent_path().parent_path() / L"logs";
     std::error_code error;
     std::filesystem::create_directories(logDirectory, error);
     if (error) return false;
 
-    HANDLE log = CreateFileW((logDirectory / L"controller-service.log").c_str(), GENERIC_WRITE,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (log == INVALID_HANDLE_VALUE) return false;
-    SetFilePointer(log, 0, nullptr, FILE_END);
-    if (!SetHandleInformation(log, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
-        CloseHandle(log);
-        return false;
-    }
+    if (!log) return false;
     HANDLE nullInput = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (nullInput == INVALID_HANDLE_VALUE ||
         !SetHandleInformation(nullInput, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
         if (nullInput != INVALID_HANDLE_VALUE) CloseHandle(nullInput);
-        CloseHandle(log);
         return false;
     }
 
     const std::wstring powerShell = powerShellPath();
     if (powerShell.empty()) {
         CloseHandle(nullInput);
-        CloseHandle(log);
         return false;
     }
     std::wstring commandLine = quoteArgument(powerShell) +
@@ -174,7 +163,6 @@ bool launchController(HANDLE job, HANDLE& child) {
                                         CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup,
                                         &process);
     CloseHandle(nullInput);
-    CloseHandle(log);
     if (!created) return false;
     if (!AssignProcessToJobObject(job, process.hProcess) || ResumeThread(process.hThread) == DWORD(-1)) {
         TerminateProcess(process.hProcess, ERROR_PROCESS_ABORTED);
@@ -253,8 +241,9 @@ void WINAPI serviceMain(DWORD, wchar_t**) {
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
                                               JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
     HANDLE child{};
+    wgps::LogPipe output(*gHostLog);
     if (!job || !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
-        !launchController(job, child)) {
+        !launchController(job, child, output.writer())) {
         const DWORD error = GetLastError();
         if (child) CloseHandle(child);
         if (job) CloseHandle(job);
@@ -347,7 +336,8 @@ int selfTest() {
     if (describeStop(StopPath::ServiceStopFailed, 5).find(L"code 5") == std::wstring::npos) return 13;
     if (describeStop(StopPath::ServiceStopForced, 0).find(L"forced") == std::wstring::npos) return 14;
     if (describeStop(StopPath::ServiceStop, 0).find(L"clean") == std::wstring::npos) return 15;
-    std::wcout << L"PASS: controller service command-line setup and exit reporting.\n";
+    if (!wgps::logSelfTest()) return 16;
+    std::wcout << L"PASS: bounded logs and controller service command-line setup and exit reporting.\n";
     return 0;
 }
 
@@ -360,6 +350,7 @@ int wmain(int argc, wchar_t** argv) {
         return 2;
     }
     gControllerScript = argv[2];
+    gHostLog = std::make_unique<wgps::BoundedLog>(hostLogPath());
     SERVICE_TABLE_ENTRYW services[] = {{const_cast<wchar_t*>(kServiceName), serviceMain}, {nullptr, nullptr}};
     gServiceMainDone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!StartServiceCtrlDispatcherW(services)) return 3;

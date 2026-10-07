@@ -3,6 +3,8 @@
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo"
+mkdir -p "$repo/local/test-temp"
+export TMPDIR="$repo/local/test-temp"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$repo/src/linux"
 case "${1:-}" in

@@ -11,7 +11,7 @@ Set-StrictMode -Version Latest
 
 if (-not (Test-Path -LiteralPath $InputPath -PathType Leaf)) { throw 'The WireGuard profile was not found.' }
 
-$lines = [IO.File]::ReadAllLines((Resolve-Path -LiteralPath $InputPath))
+$lines = [IO.File]::ReadAllLines((Resolve-Path -LiteralPath $InputPath).ProviderPath)
 $result = [Collections.Generic.List[string]]::new()
 $section = ''
 $sawPrivateKey = $false

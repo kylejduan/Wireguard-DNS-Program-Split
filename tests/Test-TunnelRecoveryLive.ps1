@@ -33,7 +33,7 @@ foreach ($function in $functions) { . ([scriptblock]::Create($function.Extent.Te
 
 $suffix = [guid]::NewGuid().ToString('N').Substring(0, 8)
 $serviceName = "WgpsRecoveryTest$suffix"
-$workDirectory = Join-Path $env:ProgramData "WgpsRecoveryTest-$suffix"
+$workDirectory = Join-Path $PSScriptRoot "WgpsRecoveryTest-$suffix"
 $hostExe = Join-Path $workDirectory 'pending-service.exe'
 $adapterName = "WgpsNoAdapter$suffix"
 $stuckHostSeconds = 8

@@ -46,7 +46,7 @@ function Get-ExpectedProcesses {
 function Stop-ExpectedProcesses {
     foreach ($process in @(Get-ExpectedProcesses)) {
         Stop-Process -Id $process.Id -Force
-        $process.WaitForExit()
+        if (-not $process.WaitForExit(10000)) { throw "WFP filter host $($process.Id) did not stop." }
     }
 }
 
@@ -58,6 +58,13 @@ if ($Action -eq 'Status') {
 }
 
 Assert-Administrator
+
+$componentMutex = [Threading.Mutex]::new($false, 'Global\WireGuardProgramSplitWfpComponent')
+$mutexHeld = $false
+try {
+    try { $mutexHeld = $componentMutex.WaitOne(30000) }
+    catch [Threading.AbandonedMutexException] { $mutexHeld = $true }
+    if (-not $mutexHeld) { throw 'Timed out waiting for the WFP component lock.' }
 
 if ($Action -eq 'Stop') {
     Stop-ExpectedProcesses
@@ -89,7 +96,7 @@ $process = $null
 $started = $false
 try {
     $process = Start-Process -FilePath $exe -ArgumentList @(
-        $IncludedAppsFile, $configuration.TunnelAddress
+        ('"{0}"' -f $IncludedAppsFile), $configuration.TunnelAddress
     ) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
     [IO.File]::WriteAllText($pidFile, [string]$process.Id)
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
@@ -108,4 +115,8 @@ try {
         if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
         Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
     }
+}
+} finally {
+    if ($mutexHeld) { $componentMutex.ReleaseMutex() }
+    $componentMutex.Dispose()
 }

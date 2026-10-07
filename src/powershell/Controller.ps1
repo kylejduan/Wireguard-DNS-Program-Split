@@ -19,8 +19,19 @@ $logFile = Join-Path $logs 'controller.log'
 $includeFile = Join-Path $state 'included-apps.txt'
 
 function Write-ControllerLog([string] $message) {
-    [IO.Directory]::CreateDirectory($logs) | Out-Null
-    Add-Content -LiteralPath $logFile -Value "$(Get-Date -Format o) $message"
+    # A log write failure must not become a routing failure or crash loop.
+    try {
+        [IO.Directory]::CreateDirectory($logs) | Out-Null
+        $line = "$(Get-Date -Format o) $message"
+        if ($line.Length -gt 16384) { $line = $line.Substring(0, 16384) + ' [truncated]' }
+        if ((Test-Path -LiteralPath $logFile) -and (Get-Item -LiteralPath $logFile).Length -gt (8MB - 64KB)) {
+            foreach ($index in 3..1) {
+                $source = if ($index -eq 1) { $logFile } else { "$logFile.$($index - 1)" }
+                if (Test-Path -LiteralPath $source) { Move-Item -LiteralPath $source -Destination "$logFile.$index" -Force }
+            }
+        }
+        Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8
+    } catch { }
 }
 
 function Start-Component([string] $name, [string] $action) {
@@ -158,7 +169,7 @@ function Save-HealthFailureEvidence([string] $Reason) {
         [IO.File]::WriteAllText($reasonFile, "$(Get-Date -Format o) $Reason")
         $tailBytes = 2MB
         foreach ($file in Get-ChildItem -LiteralPath $logs -File -Filter '*.log') {
-            # The supervisor logs are append-only and never rewritten; everything else is what a restart overwrites.
+            # Supervisor logs rotate independently; everything else is what a restart overwrites.
             if ($file.Name -in 'controller.log', 'controller-service.log') { continue }
             try {
                 # Running components hold their logs open for writing; share that access instead of failing.
@@ -167,12 +178,22 @@ function Save-HealthFailureEvidence([string] $Reason) {
                     # Take the size from the open stream, since a directory listing can lag a file that is
                     # still being written, and keep only the tail of a long-running log: the newest lines
                     # are the evidence, and an unbounded copy would delay the restart it precedes.
-                    if ($source.Length -gt $tailBytes) {
-                        $null = $source.Seek(-$tailBytes, [IO.SeekOrigin]::End)
+                    $snapshotLength = $source.Length
+                    if ($snapshotLength -gt $tailBytes) {
+                        $null = $source.Seek($snapshotLength - $tailBytes, [IO.SeekOrigin]::Begin)
                         [IO.File]::AppendAllText($reasonFile, "`r`n$($file.Name) truncated to its last $tailBytes bytes")
                     }
                     $target = [IO.File]::Create((Join-Path $folder $file.Name))
-                    try { $source.CopyTo($target) } finally { $target.Dispose() }
+                    try {
+                        $remaining = [Math]::Min($snapshotLength, $tailBytes)
+                        $buffer = [byte[]]::new(65536)
+                        while ($remaining -gt 0) {
+                            $read = $source.Read($buffer, 0, [int][Math]::Min($remaining, $buffer.Length))
+                            if ($read -eq 0) { break }
+                            $target.Write($buffer, 0, $read)
+                            $remaining -= $read
+                        }
+                    } finally { $target.Dispose() }
                 } finally { $source.Dispose() }
             } catch { }
         }

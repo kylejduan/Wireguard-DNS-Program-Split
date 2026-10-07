@@ -47,6 +47,8 @@ jobs:
           ./build/dns-dispatcher.exe --self-test
           ./build/dns-probe.exe --self-test
           ./build/wfp-probe.exe --self-test
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -static -municode tests/native/pending-service.cpp -o build/test-pending-service.exe
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -static tests/native/dns-responder.cpp -o build/test-dns-responder.exe -lws2_32
       - name: Run PowerShell checks
         shell: powershell
         run: |
@@ -56,6 +58,13 @@ jobs:
           ./tests/Test-InstallLayout.ps1 -RepositoryRoot $PWD
           ./tests/Test-AdapterMaintenance.ps1 -RepositoryRoot $PWD
           ./tests/Test-TunnelPreflight.ps1 -RepositoryRoot $PWD
+          ./tests/Test-ResourceLimits.ps1 -RepositoryRoot $PWD
+      - name: Exercise real Windows service lifecycles
+        shell: powershell
+        run: |
+          ./tests/Test-TunnelRecoveryLive.ps1 -TunnelScript "$PWD/src/powershell/Invoke-Tunnel.ps1" -StubService "$PWD/build/test-pending-service.exe"
+          ./tests/Test-ControllerServiceLive.ps1 -RepositoryRoot $PWD
+          ./tests/Test-DnsDispatcherLive.ps1 -RepositoryRoot $PWD
       - name: Check public tree
         shell: msys2 {0}
         run: ./tests/check-public-tree.sh

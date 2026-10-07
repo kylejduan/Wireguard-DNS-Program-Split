@@ -2,6 +2,7 @@
 // Private implementation fragment of dns-dispatcher.cpp.
 class Hints {
 public:
+    static constexpr size_t kMaxHints = 4096;
     // A repeated query for a name and type answered within reuseWindow, carrying no
     // newer attribution event, reuses that answer's route: the Windows DNS Client
     // retransmits and falls back to TCP without raising a new query event.
@@ -21,13 +22,21 @@ public:
                 L" event-qpc=" + std::to_wstring(eventQpc) + L" path=" + path);
     }
 
-    void addResolved(const std::wstring& name, uint16_t type, const std::wstring& path) {
+    bool addResolved(const std::wstring& name, uint16_t type, const std::wstring& path) {
         const bool selected = !path.empty() && included_.count(lower(path));
         const auto key = makeKey(name, type);
         {
             std::lock_guard lock(mutex_);
-            auto& pending = hints_[key];
             const auto now = std::chrono::steady_clock::now();
+            expire(now);
+            // Losing even one selected hint makes subsequent same-name direct hints unsafe.
+            // Refuse forwarding during a full attribution lifetime after any dropped event.
+            if (name.size() > 253 || (hints_.size() >= kMaxHints && !hints_.contains(key))) {
+                overloadedUntil_ = now + std::chrono::seconds(10);
+                changed_.notify_all();
+                return false;
+            }
+            auto& pending = hints_[key];
             if (pending.answered || pending.expires <= now) pending = {};
             pending.tunnel = pending.tunnel || selected;
             pending.direct = pending.direct || (!path.empty() && !selected);
@@ -35,6 +44,7 @@ public:
             pending.expires = now + std::chrono::seconds(10);
         }
         changed_.notify_all();
+        return true;
     }
 
     std::optional<bool> take(const std::wstring& name, uint16_t type, bool* reused = nullptr) {
@@ -44,10 +54,13 @@ public:
         std::unique_lock lock(mutex_);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
         while (true) {
-            expire();
+            const auto now = std::chrono::steady_clock::now();
+            if (now < overloadedUntil_) return std::nullopt;
+            expire(now);
             auto found = hints_.find(key);
             if (found != hints_.end()) {
                 auto& pending = found->second;
+                if (pending.expires <= now) { hints_.erase(found); continue; }
                 if (pending.answered) {
                     if (pending.decision != Decision::Pending &&
                         std::chrono::steady_clock::now() - pending.answeredAt < reuseWindow_) {
@@ -98,14 +111,18 @@ private:
         return normalizeName(name) + L"#" + std::to_wstring(type);
     }
 
-    void expire() {
-        const auto now = std::chrono::steady_clock::now();
+    void expire(std::chrono::steady_clock::time_point now) {
+        // At most one bounded scan per second, even under sustained event traffic.
+        if (now < nextExpiry_) return;
+        nextExpiry_ = now + std::chrono::seconds(1);
         for (auto it = hints_.begin(); it != hints_.end();) {
             if (it->second.expires <= now) it = hints_.erase(it);
             else ++it;
         }
     }
 
+    std::chrono::steady_clock::time_point nextExpiry_{};
+    std::chrono::steady_clock::time_point overloadedUntil_{};
     std::unordered_set<std::wstring> included_;
     std::chrono::milliseconds reuseWindow_;
     std::mutex mutex_;

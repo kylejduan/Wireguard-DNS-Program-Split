@@ -15,7 +15,8 @@ $configuration = Get-ProgramSplitConfiguration -Root $root
 if (-not $IncludedAppsFile) { $IncludedAppsFile = Join-Path $root 'state\included-apps.txt' }
 $exe = Join-Path $root 'bin\dns-dispatcher.exe'
 $pidFile = Join-Path $root 'state\dns-dispatcher.pid'
-$stdout = Join-Path $root 'logs\dns-dispatcher.log'
+$stdout = Join-Path $root 'logs\dns-dispatcher-ready.log'
+$diagnostics = Join-Path $root 'logs\dns-dispatcher.log'
 $stderr = Join-Path $root 'logs\dns-dispatcher-error.log'
 $networkState = Join-Path $root 'state\direct-network.json'
 $traceState = Join-Path $root 'state\dns-etw-session.txt'
@@ -50,7 +51,7 @@ function Get-ExpectedProcesses {
 function Stop-ExpectedProcesses {
     foreach ($process in @(Get-ExpectedProcesses)) {
         Stop-Process -Id $process.Id -Force
-        $process.WaitForExit()
+        if (-not $process.WaitForExit(10000)) { throw "DNS dispatcher $($process.Id) did not stop." }
     }
 }
 
@@ -192,8 +193,8 @@ $traceName = "WireGuardProgramSplitDnsEtw-$([guid]::NewGuid().ToString('N'))"
 
 [IO.Directory]::CreateDirectory((Split-Path -Parent $stdout)) | Out-Null
 Set-OwnedTraceState -TraceName $traceName
-$arguments = @($IncludedAppsFile, $source, $resolver, $configuration.TunnelAddress,
-    $configuration.TunnelDns, $traceName)
+$arguments = @(('"{0}"' -f $IncludedAppsFile), $source, $resolver, $configuration.TunnelAddress,
+    $configuration.TunnelDns, $traceName, ('"{0}"' -f $diagnostics))
 $process = $null
 $started = $false
 try {

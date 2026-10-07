@@ -22,6 +22,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <memory>
+#include "bounded-log.h"
 
 namespace {
 
@@ -37,6 +39,7 @@ std::atomic_uint gActiveWorkers{};
 SOCKET gUdpListener{INVALID_SOCKET};
 SOCKET gTcpListener{INVALID_SOCKET};
 std::mutex gLogMutex;
+std::unique_ptr<wgps::BoundedLog> gLog;
 std::mutex gProcessCacheMutex;
 
 struct CachedProcess {
@@ -169,11 +172,14 @@ std::unordered_set<std::wstring> loadIncludedPaths(const std::wstring& path) {
 
 void logLine(const std::wstring& line, bool flush = false) {
     std::lock_guard lock(gLogMutex);
-    static unsigned pending{};
-    std::wcout << line << L'\n';
-    if (flush || ++pending == 64) {
-        std::wcout.flush();
-        pending = 0;
+    if (gLog) {
+        gLog->write(wgps::utf8(line + L"\r\n"));
+        // stdout is only a readiness channel when a bounded log owns diagnostics.
+        if (line.rfind(L"READY:", 0) == 0) std::wcout << line << std::endl;
+    } else {
+        // Interactive diagnostic usage retains the original stdout contract.
+        std::wcout << line << L'\n';
+        if (flush) std::wcout.flush();
     }
 }
 
@@ -197,7 +203,7 @@ std::vector<BYTE> eventProperty(EVENT_RECORD* event, const wchar_t* name) {
     descriptor.PropertyName = reinterpret_cast<ULONGLONG>(name);
     descriptor.ArrayIndex = ULONG_MAX;
     ULONG size{};
-    if (TdhGetPropertySize(event, 0, nullptr, 1, &descriptor, &size) != ERROR_SUCCESS) return {};
+    if (TdhGetPropertySize(event, 0, nullptr, 1, &descriptor, &size) != ERROR_SUCCESS || size > 4096) return {};
     std::vector<BYTE> value(size);
     if (TdhGetProperty(event, 0, nullptr, 1, &descriptor, size, value.data()) != ERROR_SUCCESS) return {};
     return value;
@@ -228,55 +234,78 @@ public:
         properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
         memcpy(properties_.data() + properties->LoggerNameOffset, traceName_.c_str(), traceNameBytes);
 
-        check(StartTraceW(&session_, traceName_.c_str(), properties), "StartTraceW");
-        check(EnableTraceEx2(session_, &kDnsClientProvider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                             TRACE_LEVEL_INFORMATION, 0, 0, 0, nullptr), "EnableTraceEx2");
+        try {
+            check(StartTraceW(&session_, traceName_.c_str(), properties), "StartTraceW");
+            check(EnableTraceEx2(session_, &kDnsClientProvider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                                 TRACE_LEVEL_INFORMATION, 0, 0, 0, nullptr), "EnableTraceEx2");
 
-        log_.LoggerName = traceName_.data();
-        // ClientContext=1 selects QPC; RAW_TIMESTAMP prevents ProcessTrace from converting it to FILETIME.
-        log_.ProcessTraceMode = kProcessTraceMode;
-        log_.EventRecordCallback = onEvent;
-        log_.Context = this;
-        trace_ = OpenTraceW(&log_);
-        if (trace_ == INVALID_PROCESSTRACE_HANDLE) throw std::runtime_error("OpenTraceW failed");
-        flushRequested_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!flushRequested_) throw std::runtime_error("CreateEventW failed");
-        gTraceFlushRequested.store(flushRequested_);
-        consumer_ = std::thread([this] { ProcessTrace(&trace_, 1, nullptr, nullptr); });
-        flusher_ = std::thread([this] {
-            auto* current = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(properties_.data());
-            while (!stopping_) {
-                WaitForSingleObject(flushRequested_, 10);
-                if (stopping_) break;
-                FlushTraceW(session_, traceName_.c_str(), current);
-            }
-        });
+            log_.LoggerName = traceName_.data();
+            // ClientContext=1 selects QPC; RAW_TIMESTAMP prevents ProcessTrace from converting it to FILETIME.
+            log_.ProcessTraceMode = kProcessTraceMode;
+            log_.EventRecordCallback = onEvent;
+            log_.Context = this;
+            trace_ = OpenTraceW(&log_);
+            if (trace_ == INVALID_PROCESSTRACE_HANDLE) throw std::runtime_error("OpenTraceW failed");
+            flushRequested_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!flushRequested_) throw std::runtime_error("CreateEventW failed");
+            gTraceFlushRequested.store(flushRequested_);
+            consumer_ = std::thread([this] {
+                ProcessTrace(&trace_, 1, nullptr, nullptr);
+                if (!stopping_) gRunning = false;
+            });
+            flusher_ = std::thread([this] {
+                auto* current = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(properties_.data());
+                while (!stopping_) {
+                    WaitForSingleObject(flushRequested_, 10);
+                    if (stopping_) break;
+                    FlushTraceW(session_, traceName_.c_str(), current);
+                }
+            });
+        } catch (...) {
+            stop();
+            throw;
+        }
     }
 
     long long frequency() const { return frequency_.QuadPart; }
 
-    ~DnsTrace() {
+    ~DnsTrace() { stop(); }
+
+private:
+    void stop() noexcept {
         stopping_ = true;
         gTraceFlushRequested.store(nullptr);
         if (flushRequested_) SetEvent(flushRequested_);
         if (flusher_.joinable()) flusher_.join();
         auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(properties_.data());
-        EnableTraceEx2(session_, &kDnsClientProvider, EVENT_CONTROL_CODE_DISABLE_PROVIDER, 0, 0, 0, 0, nullptr);
-        ControlTraceW(session_, traceName_.c_str(), properties, EVENT_TRACE_CONTROL_STOP);
-        if (consumer_.joinable()) consumer_.join();
+        if (session_) {
+            EnableTraceEx2(session_, &kDnsClientProvider, EVENT_CONTROL_CODE_DISABLE_PROVIDER, 0, 0, 0, 0, nullptr);
+            ControlTraceW(session_, traceName_.c_str(), properties, EVENT_TRACE_CONTROL_STOP);
+        }
         if (trace_ != INVALID_PROCESSTRACE_HANDLE) CloseTrace(trace_);
+        if (consumer_.joinable()) consumer_.join();
         if (flushRequested_) CloseHandle(flushRequested_);
     }
 
 private:
-    static void WINAPI onEvent(EVENT_RECORD* event) {
+    static void WINAPI onEvent(EVENT_RECORD* event) noexcept {
+        try { processEvent(event); }
+        catch (...) { gRunning = false; } // Fail the component; never unwind through the ETW C callback.
+    }
+
+    static void processEvent(EVENT_RECORD* event) {
         if (!IsEqualGUID(event->EventHeader.ProviderId, kDnsClientProvider) ||
             event->EventHeader.EventDescriptor.Id != kQueryEvent) return;
         auto* self = static_cast<DnsTrace*>(event->UserContext);
         const auto nameData = eventProperty(event, L"QueryName");
         const auto typeData = eventProperty(event, L"QueryType");
         if (nameData.size() < sizeof(wchar_t) || typeData.empty()) return;
-        const std::wstring name(reinterpret_cast<const wchar_t*>(nameData.data()));
+        if (nameData.size() % sizeof(wchar_t)) return;
+        std::wstring name(nameData.size() / sizeof(wchar_t), L'\0');
+        memcpy(name.data(), nameData.data(), nameData.size());
+        const auto terminator = name.find(L'\0');
+        if (terminator == std::wstring::npos || terminator > 253) return;
+        name.resize(terminator);
         uint16_t type{};
         memcpy(&type, typeData.data(), std::min(typeData.size(), sizeof(type)));
         const long long eventQpc = event->EventHeader.TimeStamp.QuadPart;
@@ -350,21 +379,21 @@ void handleUdpQuery(Hints& hints, std::vector<char> packet, sockaddr_in client, 
 
 void handleTcpClient(SOCKET client, Hints& hints, sockaddr_in directSource, sockaddr_in directDns,
                      sockaddr_in tunnelSource, sockaddr_in tunnelDns) {
-    DWORD timeout = 5000;
-    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-    while (gRunning) {
+    SocketOwner owned(client);
+    if (!nonblocking(client)) return;
+    for (unsigned requests = 0; gRunning && requests < 64; ++requests) {
+        const auto requestDeadline = afterMilliseconds(5000);
         uint16_t wireLength{};
-        if (!receiveAll(client, reinterpret_cast<char*>(&wireLength), sizeof(wireLength))) break;
+        if (!receiveAll(client, reinterpret_cast<char*>(&wireLength), sizeof(wireLength), requestDeadline)) break;
         const int size = ntohs(wireLength);
         if (size < 12) break;
         std::vector<char> packet(size);
-        if (!receiveAll(client, packet.data(), size)) break;
+        if (!receiveAll(client, packet.data(), size, requestDeadline)) break;
         const long long queryQpc = qpcNow();
         const auto question = parseQuestion(packet);
         std::optional<bool> tunnel;
         long long classifyMilliseconds{};
-    bool reused = false;
+        bool reused = false;
         if (question) tunnel = selectRoute(hints, *question, L"TCP", queryQpc, classifyMilliseconds, reused);
         std::optional<std::vector<char>> response;
         if (question && tunnel) {
@@ -379,9 +408,10 @@ void handleTcpClient(SOCKET client, Hints& hints, sockaddr_in directSource, sock
         }
         const bool answered = response.has_value();
         if (!response) response = makeServfail(packet);
+        const auto responseDeadline = afterMilliseconds(5000);
         const uint16_t responseLength = htons(static_cast<uint16_t>(response->size()));
-        if (!sendAll(client, reinterpret_cast<const char*>(&responseLength), sizeof(responseLength)) ||
-            !sendAll(client, response->data(), static_cast<int>(response->size()))) break;
+        if (!sendAll(client, reinterpret_cast<const char*>(&responseLength), sizeof(responseLength), responseDeadline) ||
+            !sendAll(client, response->data(), static_cast<int>(response->size()), responseDeadline)) break;
         if (question && tunnel) {
             hints.complete(question->name, question->type);
             logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
@@ -390,13 +420,10 @@ void handleTcpClient(SOCKET client, Hints& hints, sockaddr_in directSource, sock
                     std::to_wstring(queryQpc), !answered);
         }
     }
-    closesocket(client);
 }
 
 BOOL WINAPI consoleControl(DWORD) {
     gRunning = false;
-    if (gUdpListener != INVALID_SOCKET) closesocket(gUdpListener);
-    if (gTcpListener != INVALID_SOCKET) closesocket(gTcpListener);
     return TRUE;
 }
 
@@ -407,10 +434,11 @@ BOOL WINAPI consoleControl(DWORD) {
 int wmain(int argc, wchar_t** argv) {
     try {
         if (argc == 2 && std::wstring(argv[1]) == L"--self-test") return selfTest();
-        if (argc != 7) {
-            std::wcerr << L"Usage: dns-dispatcher.exe <included-apps.txt> <direct-source> <direct-dns> <tunnel-source> <tunnel-dns> <etw-session>\n";
+        if (argc != 7 && argc != 8) {
+            std::wcerr << L"Usage: dns-dispatcher.exe <included-apps.txt> <direct-source> <direct-dns> <tunnel-source> <tunnel-dns> <etw-session> [log-file]\n";
             return 2;
         }
+        if (argc == 8) gLog = std::make_unique<wgps::BoundedLog>(argv[7]);
         WSADATA winsock{};
         if (WSAStartup(MAKEWORD(2, 2), &winsock)) throw std::runtime_error("WSAStartup failed");
         SetConsoleCtrlHandler(consoleControl, TRUE);
@@ -426,7 +454,8 @@ int wmain(int argc, wchar_t** argv) {
 
         gUdpListener = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         gTcpListener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (gUdpListener == INVALID_SOCKET || gTcpListener == INVALID_SOCKET) {
+        if (gUdpListener == INVALID_SOCKET || gTcpListener == INVALID_SOCKET ||
+            !nonblocking(gUdpListener) || !nonblocking(gTcpListener)) {
             throw std::runtime_error("Cannot create local DNS sockets");
         }
         BOOL exclusive = TRUE;
@@ -446,6 +475,7 @@ int wmain(int argc, wchar_t** argv) {
 
         std::thread tcpAcceptor([&] {
             while (gRunning) {
+                if (!socketReady(gTcpListener, false, afterMilliseconds(1000))) continue;
                 SOCKET client = accept(gTcpListener, nullptr, nullptr);
                 if (client == INVALID_SOCKET) {
                     if (!gRunning) break;
@@ -462,7 +492,7 @@ int wmain(int argc, wchar_t** argv) {
                             handleTcpClient(client, hints, directSource, directDns, tunnelSource,
                                             tunnelDns);
                         } catch (...) {
-                            closesocket(client);
+                            // handleTcpClient owns the socket even on an exception.
                         }
                     }).detach();
                 } catch (...) {
@@ -476,6 +506,7 @@ int wmain(int argc, wchar_t** argv) {
             std::vector<char> packet(65535);
             sockaddr_in client{};
             int clientSize = sizeof(client);
+            if (!socketReady(gUdpListener, false, afterMilliseconds(1000))) continue;
             const int received = recvfrom(gUdpListener, packet.data(), static_cast<int>(packet.size()), 0,
                                           reinterpret_cast<sockaddr*>(&client), &clientSize);
             if (received <= 0) continue;
@@ -503,8 +534,12 @@ int wmain(int argc, wchar_t** argv) {
                        reinterpret_cast<sockaddr*>(&client), clientSize);
             }
         }
-        if (gTcpListener != INVALID_SOCKET) closesocket(gTcpListener);
         if (tcpAcceptor.joinable()) tcpAcceptor.join();
+        // Detached workers borrow hints and network inputs. Drain them before stack destruction.
+        // Every socket operation checks gRunning at least every 200 ms.
+        while (gActiveWorkers.load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        closesocket(gUdpListener);
+        closesocket(gTcpListener);
         WSACleanup();
         return 0;
     } catch (const std::exception& error) {

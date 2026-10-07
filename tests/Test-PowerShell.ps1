@@ -433,8 +433,9 @@ try {
     Assert-True ($controllerServiceSource -match 'JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE' -and
         $controllerServiceSource -match 'JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK') `
         'controller service preserves adoptable data-plane children across supervisor recovery'
-    Assert-True ($controllerServiceSource -match '(?s)controller-service\.log.*?GENERIC_WRITE,\s*FILE_SHARE_READ\s*\|\s*FILE_SHARE_WRITE') `
-        'controller service can reopen its log while adoptable children retain inherited handles'
+    Assert-True ($controllerServiceSource -match 'wgps::LogPipe output' -and
+        $controllerServiceSource -match 'output.writer\(\)') `
+        'controller child output goes through the bounded rotating pipe writer'
     Assert-True ($controllerServiceSource -match 'kStopTimeoutMilliseconds = 240000' -and
         $controllerServiceSource -match '(?s)TerminateJobObject.*?SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR') `
         'controller service gives ordered cleanup time and reports forced stop as failure'

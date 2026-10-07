@@ -7,7 +7,7 @@ struct Question {
 
 std::optional<Question> parseQuestion(const std::vector<char>& packet) {
     if (packet.size() < 17 || static_cast<unsigned char>(packet[4]) != 0 ||
-        static_cast<unsigned char>(packet[5]) == 0) return std::nullopt;
+        static_cast<unsigned char>(packet[5]) != 1) return std::nullopt;
     size_t offset = 12;
     std::wstring name;
     while (offset < packet.size()) {
@@ -17,7 +17,7 @@ std::optional<Question> parseQuestion(const std::vector<char>& packet) {
         if (!name.empty()) name.push_back(L'.');
         for (unsigned i = 0; i < length; ++i) name.push_back(static_cast<unsigned char>(packet[offset++]));
     }
-    if (name.empty() || offset + 4 > packet.size()) return std::nullopt;
+    if (name.empty() || name.size() > 253 || offset + 4 > packet.size()) return std::nullopt;
     const uint16_t type = (static_cast<unsigned char>(packet[offset]) << 8) |
                           static_cast<unsigned char>(packet[offset + 1]);
     return Question{normalizeName(name), type};
@@ -86,38 +86,22 @@ sockaddr_in address(const wchar_t* ip, uint16_t port) {
     return result;
 }
 
-bool sendAll(SOCKET socketHandle, const char* data, int size) {
-    int sent{};
-    while (sent < size) {
-        const int current = send(socketHandle, data + sent, size - sent, 0);
-        if (current <= 0) return false;
-        sent += current;
-    }
-    return true;
-}
-
-bool receiveAll(SOCKET socketHandle, char* data, int size) {
-    int received{};
-    while (received < size) {
-        const int current = recv(socketHandle, data + received, size - received, 0);
-        if (current <= 0) return false;
-        received += current;
-    }
-    return true;
-}
+#include "dns-sockets.h"
 
 std::optional<std::vector<char>> udpExchange(const std::vector<char>& packet, sockaddr_in source,
                                              sockaddr_in resolver) {
     SOCKET upstream = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (upstream == INVALID_SOCKET) return std::nullopt;
-    DWORD timeout = 4000;
-    setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-    setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    SocketOwner owned(upstream);
+    if (!nonblocking(upstream)) return std::nullopt;
+    const auto deadline = afterMilliseconds(4000);
     source.sin_port = 0;
     std::optional<std::vector<char>> result;
     if (bind(upstream, reinterpret_cast<sockaddr*>(&source), sizeof(source)) == 0 &&
-        connect(upstream, reinterpret_cast<sockaddr*>(&resolver), sizeof(resolver)) == 0 &&
-        send(upstream, packet.data(), static_cast<int>(packet.size()), 0) != SOCKET_ERROR) {
+        connectBefore(upstream, resolver, deadline) &&
+        socketReady(upstream, true, deadline) &&
+        send(upstream, packet.data(), static_cast<int>(packet.size()), 0) == static_cast<int>(packet.size()) &&
+        socketReady(upstream, false, deadline)) {
         std::vector<char> response(65535);
         const int received = recv(upstream, response.data(), static_cast<int>(response.size()), 0);
         if (received > 0) {
@@ -125,7 +109,6 @@ std::optional<std::vector<char>> udpExchange(const std::vector<char>& packet, so
             if (matchingResponse(packet, response) && zeroResponseTtls(response)) result = std::move(response);
         }
     }
-    closesocket(upstream);
     return result;
 }
 
@@ -133,27 +116,26 @@ std::optional<std::vector<char>> tcpExchange(const std::vector<char>& packet, so
                                              sockaddr_in resolver) {
     SOCKET upstream = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (upstream == INVALID_SOCKET) return std::nullopt;
-    DWORD timeout = 4000;
-    setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-    setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    SocketOwner owned(upstream);
+    if (!nonblocking(upstream)) return std::nullopt;
+    const auto deadline = afterMilliseconds(4000);
     source.sin_port = 0;
     std::optional<std::vector<char>> result;
     const uint16_t length = htons(static_cast<uint16_t>(packet.size()));
     if (bind(upstream, reinterpret_cast<sockaddr*>(&source), sizeof(source)) == 0 &&
-        connect(upstream, reinterpret_cast<sockaddr*>(&resolver), sizeof(resolver)) == 0 &&
-        sendAll(upstream, reinterpret_cast<const char*>(&length), sizeof(length)) &&
-        sendAll(upstream, packet.data(), static_cast<int>(packet.size()))) {
+        connectBefore(upstream, resolver, deadline) &&
+        sendAll(upstream, reinterpret_cast<const char*>(&length), sizeof(length), deadline) &&
+        sendAll(upstream, packet.data(), static_cast<int>(packet.size()), deadline)) {
         uint16_t responseLength{};
-        if (receiveAll(upstream, reinterpret_cast<char*>(&responseLength), sizeof(responseLength))) {
+        if (receiveAll(upstream, reinterpret_cast<char*>(&responseLength), sizeof(responseLength), deadline)) {
             const int size = ntohs(responseLength);
             std::vector<char> response(size);
-            if (size && receiveAll(upstream, response.data(), size) && matchingResponse(packet, response) &&
+            if (size && receiveAll(upstream, response.data(), size, deadline) && matchingResponse(packet, response) &&
                 zeroResponseTtls(response)) {
                 result = std::move(response);
             }
         }
     }
-    closesocket(upstream);
     return result;
 }
 
