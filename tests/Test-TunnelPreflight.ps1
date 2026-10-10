@@ -58,7 +58,7 @@ try {
     Start-TunnelAfterPreflight -ServiceState $global:wgpsTestService
     Assert-True (($global:wgpsTestEvents -join ',') -eq 'preflight,start') 'failed attempts release the creation mutex for a later retry'
     $source=[IO.File]::ReadAllText($path)
-    Assert-True ($source -match "'start=' 'demand'" -and $source -match 'Set-Service -Name \$serviceName -StartupType Manual' -and
+    Assert-True ($source -match 'New-Service -Name \$serviceName -BinaryPathName \$expectedCommand -StartupType Manual' -and $source -match 'Set-Service -Name \$serviceName -StartupType Manual' -and
         $source -notmatch "'start=' 'auto'|StartupType Automatic") 'SCM cannot bypass preflight through automatic tunnel startup'
 } finally {
     Remove-Item -LiteralPath $temporary -Recurse -Force

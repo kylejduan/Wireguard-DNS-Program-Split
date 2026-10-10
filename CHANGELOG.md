@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Windows installs now default to `%ProgramFiles%\WireGuardProgramSplit`. Service and controller child commands support paths with spaces. `Migrate-Installation.ps1` moves an active legacy ProgramData installation with its configuration and permissions, updates services and the tray, and rolls back on activation failure.
+
 - Windows tunnel startup now uses a single serialized creation path: the automatic controller starts the Manual tunnel service only after orphan-adapter preflight. Running/starting owned services are reused. Remaining enumerated root WireGuard devices or an existing split adapter block a new creation attempt; ambiguous devices are preserved. This closes the SCM automatic-start bypass of cleanup.
 
 - Windows installation: after activation and every five minutes while enabled, inspect stray `ROOT\WIREGUARD` devices that Windows servicing can recreate. Remove at most one verified, disconnected device with zero traffic and no configured address or nonlocal route per pass. Recheck identity immediately before exact-device removal, preserve a diagnostic snapshot, and keep maintenance failures independent of VPN health/restarts. Software-enumerated tunnels and shared driver packages are preserved.

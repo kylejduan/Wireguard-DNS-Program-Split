@@ -282,10 +282,10 @@ $ownedEndpointRoute = if ($savedRouteState -and
 if (-not $ownedEndpointRoute) { Remove-OwnedEndpointRoute }
 
 $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
-$expectedCommand = '{0} /service {1}' -f $hostExe, $config
+$expectedCommand = Get-ProgramSplitServiceCommand -HostPath $hostExe -ArgumentPath $config
 if (-not $service) {
-    $createOutput = & sc.exe create $serviceName 'binPath=' $expectedCommand 'type=' 'own' 'start=' 'demand' 'error=' 'normal' 'depend=' 'Nsi/TcpIp' 'DisplayName=' 'WireGuard Program Split' 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Failed to create the tunnel service: $($createOutput -join ' ')" }
+    New-Service -Name $serviceName -BinaryPathName $expectedCommand -StartupType Manual `
+        -DependsOn @('Nsi', 'TcpIp') -DisplayName 'WireGuard Program Split' | Out-Null
     & sc.exe sidtype $serviceName unrestricted | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to configure the tunnel service SID.' }
 } elseif (-not (Test-ProgramSplitServiceOwnership -Service $service -HostPath $hostExe -ArgumentPath $config)) {

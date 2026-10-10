@@ -60,7 +60,7 @@ From Windows PowerShell, `-PlanOnly` validates all paths and transforms the prof
 
 Repeat the command in an elevated Windows PowerShell session without `-PlanOnly`. Add `-DisableBrowserSecureDns` if selected browsers must use the WireGuard profile's DNS rather than browser-owned DoH.
 
-The installation is machine-wide. Runtime files are ACL-locked beneath `C:\ProgramData\WireGuardProgramSplit`; only SYSTEM and Administrators retain access. The tray appears after interactive logon.
+The installation is machine-wide. Runtime files are ACL-locked beneath `C:\Program Files\WireGuardProgramSplit`; only SYSTEM and Administrators retain access. The tray appears after interactive logon.
 
 The controller starts automatically; the tunnel service is Manual so it starts only after adapter preflight. Before starting a stopped tunnel, the controller serializes creation, removes eligible root-enumerated orphans, and refuses creation if any enumerated root WireGuard devices remain or a split adapter already exists. Running/starting owned tunnels are reused. The controller also checks after activation and every five minutes while enabled. These can be recreated by Windows servicing with older WireGuard runtimes. Cleanup requires verified WireGuard identity, disconnected status, zero traffic, and only automatic link-local addresses/local routes; it rechecks the device before removal. Other tunnels and the shared driver package are preserved. Uncertain devices remain for manual inspection, and maintenance errors do not restart the stack. See [adapter maintenance](troubleshooting.md#extra-wireguard-network-adapter).
 
@@ -81,6 +81,21 @@ Also verify the host has no usable IPv6 default route. IPv6 is not redirected in
 ```powershell
 Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue
 ```
+
+## Move an existing ProgramData installation
+
+From an elevated 64-bit Windows PowerShell session in the updated repository:
+
+```powershell
+./Migrate-Installation.ps1 -PlanOnly
+./Migrate-Installation.ps1
+```
+
+The migration moves the existing protected tree to `%ProgramFiles%\WireGuardProgramSplit`, updates both service commands and the tray task, and installs the three scripts needed for paths with spaces. Configuration, profiles, included applications, logs, binaries, and permissions are preserved. Mutable state remains inside the protected installation tree. Both roots must be on the same volume; the destination must not exist. The installation must be enabled and running with an Automatic controller and Manual tunnel.
+
+This briefly stops the split tunnel and DNS dispatcher; pause sensitive included-app traffic during the move. The migration validates startup and restores the old location and service commands if activation fails. Original scripts remain under `state\migration-backup-<id>` for inspection. It does not uninstall or reinstall shared drivers.
+
+For a legacy installation that has not been moved, pass `-DestinationRoot "$env:ProgramData\WireGuardProgramSplit"` to `Uninstall.ps1`. Custom installation paths also require an explicit `-DestinationRoot`.
 
 ## Uninstall
 

@@ -21,7 +21,7 @@ The small native controller host exists because measured Task Scheduler startup 
 ## Trust and security boundaries
 
 - WireGuard private keys and machine-specific settings are local-only and must never enter Git history.
-- Deployed runtime files live beneath a locked `C:\ProgramData\WireGuardProgramSplit` tree writable only by SYSTEM and Administrators.
+- Deployed runtime files live beneath a locked `C:\Program Files\WireGuardProgramSplit` tree writable only by SYSTEM and Administrators.
 - The public project does not redistribute WireGuard or PIA binaries. Installation requires separately obtained compatible WireGuard runtime DLLs and a signed PIA WFP callout package; signatures are checked before installation.
 - WFP objects are dynamic and disappear if their host exits. The controller restores them, but a controller or host failure is fail-open for payload unless optional persistent firewall guards are added.
 - Application-owned DoH, DoT, and DoQ bypass ordinary Windows DNS and are outside the DNS split. Browser secure-DNS policy can be disabled explicitly.
@@ -31,7 +31,7 @@ The small native controller host exists because measured Task Scheduler startup 
 
 - The GitHub repository contains source, tests, generic examples using documentation-only address ranges, and dependency instructions.
 - `local/`, profiles, binaries, driver packages, logs, state, and generated settings are ignored.
-- The configured operator copy may live in OneDrive, but boot-time execution never depends on OneDrive availability. Installation deploys a protected runtime copy to ProgramData.
+- The configured operator copy may live in OneDrive, but boot-time execution never depends on OneDrive availability. Installation deploys a protected runtime copy to Program Files.
 
 ## Acceptance
 

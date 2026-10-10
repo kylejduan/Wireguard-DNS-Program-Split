@@ -46,6 +46,15 @@ function Test-ProgramSplitTaskOwnership {
         [string] $arguments.Value -eq (Get-ProgramSplitTaskArguments -ScriptPath $ScriptPath)
 }
 
+function Get-ProgramSplitServiceCommand {
+    param(
+        [Parameter(Mandatory)] [string] $HostPath,
+        [Parameter(Mandatory)] [string] $ArgumentPath
+    )
+
+    return '"{0}" /service "{1}"' -f $HostPath, $ArgumentPath
+}
+
 function Test-ProgramSplitServiceOwnership {
     param(
         [Parameter(Mandatory)] $Service,
@@ -53,7 +62,11 @@ function Test-ProgramSplitServiceOwnership {
         [Parameter(Mandatory)] [string] $ArgumentPath
     )
 
-    return [string] $Service.PathName -eq ('{0} /service {1}' -f $HostPath, $ArgumentPath)
+    if ([string] $Service.PathName -eq (Get-ProgramSplitServiceCommand -HostPath $HostPath `
+            -ArgumentPath $ArgumentPath)) { return $true }
+    # Existing installations used unquoted commands only under paths without whitespace.
+    return $HostPath -notmatch '\s' -and $ArgumentPath -notmatch '\s' -and
+        [string] $Service.PathName -eq ('{0} /service {1}' -f $HostPath, $ArgumentPath)
 }
 
 function Test-ProgramSplitNrptRuleOwnership {

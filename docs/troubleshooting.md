@@ -2,7 +2,7 @@
 
 ## Start with state and logs
 
-The tray's **Open logs** command opens `C:\ProgramData\WireGuardProgramSplit\logs`. `controller.log` shows component order; `last-error.txt` records the latest activation failure.
+The tray's **Open logs** command opens `C:\Program Files\WireGuardProgramSplit\logs`. `controller.log` shows component order; `last-error.txt` records the latest activation failure.
 
 Useful checks from elevated PowerShell:
 
@@ -73,8 +73,8 @@ Background repair requires the owned software-enumerated tunnel to be up and its
 From elevated PowerShell, inspect or run maintenance immediately:
 
 ```powershell
-& 'C:\ProgramData\WireGuardProgramSplit\src\Invoke-AdapterMaintenance.ps1' -Action Status
-& 'C:\ProgramData\WireGuardProgramSplit\src\Invoke-AdapterMaintenance.ps1' -Action Repair
+& 'C:\Program Files\WireGuardProgramSplit\src\Invoke-AdapterMaintenance.ps1' -Action Status
+& 'C:\Program Files\WireGuardProgramSplit\src\Invoke-AdapterMaintenance.ps1' -Action Repair
 ```
 
 `Status` does not change devices. The controller records outcomes in `controller.log`; `adapter-removal-before.json` and `adapter-removal-{output,error}.log` retain the latest attempted removal. An incomplete inspection/removal is logged and retried on the next interval without restarting the VPN. A device that has traffic, configuration, or uncertain ownership needs manual investigation instead of wider automatic deletion.

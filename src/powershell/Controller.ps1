@@ -46,7 +46,7 @@ function Start-Component([string] $name, [string] $action) {
     $stderr = Join-Path $logs "$key-error.log"
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $process = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script, '-Action', $action
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $script), '-Action', $action
     ) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
     # Materialize the process handle before it can exit. Windows PowerShell 5.1 otherwise
     # exposes a null ExitCode for short-lived children created with Start-Process.

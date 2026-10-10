@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [CmdletBinding()]
 param(
-    [string] $DestinationRoot = 'C:\ProgramData\WireGuardProgramSplit',
+    [string] $DestinationRoot = (Join-Path $env:ProgramFiles 'WireGuardProgramSplit'),
     [switch] $PlanOnly
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-if ($DestinationRoot -match '\s') { throw 'DestinationRoot cannot contain whitespace.' }
 . (Join-Path $PSScriptRoot 'src\powershell\Common.ps1')
 
 $plan = [pscustomobject]@{

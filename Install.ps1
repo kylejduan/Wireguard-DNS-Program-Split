@@ -6,7 +6,7 @@ param(
     [Parameter(Mandatory)] [string] $WireGuardRuntimeDirectory,
     [Parameter(Mandatory)] [string] $PiaDriverDirectory,
     [string] $BuildDirectory = (Join-Path $PSScriptRoot 'build'),
-    [string] $DestinationRoot = 'C:\ProgramData\WireGuardProgramSplit',
+    [string] $DestinationRoot = (Join-Path $env:ProgramFiles 'WireGuardProgramSplit'),
     [switch] $DisableBrowserSecureDns,
     [switch] $PlanOnly
 )
@@ -32,7 +32,6 @@ function Assert-ValidSignature([string] $Path, [string] $SubjectPattern) {
 }
 
 $profilePath = (Get-Item -LiteralPath $Profile -ErrorAction Stop).FullName
-if ($DestinationRoot -match '\s') { throw 'DestinationRoot cannot contain whitespace.' }
 $fullDestinationRoot = [IO.Path]::GetFullPath($DestinationRoot)
 if ([IO.Path]::GetPathRoot($fullDestinationRoot).TrimEnd('\') -eq $fullDestinationRoot.TrimEnd('\')) {
     throw 'DestinationRoot cannot be a filesystem root.'
@@ -121,12 +120,12 @@ try {
         ([ordered]@{ Product = 'WireGuardProgramSplit'; Schema = 1 } | ConvertTo-Json),
         [Text.UTF8Encoding]::new($false))
     & icacls.exe $DestinationRoot /reset /T /C /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Failed to normalize the ProgramData installation ACL.' }
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to normalize the installation ACL.' }
     & icacls.exe $DestinationRoot /inheritance:r /grant:r `
         '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Failed to lock the ProgramData installation root.' }
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to lock the installation root.' }
     & icacls.exe (Join-Path $DestinationRoot '*') /inheritance:e /T /C /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Failed to inherit the protected ProgramData ACL.' }
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to inherit the protected installation ACL.' }
 
     Copy-Item -Path (Join-Path $PSScriptRoot 'src\powershell\*.ps1') -Destination (Join-Path $DestinationRoot 'src')
     foreach ($name in $projectExecutables) {
@@ -147,11 +146,10 @@ try {
     & (Join-Path $DestinationRoot 'src\Invoke-Tunnel.ps1') -Action Start | Out-Null
     $controllerHost = Join-Path $DestinationRoot 'bin\controller-service.exe'
     $controllerScript = Join-Path $DestinationRoot 'src\Controller.ps1'
-    $controllerCommand = '{0} /service {1}' -f $controllerHost, $controllerScript
-    $createOutput = & sc.exe create $plan.ControllerServiceName 'binPath=' $controllerCommand `
-        'type=' 'own' 'start=' 'auto' 'error=' 'normal' 'depend=' 'Nsi/TcpIp' `
-        'DisplayName=' 'WireGuard Program Split Controller' 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Failed to create the controller service: $($createOutput -join ' ')" }
+    $controllerCommand = Get-ProgramSplitServiceCommand -HostPath $controllerHost -ArgumentPath $controllerScript
+    New-Service -Name $plan.ControllerServiceName -BinaryPathName $controllerCommand `
+        -StartupType Automatic -DependsOn @('Nsi', 'TcpIp') `
+        -DisplayName 'WireGuard Program Split Controller' | Out-Null
     & sc.exe sidtype $plan.ControllerServiceName unrestricted | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to configure the controller service SID.' }
     & sc.exe failure $plan.ControllerServiceName 'reset=' '86400' `

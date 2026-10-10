@@ -46,12 +46,12 @@ Endpoint = 198.51.100.10:51820
 
     $plan = & (Join-Path $RepositoryRoot 'Install.ps1') -Profile $profile -Applications $application `
         -WireGuardRuntimeDirectory $runtime -PiaDriverDirectory $driver -BuildDirectory $build `
-        -DestinationRoot 'C:\ProgramData\WireGuardProgramSplit\' -PlanOnly
+        -DestinationRoot 'C:\Program Files\WireGuardProgramSplit\' -PlanOnly
     Assert-True (-not (Test-Path -LiteralPath $staleOwnedStaging)) `
         'installer removes a stale exact-owned staging directory before processing a new profile'
     Assert-True (Test-Path -LiteralPath $nearMatchStaging -PathType Container) `
         'installer preserves a similarly prefixed directory outside its exact GUID namespace'
-    Assert-True ($plan.DestinationRoot -eq 'C:\ProgramData\WireGuardProgramSplit') `
+    Assert-True ($plan.DestinationRoot -eq 'C:\Program Files\WireGuardProgramSplit') `
         'installer normalizes the destination root before planning resource ownership'
     Assert-True ($plan.ServiceName -eq 'WireGuardTunnel$WireGuardSplit') 'installer plans the neutral tunnel service'
     Assert-True ($plan.ServiceStartType -eq 'Manual') 'controller owns tunnel startup after adapter preflight'
@@ -68,14 +68,19 @@ Endpoint = 198.51.100.10:51820
     $installerSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'Install.ps1'))
     Assert-True ($installerSource -match 'if \(\$destinationCreated -and \(Test-Path') `
         'installer rollback removes only a destination created by the current run'
-    Assert-True ($installerSource -match 'sc\.exe create \$plan\.ControllerServiceName' -and
-        $installerSource -match "'depend=' 'Nsi/TcpIp'") `
+    Assert-True ($installerSource -match 'New-Service -Name \$plan\.ControllerServiceName' -and
+        $installerSource -match "-DependsOn @\('Nsi', 'TcpIp'\)") `
         'installer creates the automatic controller service with core network dependencies'
     Assert-True ($installerSource -notmatch 'Register-ScheduledTask -TaskName \$plan\.LegacyControllerTask') `
         'installer no longer creates the delayed startup controller task'
 
+    $defaultPlan = & (Join-Path $RepositoryRoot 'Install.ps1') -Profile $profile -Applications $application `
+        -WireGuardRuntimeDirectory $runtime -PiaDriverDirectory $driver -BuildDirectory $build -PlanOnly
+    Assert-True ($defaultPlan.DestinationRoot -eq (Join-Path $env:ProgramFiles 'WireGuardProgramSplit')) `
+        'installer defaults to the Windows Program Files directory'
+
     $removal = & (Join-Path $RepositoryRoot 'Uninstall.ps1') `
-        -DestinationRoot 'C:\ProgramData\WireGuardProgramSplit' -PlanOnly
+        -DestinationRoot 'C:\Program Files\WireGuardProgramSplit' -PlanOnly
     Assert-True ($removal.ServiceName -eq 'WireGuardTunnel$WireGuardSplit') 'uninstaller scopes the tunnel service'
     Assert-True ($removal.ControllerServiceName -eq $plan.ControllerServiceName) `
         'installer and uninstaller own the same controller service'
