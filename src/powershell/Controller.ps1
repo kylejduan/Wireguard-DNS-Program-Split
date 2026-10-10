@@ -98,15 +98,12 @@ function Invoke-AdapterMaintenance {
     }
 }
 
-function Get-ManagedProcess([string] $pidName, [string] $processName, [string] $expectedPath) {
+function Test-ManagedProcess([string] $pidName, [string] $expectedPath) {
     $path = Join-Path $state $pidName
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
     $managedPid = 0
-    if (-not [int]::TryParse([IO.File]::ReadAllText($path), [ref]$managedPid)) { return $null }
-    $process = Get-Process -Id $managedPid -ErrorAction SilentlyContinue
-    if ($process -and $process.ProcessName -eq $processName -and
-        [string]$process.Path -eq $expectedPath) { return $process }
-    return $null
+    if (-not [int]::TryParse([IO.File]::ReadAllText($path), [ref]$managedPid)) { return $false }
+    return Test-ProgramSplitProcessPath -ProcessId $managedPid -ExpectedPath $expectedPath
 }
 
 function Get-ExpectedProcesses([string] $processName, [string] $expectedPath) {
@@ -122,8 +119,8 @@ function Test-StackActive {
     return (Test-Path -LiteralPath $activeFile -PathType Leaf) -and
         $service -and $service.Status -eq 'Running' -and $rule -and
         (Test-Path -LiteralPath (Join-Path $state 'dns-etw-session.txt') -PathType Leaf) -and
-        (Get-ManagedProcess 'dns-dispatcher.pid' 'dns-dispatcher' (Join-Path $root 'bin\dns-dispatcher.exe')) -and
-        (Get-ManagedProcess 'wfp-filters.pid' 'wfp-probe' (Join-Path $root 'bin\wfp-probe.exe'))
+        (Test-ManagedProcess 'dns-dispatcher.pid' (Join-Path $root 'bin\dns-dispatcher.exe')) -and
+        (Test-ManagedProcess 'wfp-filters.pid' (Join-Path $root 'bin\wfp-probe.exe'))
 }
 
 function Test-StackPresent {
@@ -347,7 +344,7 @@ function Test-PiaDriverReady {
 function Start-Stack {
     $stackTimer = [Diagnostics.Stopwatch]::StartNew()
     $script:configuration = Get-ProgramSplitConfiguration -Root $root
-    $dispatcherWasRunning = [bool](Get-ManagedProcess 'dns-dispatcher.pid' 'dns-dispatcher' `
+    $dispatcherWasRunning = [bool](Test-ManagedProcess 'dns-dispatcher.pid' `
         (Join-Path $root 'bin\dns-dispatcher.exe'))
     Remove-Item -LiteralPath $stackStoppedFile -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $activeFile -Force -ErrorAction SilentlyContinue

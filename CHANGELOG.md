@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reduce Windows supervision CPU by querying process image paths without module enumeration, and reduce Linux firewall-inventory allocations. Exact process ownership, complete mark/zone validation and health-check intervals are preserved. See the [paired performance audit](docs/performance.md).
+
 - Windows installs now default to `%ProgramFiles%\WireGuardProgramSplit`. Service and controller child commands support paths with spaces. `Migrate-Installation.ps1` moves an active legacy ProgramData installation with its configuration and permissions, updates services and the tray, and rolls back on activation failure.
 
 - Windows tunnel startup now uses a single serialized creation path: the automatic controller starts the Manual tunnel service only after orphan-adapter preflight. Running/starting owned services are reused. Remaining enumerated root WireGuard devices or an existing split adapter block a new creation attempt; ambiguous devices are preserved. This closes the SCM automatic-start bypass of cleanup.

@@ -7,6 +7,47 @@ function Assert-ProgramSplit64BitPowerShell {
     }
 }
 
+function Test-ProgramSplitProcessPath {
+    param([int] $ProcessId, [Parameter(Mandatory)] [string] $ExpectedPath)
+
+    if ($ProcessId -le 0) { return $false }
+    if (-not ('WireGuardProgramSplit.ProcessIdentity' -as [type])) {
+        # Process.MainModule enumerates modules. This read-only check needs only the
+        # image name; pin the process handle while querying it, without caching PIDs.
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace WireGuardProgramSplit {
+    public static class ProcessIdentity {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool QueryFullProcessImageName(IntPtr process, uint flags,
+            StringBuilder path, ref int size);
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetExitCodeProcess(IntPtr process, out uint code);
+        public static bool Matches(int pid, string expected) {
+            IntPtr process = OpenProcess(0x1000, false, pid); // QUERY_LIMITED_INFORMATION
+            if (process == IntPtr.Zero) return false;
+            try {
+                uint code;
+                if (!GetExitCodeProcess(process, out code) || code != 259) return false;
+                int size = 32768;
+                var path = new StringBuilder(size);
+                return QueryFullProcessImageName(process, 0, path, ref size) &&
+                    String.Equals(path.ToString(), expected, StringComparison.OrdinalIgnoreCase);
+            } finally { CloseHandle(process); }
+        }
+    }
+}
+'@
+    }
+    return [WireGuardProgramSplit.ProcessIdentity]::Matches($ProcessId, $ExpectedPath)
+}
+
 function Get-ProgramSplitOwnedTraceNames {
     param(
         [AllowNull()] [string] $StateValue,

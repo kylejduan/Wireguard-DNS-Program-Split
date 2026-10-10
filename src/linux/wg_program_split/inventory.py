@@ -164,58 +164,65 @@ def _has_mark(value):
 
 
 def _nft_usage(value):
-    """Recognize constant masks/preserving writes; reject dynamic mark semantics."""
+    """Recognize constant masks/preserving writes; reject dynamic mark semantics.
+
+    Accumulate once per inventory rather than allocating masks and sets for
+    every JSON scalar. Every expression is still inspected, even after all
+    mark bits are claimed: a later unsupported expression must fail closed.
+    """
     mark = {'meta': {'key': 'mark'}}
     zone = {'ct': {'key': 'zone'}}
     used, zones = 0, set()
-    if isinstance(value, list):
-        for item in value:
-            bits, found = _nft_usage(item)
-            used |= bits
-            zones |= found
-        return used, zones
-    if not isinstance(value, dict):
-        return used, zones
-    if 'xt' in value and isinstance(value['xt'], dict):
-        # iptables-nft renders its extensions opaquely; their bits and zones
-        # come from the textual iptables-nft-save dump instead (see _opaque_marks).
-        return used, zones
-    if 'mangle' in value and value['mangle'].get('key') == mark:
-        output = value['mangle']['value']
-        if type(output) is int:
-            return 0xffffffff, zones
-        try:
-            preserved, added = output['|']
-            original, mask = preserved['&']
-            if original != mark:
-                raise ValueError
-            return ((~_u32(mask)) | _u32(added)) & 0xffffffff, zones
-        except (KeyError, TypeError, ValueError):
-            raise NetworkError('unsupported nftables mark assignment') from None
-    if 'match' in value and _has_mark(value['match']):
-        item = value['match']
-        left = item.get('left')
-        if left == mark:
-            _u32(item.get('right'))
-            return 0xffffffff, zones
-        if isinstance(left, dict) and '&' in left and len(left['&']) == 2 and left['&'][0] == mark:
-            _u32(item.get('right'))
-            return _u32(left['&'][1]), zones
-        raise NetworkError('unsupported nftables mark comparison')
-    if 'mangle' in value and value['mangle'].get('key') == zone:
-        number = _u32(value['mangle'].get('value'))
-        if number > 65535:
-            raise NetworkError('invalid conntrack zone')
-        return used, {number}
-    if 'match' in value and value['match'].get('left') == zone:
-        return used, {_u32(value['match'].get('right'))}
-    if ((isinstance(value.get('meta'), dict) and value['meta'].get('key') == 'mark') or
-            (isinstance(value.get('ct'), dict) and value['ct'].get('key') == 'zone')):
-        raise NetworkError('unrecognized nftables mark or zone expression')
-    for item in value.values():
-        bits, found = _nft_usage(item)
-        used |= bits
-        zones |= found
+    pending = [value]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, list):
+            pending.extend(value)
+            continue
+        if not isinstance(value, dict):
+            continue
+        if 'xt' in value and isinstance(value['xt'], dict):
+            # Opaque iptables extensions are covered by the textual dumps.
+            continue
+        if 'mangle' in value and value['mangle'].get('key') == mark:
+            output = value['mangle']['value']
+            if type(output) is int:
+                used |= 0xffffffff
+                continue
+            try:
+                preserved, added = output['|']
+                original, mask = preserved['&']
+                if original != mark:
+                    raise ValueError
+                used |= ((~_u32(mask)) | _u32(added)) & 0xffffffff
+            except (KeyError, TypeError, ValueError):
+                raise NetworkError('unsupported nftables mark assignment') from None
+            continue
+        if 'match' in value and _has_mark(value['match']):
+            item = value['match']
+            left = item.get('left')
+            if left == mark:
+                _u32(item.get('right'))
+                used |= 0xffffffff
+            elif isinstance(left, dict) and '&' in left and len(left['&']) == 2 and left['&'][0] == mark:
+                _u32(item.get('right'))
+                used |= _u32(left['&'][1])
+            else:
+                raise NetworkError('unsupported nftables mark comparison')
+            continue
+        if 'mangle' in value and value['mangle'].get('key') == zone:
+            number = _u32(value['mangle'].get('value'))
+            if number > 65535:
+                raise NetworkError('invalid conntrack zone')
+            zones.add(number)
+            continue
+        if 'match' in value and value['match'].get('left') == zone:
+            zones.add(_u32(value['match'].get('right')))
+            continue
+        if ((isinstance(value.get('meta'), dict) and value['meta'].get('key') == 'mark') or
+                (isinstance(value.get('ct'), dict) and value['ct'].get('key') == 'zone')):
+            raise NetworkError('unrecognized nftables mark or zone expression')
+        pending.extend(value.values())
     return used, zones
 
 

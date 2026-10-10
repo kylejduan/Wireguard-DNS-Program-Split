@@ -57,6 +57,7 @@ jobs:
           ./tests/Test-ControllerHealth.ps1 -RepositoryRoot $PWD
           ./tests/Test-InstallLayout.ps1 -RepositoryRoot $PWD
           ./tests/Test-InstallPaths.ps1 -RepositoryRoot $PWD
+          ./tests/Test-ProcessIdentity.ps1 -RepositoryRoot $PWD
           ./tests/Test-AdapterMaintenance.ps1 -RepositoryRoot $PWD
           ./tests/Test-TunnelPreflight.ps1 -RepositoryRoot $PWD
           ./tests/Test-ResourceLimits.ps1 -RepositoryRoot $PWD
