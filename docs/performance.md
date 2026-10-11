@@ -250,3 +250,36 @@ changes are included here. These checks do not establish maximum DNS QPS,
 line-rate throughput or a weeks-long soak.
 
 Private measurements and scripts are retained under `local/performance/20261011/`.
+
+### Deployment verification
+
+The implementation and console-encoding fix were published as `5a5a2e3` and
+`c317d49`. [CI for the deployed source](https://github.com/kylejduan/Wireguard-DNS-Program-Split/actions/runs/38138767821)
+passed Linux unit/native checks and Windows native, PowerShell, real SCM and
+DNS Client/ETW checks. Locally, 313 Linux unit tests, the native Linux checks,
+ten Windows PowerShell suites, native Windows self-tests and the throwaway
+real-SCM recovery test passed. The first Windows CI attempt exposed a UTF-8
+stdin-preamble difference; it was reproduced locally, fixed in the pipe
+protocol, and retained as a regression test alongside Unicode output coverage.
+
+Both live installations were updated with rollback copies retained. Linux
+artifact hashes were verified, and configuration, BPF object, pinned map/link
+identities, policy, allocation and generation were preserved. A 60-second sample
+of the deployed controller cgroup, including its children, averaged 2.79% of one
+core and about 20.3 MiB of cgroup memory. It stayed ready with protection verified,
+stable processes and zero automatic restarts. The temporary candidate staging
+was removed; the root-private rollback copy remains.
+
+Windows installed hashes match the verified sources/build. Only the four
+expected existing files changed and the validation worker was added; existing
+ACLs, configuration, profiles, drivers and other binaries were preserved.
+System and tunnel DNS passed after deployment. During a 90-second sample the
+controller, worker, tray and native processes kept the same PIDs, and two
+periodic dispatcher validation passes completed. The worker used 136.8 MiB
+private memory in this live sample. The sum of the seven persistent process CPU
+rates was about 2.14% of one core; this excludes transient probes and external
+Windows providers and is not a whole-system measurement. The tray task was
+running, the stack was active, the installation remained under Program Files,
+and the legacy ProgramData directory was absent.
+
+These are short deployment checks, not a long-term stability or saturation proof.
