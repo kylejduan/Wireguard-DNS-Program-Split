@@ -6,7 +6,11 @@ param([switch] $Serve)
 if ($Serve) {
     $ErrorActionPreference = 'Stop'
     Set-StrictMode -Version Latest
-    while ($null -ne ($request = [Console]::ReadLine())) {
+    # .NET Framework initializes redirected stdin using the parent console
+    # encoding and can emit a UTF-8 preamble during Process.Start itself.
+    $inputReader = [IO.StreamReader]::new([Console]::OpenStandardInput(), [Text.UTF8Encoding]::new($false, $true), $true)
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    while ($null -ne ($request = $inputReader.ReadLine())) {
         if ($request -notin @('Invoke-LocalNrpt.ps1', 'Invoke-DnsDispatcher.ps1')) { exit 2 }
         try {
             # Invocation (not dot sourcing) gives each request a fresh script scope.
@@ -75,6 +79,7 @@ namespace ProgramSplit {
                 start.CreateNoWindow = true;
                 start.RedirectStandardInput = true;
                 start.RedirectStandardOutput = true;
+                start.StandardOutputEncoding = new UTF8Encoding(false);
                 child = Process.Start(start);
                 if (!AssignProcessToJobObject(job, child.Handle))
                     throw new InvalidOperationException("Cannot contain validation worker.");
@@ -84,8 +89,11 @@ namespace ProgramSplit {
             if (name != "Invoke-LocalNrpt.ps1" && name != "Invoke-DnsDispatcher.ps1")
                 throw new ArgumentException("Unsupported validation.");
             try {
-                child.StandardInput.WriteLine(name);
-                child.StandardInput.Flush();
+                // StreamWriter may emit a BOM when the supervisor console is
+                // UTF-8 (including CI). Requests are fixed ASCII, with no BOM.
+                byte[] request = Encoding.ASCII.GetBytes(name + "\n");
+                child.StandardInput.BaseStream.Write(request, 0, request.Length);
+                child.StandardInput.BaseStream.Flush();
                 var read = Task.Run(() => {
                     var line = new StringBuilder();
                     for (;;) {
@@ -96,8 +104,10 @@ namespace ProgramSplit {
                         line.Append((char)value);
                     }
                 });
-                if (!read.Wait(timeoutMilliseconds)) throw new TimeoutException("Validation worker timed out.");
-                return read.Result;
+                try {
+                    if (!read.Wait(timeoutMilliseconds)) throw new TimeoutException("Validation worker timed out.");
+                    return read.Result;
+                } catch (AggregateException error) { throw error.GetBaseException(); }
             } catch { Dispose(); throw; }
         }
         public void Dispose() {
