@@ -536,6 +536,8 @@ class Controller:
         if not 1 <= interval <= 60:
             raise ControllerError('health interval must be between one and sixty seconds')
         event = stop or threading.Event()
+        if isinstance(self.kernel, NativeGuard):
+            self.kernel.persistent = True
         old = {}
         if stop is None:
             for signum in (signal.SIGTERM, signal.SIGINT):
@@ -564,6 +566,9 @@ class Controller:
                 except (OSError, ValueError, RuntimeError):
                     pass  # Blocked protection is retained; the next interval retries.
         finally:
+            if isinstance(self.kernel, NativeGuard):
+                self.kernel.close()
+                self.kernel.persistent = False
             for signum, handler in old.items():
                 signal.signal(signum, handler)
             # Deliberately leave pinned links, marks, routes, and firewall intact.

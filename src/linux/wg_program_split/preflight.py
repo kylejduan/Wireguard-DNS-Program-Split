@@ -9,6 +9,8 @@ import subprocess
 import time
 
 from . import ownership as own
+from .native_worker import NativeWorker
+from .command import capture
 
 
 class ControllerError(RuntimeError):
@@ -17,16 +19,9 @@ class ControllerError(RuntimeError):
 
 def command(*argv, input=None):
     try:
-        result = subprocess.run(argv, input=input, text=input is None, capture_output=True, timeout=30,
-                                env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
-    except (OSError, subprocess.TimeoutExpired):
-        raise ControllerError('native operation could not complete') from None
-    if result.returncode:
-        raise ControllerError('native operation failed')
-    try:
-        return result.stdout if input is None else result.stdout.decode('utf-8')
-    except UnicodeError:
-        raise ControllerError('native operation returned invalid output') from None
+        return capture(argv, input=input, timeout=30)
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        raise ControllerError('native operation failed, timed out or exceeded output limits') from None
 
 
 def read_private(directory, name, maximum):
@@ -107,9 +102,30 @@ class NativeGuard:
     def __init__(self, artifacts, pins):
         self.loader, self.object = Path(artifacts) / 'bpf-loader', Path(artifacts) / 'classifier.bpf.o'
         self.pins = Path(pins)
+        self.persistent = False
+        self._worker = None
+        self._worker_identity = None
+
+    def close(self):
+        if self._worker is not None:
+            self._worker.close()
+            self._worker = None
 
     def _run(self, *args, input=None):
         verify_artifact(self.loader)
+        if self.persistent and args in (('snapshot', self.pins), ('probe-dns', self.pins)) and input is None:
+            info = self.loader.stat()
+            identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            try:
+                if self._worker_identity != identity:
+                    self.close()
+                if self._worker is None:
+                    self._worker = NativeWorker(self.loader, self.pins)
+                    self._worker_identity = identity
+                return self._worker.request(args[0])
+            except (OSError, ValueError, subprocess.SubprocessError):
+                self.close()
+                raise ControllerError('native observation could not complete') from None
         return command(str(self.loader), *map(str, args), input=input)
 
     def exists(self):

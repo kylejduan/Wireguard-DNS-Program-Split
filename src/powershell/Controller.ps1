@@ -6,6 +6,7 @@ Set-StrictMode -Version Latest
 
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Common.ps1')
+. (Join-Path $PSScriptRoot 'ValidationWorker.ps1')
 Assert-ProgramSplit64BitPowerShell
 $configuration = Get-ProgramSplitConfiguration -Root $root
 $state = Join-Path $root 'state'
@@ -64,24 +65,26 @@ function Complete-Component($component) {
     $stdout = $component.Stdout
     $stderr = $component.Stderr
     $timer = $component.Timer
-    if (-not $process.WaitForExit(45000)) {
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-        throw "$name $action timed out."
-    }
-    # Finalize redirected streams after the timed overload reports completion.
-    $process.WaitForExit()
-    $output = @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue)
-    $errors = @(Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue)
-    # Log what the component reported before judging its exit: a failed run's output records actions
-    # it already took, such as resetting a stuck tunnel host, and the next run overwrites the file.
-    if ($output) { Write-ControllerLog ($output -join ' ') }
-    if ($process.ExitCode -ne 0) { throw "$name $action exited with code $($process.ExitCode): $($errors -join ' ')" }
-    if ($errors) { throw "$name $action failed: $($errors -join ' ')" }
-    $timer.Stop()
     try {
-        $elapsedMilliseconds = [long][Math]::Round(($process.ExitTime - $process.StartTime).TotalMilliseconds)
-    } catch { $elapsedMilliseconds = $timer.ElapsedMilliseconds }
-    Write-ControllerLog "$name $action completed in $elapsedMilliseconds ms."
+        if (-not $process.WaitForExit(45000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            throw "$name $action timed out."
+        }
+        # Finalize redirected streams after the timed overload reports completion.
+        $process.WaitForExit()
+        $output = @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue)
+        $errors = @(Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue)
+        # Log what the component reported before judging its exit: a failed run's output records actions
+        # it already took, such as resetting a stuck tunnel host, and the next run overwrites the file.
+        if ($output) { Write-ControllerLog ($output -join ' ') }
+        if ($process.ExitCode -ne 0) { throw "$name $action exited with code $($process.ExitCode): $($errors -join ' ')" }
+        if ($errors) { throw "$name $action failed: $($errors -join ' ')" }
+        $timer.Stop()
+        try {
+            $elapsedMilliseconds = [long][Math]::Round(($process.ExitTime - $process.StartTime).TotalMilliseconds)
+        } catch { $elapsedMilliseconds = $timer.ElapsedMilliseconds }
+        Write-ControllerLog "$name $action completed in $elapsedMilliseconds ms."
+    } finally { $process.Dispose() }
 }
 
 function Invoke-Component([string] $name, [string] $action) {
@@ -136,6 +139,7 @@ function Test-StackPresent {
 }
 
 function Stop-Stack([switch] $RestoreCache, [switch] $ThrowOnFailure) {
+    Stop-ValidationWorker
     $cleanupErrors = [Collections.Generic.List[string]]::new()
     $wfpStopped = $false
     try {
@@ -290,8 +294,8 @@ function Test-LocalDns {
 
 function Test-StackHealth {
     Assert-ProgramSplitNoIpv6DefaultRoute
-    Invoke-Component 'Invoke-LocalNrpt.ps1' 'Validate'
-    Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Validate'
+    Invoke-Validation 'Invoke-LocalNrpt.ps1'
+    Invoke-Validation 'Invoke-DnsDispatcher.ps1'
     Test-TunnelDns -TimeoutMilliseconds 1000 -Attempts 3
 }
 
@@ -571,6 +575,7 @@ try {
         else { Start-Sleep -Milliseconds $loopWaitMilliseconds }
     }
 } finally {
+    Stop-ValidationWorker
     if ($stopEvent) { $stopEvent.Dispose() }
     if ($mutex) {
         $mutex.ReleaseMutex()

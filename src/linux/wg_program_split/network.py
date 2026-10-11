@@ -267,6 +267,7 @@ class Network:
             if any(not isinstance(v, list) or any(not isinstance(x, dict) for x in v)
                    for v in snapshot.values()):
                 raise ValueError
+            snapshot['owned_nft'] = self._nft_identity(snapshot['nft'])
             return snapshot
         except (KeyError, TypeError, ValueError):
             raise NetworkError('incomplete live network inventory') from None
@@ -320,9 +321,9 @@ class Network:
             rules = [r for r in snapshot['rules'] if r.get('priority') == a.priority]
             return None if not rules else {'state': rules[0]} if len(rules) == 1 else {'ambiguous': True}
         if kind == 'nft_table':
-            return self._nft_identity(snapshot['nft'])
+            return snapshot['owned_nft']
         if kind == 'conntrack_zone':
-            table = self._nft_identity(snapshot['nft'])
+            table = snapshot['owned_nft']
             if table is None:
                 return None
             return {'zone': a.zone, 'nft_handle': table['handle'], 'comment': table['comment']}

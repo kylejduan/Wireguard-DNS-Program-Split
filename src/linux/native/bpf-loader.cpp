@@ -230,6 +230,22 @@ Configuration configuration(const fs::path &dir) {
     if (cfg.version != abi) fail("unsupported pinned ABI");
     return cfg;
 }
+// Kernel function type IDs are immutable for this process's boot. Keep only
+// these twelve integers; release the large parsed BTF after resolving them.
+const std::array<int, links.size()> &hook_types() {
+    static const auto ids=[] {
+        std::unique_ptr<btf,decltype(&btf__free)> types(btf__load_vmlinux_btf(),btf__free);
+        if (!types) fail("kernel BTF unavailable");
+        std::array<int, links.size()> result{};
+        for (size_t i=0;i<links.size();++i) {
+            auto hook=std::string("bpf_lsm_")+links[i].hook;
+            result[i]=btf__find_by_name_kind(types.get(),hook.c_str(),BTF_KIND_FUNC);
+            if (result[i]<=0) fail("kernel hook type unavailable");
+        }
+        return result;
+    }();
+    return ids;
+}
 void verify_owner(const fs::path &dir) {
     std::set<std::string> expected;
     for (const auto &spec:maps) expected.insert(spec.name);
@@ -244,14 +260,13 @@ void verify_owner(const fs::path &dir) {
         check(bpf_obj_get_info_by_fd(fd.value,&info,&size)==0,"read owned map");
         owned.insert(info.id);
     }
-    std::unique_ptr<btf,decltype(&btf__free)> types(btf__load_vmlinux_btf(),btf__free);
-    if (!types) fail("kernel BTF unavailable");
-    for (const auto &spec:links) {
+    const auto &targets=hook_types();
+    for (size_t i=0;i<links.size();++i) {
+        const auto &spec=links[i];
         Fd link(bpf_obj_get((dir/spec.pin).c_str()));
         bpf_link_info info{}; uint32_t size=sizeof(info);
         check(bpf_obj_get_info_by_fd(link.value,&info,&size)==0,"read owned link");
-        auto hook=std::string("bpf_lsm_")+spec.hook;
-        int target=btf__find_by_name_kind(types.get(),hook.c_str(),BTF_KIND_FUNC);
+        int target=targets[i];
         if (spec.cgroup ? (info.type!=BPF_LINK_TYPE_CGROUP || info.cgroup.attach_type!=BPF_LSM_CGROUP) :
             (info.type!=BPF_LINK_TYPE_TRACING || info.tracing.attach_type!=BPF_LSM_MAC ||
              info.tracing.target_btf_id!=static_cast<uint32_t>(target))) fail("link attachment identity mismatch");
@@ -725,6 +740,25 @@ void probe_dns(const fs::path &dir) {
         fail("native DNS probe timed out or returned an invalid original-peer answer");
     std::cout<<"{\"dns\":true}\n";
 }
+// Read-only request loop over inherited anonymous pipes. Reopen and verify
+// every pin/map/link/program under a fresh lock on every operation. Nothing
+// mutable (including configuration or policy) is retained between requests.
+void observe(const fs::path &dir) {
+    char request[32];
+    while (std::cin.getline(request,sizeof(request))) {
+        std::string operation=request;
+        if (operation!="snapshot" && operation!="probe-dns") fail("unsupported observation");
+        if (operation=="probe-dns") require_mutation_host();
+        Fd lock(open(dir.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC));
+        check(flock(lock.value,operation=="snapshot"?LOCK_SH:LOCK_EX)==0,"lock observation");
+        verify_owner(dir);
+        if (operation=="snapshot") snapshot_json(dir);
+        else probe_dns(dir);
+        std::cout.flush();
+        if (!std::cout) fail("observation pipe closed");
+    }
+    if (!std::cin.eof()) fail("invalid observation request");
+}
 void capabilities() {
     struct utsname name{};
     check(uname(&name) == 0, "uname");
@@ -745,6 +779,7 @@ void capabilities() {
 int main(int argc, char **argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "capabilities") { capabilities(); return 0; }
+        if (argc == 3 && std::string(argv[1]) == "observe") { observe(argv[2]); return 0; }
         if (argc == 3 && std::string(argv[1]) == "status") { status(argv[2]); return 0; }
         if (argc==3 && (std::string(argv[1])=="policy" || std::string(argv[1])=="snapshot")) {
             Fd lock(open(argv[2],O_RDONLY|O_DIRECTORY|O_CLOEXEC));

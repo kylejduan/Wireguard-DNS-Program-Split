@@ -309,11 +309,11 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(network.inspect(PROFILE, runner=endpoint_on_link).underlay, 'eth0')
 
     def test_runner_redacts_stderr_timeout_and_argv(self):
-        for result in (subprocess.CompletedProcess(['wg'], 1, '', 'PrivateKey=' + PRIVATE),
+        for result in (subprocess.SubprocessError('PrivateKey=' + PRIVATE),
                        subprocess.TimeoutExpired(['wg', PRIVATE], 1, output=PRIVATE)):
             with self.subTest(kind=type(result).__name__):
                 kwargs = {'side_effect': result} if isinstance(result, Exception) else {'return_value': result}
-                with patch('wg_program_split.inventory.subprocess.run', **kwargs):
+                with patch('wg_program_split.inventory.capture', **kwargs):
                     with self.assertRaises(network.NetworkError) as error:
                         network.run_command(('wg', 'show', 'all', 'fwmark'))
                 self.assertNotIn(PRIVATE, str(error.exception))

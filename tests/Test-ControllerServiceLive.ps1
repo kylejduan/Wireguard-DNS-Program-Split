@@ -31,10 +31,17 @@ function Wait-Until([scriptblock] $Condition, [string] $Description) {
 }
 try {
     [IO.Directory]::CreateDirectory((Split-Path -Parent $script)) | Out-Null
+    Copy-Item (Join-Path $RepositoryRoot 'src\powershell\ValidationWorker.ps1') (Join-Path $root 'src')
+    [IO.File]::WriteAllText((Join-Path $root 'src\Invoke-LocalNrpt.ps1'), "Write-Output 'PASS: fixture'")
     [IO.File]::WriteAllText($script, @'
 param([long] $StopEventHandle)
 $event = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset)
 $event.SafeWaitHandle = [Microsoft.Win32.SafeHandles.SafeWaitHandle]::new([IntPtr]$StopEventHandle, $false)
+. (Join-Path $PSScriptRoot 'ValidationWorker.ps1')
+$worker = [ProgramSplit.ValidationWorker]::new((Join-Path $PSScriptRoot 'ValidationWorker.ps1'))
+$reply = $worker.Validate('Invoke-LocalNrpt.ps1', 30000) | ConvertFrom-Json
+if (-not $reply.Ok) { throw 'Nested validation worker failed.' }
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'worker.pid'), [string]$worker.ProcessId)
 if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'crash')) { exit 7 }
 foreach ($index in 1..2500) { [Console]::WriteLine(('x' * 4096)) }
 [Console]::WriteLine('OUTPUT-DRAINED')
@@ -55,6 +62,8 @@ $event.Dispose()
     } 'child output rotation and drain'
     Stop-Service -Name $name
     if (-not $process.WaitForExit(10000)) { throw 'Stopped controller service host remained alive.' }
+    $workerId = [int][IO.File]::ReadAllText((Join-Path $root 'src\worker.pid'))
+    Wait-Until { -not (Get-Process -Id $workerId -ErrorAction SilentlyContinue) } 'worker cleanup after SCM stop'
     $text = (Read-SharedText $log)
     if ($text -notmatch 'FINAL-CHILD-ERROR' -or $text -notmatch 'service stop completed with clean stack cleanup') {
         throw 'Ordered service stop lost child stderr or the host exit record.'
@@ -72,7 +81,9 @@ $event.Dispose()
     if ($record.ExitCode -ne 1066 -or $record.ServiceSpecificExitCode -ne 7) {
         throw 'Unexpected child exit was not reported as an SCM service failure.'
     }
-    Write-Output 'PASS: real controller SCM start, output rotation, ordered stop, stderr drain, and child-crash reporting.'
+    $workerId = [int][IO.File]::ReadAllText((Join-Path $root 'src\worker.pid'))
+    Wait-Until { -not (Get-Process -Id $workerId -ErrorAction SilentlyContinue) } 'worker cleanup after controller crash'
+    Write-Output 'PASS: nested validation worker cleanup and real controller SCM start, output rotation, ordered stop, stderr drain, and child-crash reporting.'
 } finally {
     if ($created) {
         $record = Get-CimInstance Win32_Service -Filter "Name='$name'"

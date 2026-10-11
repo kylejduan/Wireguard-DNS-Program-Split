@@ -316,3 +316,20 @@ The manual privileged CI job requires an operator-provisioned disposable runner
 labelled `wgps-disposable-vm`; it is not run on untrusted pull requests. Missing
 capabilities fail the requested privileged suite. Ignored `local/validation`
 contains the local evidence, while test keys/configuration remain private.
+
+### Observation worker and command resource bounds
+
+The daemon reuses a native observation helper over private anonymous pipes. It
+retains only immutable kernel BTF function IDs. Every snapshot and DNS probe
+reopens the current pin directory and verifies its maps, links, programs and
+configuration under a fresh lock. Snapshots read policy under that same lock;
+no mutable observation is reused between checks.
+Changed helper artifacts, failure or timeout discard the worker. Controller
+shutdown kills/reaps it while leaving pinned enforcement intact. CLI mutations
+retain their existing single-use helper and ownership checks.
+
+Fixed native commands have a 32 MiB stdout limit and 1 MiB stderr limit enforced
+while reading; excessive or incomplete output fails the operation instead of
+becoming a partial inventory. Timeout and overflow kill/reap the owned command.
+Network commands keep their 15-second timeout and native operations 30 seconds.
+See the [follow-up measurements and tradeoffs](performance.md#october-11-2026-broader-audit-and-implementation).

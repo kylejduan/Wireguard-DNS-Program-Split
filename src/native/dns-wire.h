@@ -121,11 +121,9 @@ std::optional<std::vector<char>> tcpExchange(const std::vector<char>& packet, so
     const auto deadline = afterMilliseconds(4000);
     source.sin_port = 0;
     std::optional<std::vector<char>> result;
-    const uint16_t length = htons(static_cast<uint16_t>(packet.size()));
     if (bind(upstream, reinterpret_cast<sockaddr*>(&source), sizeof(source)) == 0 &&
         connectBefore(upstream, resolver, deadline) &&
-        sendAll(upstream, reinterpret_cast<const char*>(&length), sizeof(length), deadline) &&
-        sendAll(upstream, packet.data(), static_cast<int>(packet.size()), deadline)) {
+        sendDnsFrame(upstream, packet, deadline)) {
         uint16_t responseLength{};
         if (receiveAll(upstream, reinterpret_cast<char*>(&responseLength), sizeof(responseLength), deadline)) {
             const int size = ntohs(responseLength);

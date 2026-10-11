@@ -168,18 +168,16 @@ def local_tests():
         assert result.returncode == 0  # Some hosts admit a larger ARG_MAX.
     native = NativeGuard('/usr/lib/wg-program-split', '/sys/fs/bpf/wgps-bulk-test')
     with patch('wg_program_split.preflight.verify_artifact'), \
-            patch('wg_program_split.preflight.subprocess.run', return_value=SimpleNamespace(
-                  returncode=0, stdout=b'loaded\n')) as execute:
+            patch('wg_program_split.preflight.capture', return_value='loaded\n') as execute:
         native.load(values, SimpleNamespace(mask=0xffff0000, mark=0x10000))
         argv = execute.call_args.args[0]
         assert argv[1] == 'load-policy-stdin' and len(argv) == 7
         assert execute.call_args.kwargs['input'] == payload
         assert execute.call_args.kwargs.get('text') is not True
         assert execute.call_args.kwargs['timeout'] == 30
-        assert execute.call_args.kwargs['env'] == {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'}
     for bad in (['/x'] * 1025, ['/' + 'x' * 4095], ['/x\0/y']):
         with patch('wg_program_split.preflight.verify_artifact'), \
-                patch('wg_program_split.preflight.subprocess.run') as execute:
+                patch('wg_program_split.preflight.capture') as execute:
             try:
                 native.load(bad, SimpleNamespace(mask=0xffff0000, mark=0x10000))
             except ControllerError:

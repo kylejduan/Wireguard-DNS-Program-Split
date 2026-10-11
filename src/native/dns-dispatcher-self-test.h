@@ -56,9 +56,7 @@ bool exchangeTest(const std::vector<char>& query, bool tcp) {
             if (!receiveAll(client.value, reinterpret_cast<char*>(&size), sizeof(size), deadline)) return;
             std::vector<char> request(ntohs(size));
             if (!receiveAll(client.value, request.data(), static_cast<int>(request.size()), deadline) || request != query) return;
-            size = htons(static_cast<uint16_t>(reply.size()));
-            sendAll(client.value, reinterpret_cast<const char*>(&size), sizeof(size), deadline);
-            sendAll(client.value, reply.data(), static_cast<int>(reply.size()), deadline);
+            sendDnsFrame(client.value, reply, deadline);
         } else {
             sockaddr_in peer{};
             int peerSize = sizeof(peer);
@@ -157,6 +155,11 @@ int selfTest() {
     if (!recovered || !*recovered) return 27;
     if (!socketDeadlineTest()) return 28;
     if (!exchangeTest(query, false) || !exchangeTest(query, true)) return 29;
+    auto largeQuery = query;
+    largeQuery.resize(65507, 0); // Maximum IPv4 UDP payload, also a large TCP frame.
+    if (!exchangeTest(largeQuery, false) || !exchangeTest(largeQuery, true)) return 30;
+    largeQuery.resize(65535, 0);
+    if (!exchangeTest(largeQuery, true)) return 31;
     if (gHintWaiters.load()) return 30;
     std::wcout << L"PASS: DNS parsing, attribution capacity/recovery, and real socket deadlines.\n";
     return 0;

@@ -11,6 +11,7 @@ import shutil
 import subprocess
 
 from .errors import NetworkError
+from .command import capture
 
 
 _TOOL_PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
@@ -23,14 +24,9 @@ def run_command(argv, *, input=None):
     if not argv or argv[0] not in {'ip', 'wg', 'nft', 'conntrack', 'sysctl', *_IPTABLES_DUMPS}:
         raise NetworkError('unsupported network command')
     try:
-        result = subprocess.run(tuple(argv), input=input, capture_output=True, text=True,
-                                timeout=15, check=False,
-                                env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
-    except (OSError, subprocess.SubprocessError):
-        raise NetworkError('network command failed or timed out; inspect effective state') from None
-    if result.returncode or len(result.stdout) > 32 * 1024 * 1024:
-        raise NetworkError('network command failed or returned excessive output')
-    return result.stdout
+        return capture(tuple(argv), input=input.encode('utf-8') if input is not None else None, timeout=15)
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        raise NetworkError('network command failed, timed out or exceeded output limits; inspect effective state') from None
 
 
 def _call(runner, *argv, input=None):

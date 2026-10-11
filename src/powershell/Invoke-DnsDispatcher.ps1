@@ -115,37 +115,43 @@ if ($Action -eq 'Status') {
 
 if ($Action -eq 'Validate') {
     $process = Get-ManagedProcess
-    if (-not $process) { throw 'The managed DNS dispatcher process is unavailable.' }
-    $traceNames = @(Get-OwnedTraceNames)
-    if ($traceNames.Count -ne 1) { throw 'The managed DNS dispatcher must own exactly one ETW session.' }
-    $udpEndpoint = Get-NetUDPEndpoint -LocalAddress '127.0.0.1' -LocalPort 53 -ErrorAction SilentlyContinue |
-        Where-Object { $_.OwningProcess -eq $process.Id }
-    $tcpEndpoint = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 53 -State Listen -ErrorAction SilentlyContinue |
-        Where-Object { $_.OwningProcess -eq $process.Id }
-    if (-not $udpEndpoint -or -not $tcpEndpoint) { throw 'The managed DNS dispatcher does not own loopback port 53.' }
-    if (-not (Test-Path -LiteralPath $networkState -PathType Leaf)) { throw 'Direct-network state is missing.' }
-    $saved = Get-Content -LiteralPath $networkState -Raw | ConvertFrom-Json
-    $current = Get-DirectNetwork
-    if ($saved.InterfaceIndex -ne $current.InterfaceIndex -or $saved.Source -ne $current.Source -or
-        $saved.Resolver -ne $current.Resolver) {
-        throw 'The active physical route, source address, or DNS resolver changed.'
+    $health = $null
+    try {
+        if (-not $process) { throw 'The managed DNS dispatcher process is unavailable.' }
+        $traceNames = @(Get-OwnedTraceNames)
+        if ($traceNames.Count -ne 1) { throw 'The managed DNS dispatcher must own exactly one ETW session.' }
+        $udpEndpoint = Get-NetUDPEndpoint -LocalAddress '127.0.0.1' -LocalPort 53 -ErrorAction SilentlyContinue |
+            Where-Object { $_.OwningProcess -eq $process.Id }
+        $tcpEndpoint = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 53 -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { $_.OwningProcess -eq $process.Id }
+        if (-not $udpEndpoint -or -not $tcpEndpoint) { throw 'The managed DNS dispatcher does not own loopback port 53.' }
+        if (-not (Test-Path -LiteralPath $networkState -PathType Leaf)) { throw 'Direct-network state is missing.' }
+        $saved = Get-Content -LiteralPath $networkState -Raw | ConvertFrom-Json
+        $current = Get-DirectNetwork
+        if ($saved.InterfaceIndex -ne $current.InterfaceIndex -or $saved.Source -ne $current.Source -or
+            $saved.Resolver -ne $current.Resolver) {
+            throw 'The active physical route, source address, or DNS resolver changed.'
+        }
+        $probe = Join-Path $root 'bin\dns-probe.exe'
+        $health = Start-Process -FilePath $probe -ArgumentList @('--system', 'example.com', 3) `
+            -RedirectStandardOutput $healthOut -RedirectStandardError $healthError -WindowStyle Hidden -PassThru
+        $null = $health.Handle
+        if (-not $health.WaitForExit(8000)) {
+            Stop-Process -Id $health.Id -Force -ErrorAction SilentlyContinue
+            throw 'Local split-DNS health probe timed out.'
+        }
+        $health.WaitForExit()
+        $output = @(Get-Content -LiteralPath $healthOut -ErrorAction SilentlyContinue)
+        $errors = @(Get-Content -LiteralPath $healthError -ErrorAction SilentlyContinue)
+        if ($health.ExitCode -ne 0 -or -not ($output -match '^PASS:')) {
+            throw "Local split-DNS health probe failed: $($output + $errors -join ' ')"
+        }
+        Write-Output 'PASS: dispatcher ownership, direct-network inputs, ETW attribution, and loopback DNS are healthy.'
+        exit 0
+    } finally {
+        if ($health) { $health.Dispose() }
+        if ($process) { $process.Dispose() }
     }
-    $probe = Join-Path $root 'bin\dns-probe.exe'
-    $health = Start-Process -FilePath $probe -ArgumentList @('--system', 'example.com', 3) `
-        -RedirectStandardOutput $healthOut -RedirectStandardError $healthError -WindowStyle Hidden -PassThru
-    $null = $health.Handle
-    if (-not $health.WaitForExit(8000)) {
-        Stop-Process -Id $health.Id -Force -ErrorAction SilentlyContinue
-        throw 'Local split-DNS health probe timed out.'
-    }
-    $health.WaitForExit()
-    $output = @(Get-Content -LiteralPath $healthOut -ErrorAction SilentlyContinue)
-    $errors = @(Get-Content -LiteralPath $healthError -ErrorAction SilentlyContinue)
-    if ($health.ExitCode -ne 0 -or -not ($output -match '^PASS:')) {
-        throw "Local split-DNS health probe failed: $($output + $errors -join ' ')"
-    }
-    Write-Output 'PASS: dispatcher ownership, direct-network inputs, ETW attribution, and loopback DNS are healthy.'
-    exit 0
 }
 
 Assert-Administrator

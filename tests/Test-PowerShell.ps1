@@ -68,7 +68,7 @@ $stopWfp = $controllerSource.IndexOf("Invoke-Component 'Invoke-WfpFilters.ps1' '
 $stopNrpt = $controllerSource.IndexOf("Invoke-Component 'Invoke-LocalNrpt.ps1' 'Disable'", $stopStack)
 Assert-True ($stopWfp -gt $stopStack -and $stopWfp -lt $stopNrpt) `
     'controller removes payload filters before restoring direct DNS'
-Assert-True ($controllerSource -match "Invoke-Component 'Invoke-LocalNrpt.ps1' 'Validate'") `
+Assert-True ($controllerSource -match "Invoke-Validation 'Invoke-LocalNrpt.ps1'") `
     'controller health validates the active NRPT namespace'
 $stackHealthSource = $controllerSource.Substring(
     $controllerSource.IndexOf('function Test-StackHealth'),

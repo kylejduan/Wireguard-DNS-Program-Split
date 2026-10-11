@@ -145,3 +145,108 @@ and [Linux operating limits](linux.md) still apply.
 Raw samples, benchmark sources and deployment checks are retained locally under
 `local/performance/20261010/`. The local evidence manifest has SHA-256
 `9ed831effab89742d09e74496f7e99f6011e1489e2d7942cd3aea338d46084e3`.
+
+## October 11, 2026: broader audit and implementation
+
+Baseline: `0259e76`. The follow-up examined supervision, native helpers, kernel
+hooks and maps, network inventory, DNS allocation/framing/logging/attribution,
+UI memory, build options and host tuning. The changes below preserve the same
+health intervals and routing policy.
+
+### Implemented changes and measurements
+
+- Windows reuses a private PowerShell validation worker for periodic NRPT and
+  dispatcher checks. Each request invokes the existing script in a fresh script
+  scope, reloads configuration and observes live state. Anonymous pipes allow
+  only the two validators. The 45-second deadline remains; failure discards the
+  worker, and a kill-on-close job contains its probe descendants. Stack stop
+  and controller shutdown dispose the worker. Startup/recovery mutations still
+  use separate component processes. Owned validation/component process handles
+  are now disposed explicitly.
+- Linux daemon observations reuse a native helper over private anonymous pipes.
+  Only twelve immutable kernel BTF function IDs survive between requests; the
+  parsed BTF is freed. Every request opens a fresh pin-directory lock and repeats
+  map, link, program, configuration and policy checks. The helper keeps no live
+  object descriptors while idle. Artifact replacement invalidates the worker;
+  timeout, crash, malformed or excessive output fails the check and discards it.
+  CLI operations remain single-use. The kernel programs, map layouts and ABI
+  are unchanged.
+- Linux hashes the owned nft table once per fresh network snapshot. The two
+  independent network observations around DNS probing remain intact.
+- Linux command capture enforces 32 MiB stdout and 1 MiB stderr limits while
+  reading. It multiplexes input/output, rejects incomplete results, redacts
+  command diagnostics and kills/reaps its fixed helper on timeout or overflow.
+  This bounds peak buffering; it is not presented as a normal-load CPU saving.
+- Windows UDP ingress uses one 65,535-byte receive buffer and copies only the
+  received bytes into each request. A 128-byte query therefore no longer retains
+  a 65,535-byte vector while waiting for attribution/upstream. At 256 outstanding
+  queries of that size, request-buffer capacity falls by approximately 15.9 MiB,
+  less the single shared receive buffer. This excludes response buffers, socket
+  storage and thread stacks. Maximum-sized UDP/TCP exchanges remain supported.
+- TCP DNS sends prefix and body together using scatter/gather in both directions,
+  retaining partial-write handling and absolute deadlines. An ordinary complete
+  write needs one send call instead of two. A 600-request loopback comparison
+  passed; observed latency differences were small/noisy, so no WAN latency
+  improvement is claimed. Tray text changes only when its displayed value changes.
+
+Five alternating Windows rounds, after warmup, measured the two validators at
+1,715.625 ms CPU/pass in fresh processes versus 106.25 ms in the contained worker
+(93.8% lower); elapsed time was 2,596.7 versus 882.3 ms. All validations passed.
+These figures cover validator process CPU, excluding the parent's small pipe
+handling cost, native probe grandchildren and Windows providers. A previous
+paired run gave 1,884.375 versus 112.5 ms. The warm worker used about **162 MiB
+private memory** in the isolated benchmark: this deliberately trades persistent
+memory for far less repeated startup CPU. It is not a minimum-memory design.
+
+Ten alternating Linux rounds of snapshot, DNS probe, snapshot measured combined
+caller/helper CPU at 43.60 versus 2.60 ms (94.0% lower), and elapsed time at
+189.2 versus 148.5 ms. All forty snapshots matched the installed enforcement
+identities and policy. The helper used about 5.1 MiB RSS. CPU combines caller
+process time with reaped-child accounting for the baseline and scheduler runtime
+for the resident helper; RSS is process memory, not kernel map memory.
+
+Eight complete healthy checks per version measured 140.21 versus 101.39 ms CPU
+(27.7% lower), including children and the resident helper. Elapsed time was
+283.8 versus 244.4 ms. These full-check batches were sequential, not alternating,
+and include concurrent host work. They support the direction of the more tightly
+paired helper result, not a precise whole-host CPU prediction.
+
+### Disposition of the remaining opportunities
+
+| Area | Decision and evidence needed before another implementation |
+| --- | --- |
+| Native Windows tray | Promising: the PowerShell tray previously used 83 MiB private memory. Requires equivalent menus, profile import/rollback, permissions and UI validation. No measured native replacement yet. |
+| Native Windows controller | Could eliminate interpreter memory, including the new worker tradeoff. Recovery/ownership/hold behavior makes this a separate substantial port. |
+| Batched native Linux network inventory | 33 commands per baseline check; the worker removes three launches. Replacing the remaining command parsers with netlink/nft/WireGuard APIs needs fresh-state and foreign-rule parity tests. Parallel launches alone do not establish lower CPU. |
+| Sparse long-path BPF map | About 4.13 MiB reserved while empty. `BPF_F_NO_PREALLOC` needs map migration, allocation-failure/rollback and disposable-kernel testing. Keep the existing map ABI. |
+| Negative-role BPF cache | About 6 MiB; file-open hooks consumed about 3% of one core under the sampled workload. Need hit/miss and contention measurements before trading memory for extra lookup work. |
+| Guard epoch lookups and nft chain traversal | Potential per-operation savings, but concurrent updates, hook priorities, conntrack zones and foreign rules are correctness boundaries. Require controlled packet/kernel tests. |
+| Socket classifier representation | Only about 0.019% of one core in the sample. Existing short-path tier and once-per-new-socket classification make this lower priority than file guards. |
+| Upstream UDP response buffers | Still reserve up to 65,535 bytes after a reply becomes readable. Sizing from queued bytes introduces another socket query; no measured net gain yet. |
+| DNS logging and ETW event-ID/metadata filtering | Potential burst-load improvements. Need event-loss, schema-version and diagnostic-retention tests; do not remove failure evidence or narrow attribution coverage speculatively. |
+| IOCP/async DNS instead of threads | Requires bounded queues, fairness, cancellation and saturation/tail-latency comparison. Current low query volume does not justify claiming an improvement from a rewrite. |
+| Upstream socket/connection pooling | Must retain source binding and isolate transaction IDs, peers, questions, late replies, resets and configuration generations. No verified workload benefit yet. |
+| Private route-partitioned DNS cache/coalescing | Could save WAN work, but changes behavior. Requires attribution before cache lookup, TTL/EDNS/DNSSEC handling and strict direct/tunnel isolation. Never enable a shared cross-route cache. |
+| Attribution wakeups and process-cache eviction | Per-key wakeups and incremental eviction could help bursts/churn. Current sampled classification p99 was 2 ms; benchmark contention before adding structures. Preserve PID creation-time identity. |
+| Notifications replacing supervisor polling | Could reduce idle wakeups. Must preserve detection intervals and recover from lost notifications; only redundant tray updates were removed now. |
+| Incremental Windows application-list updates | Reduces management disruption, not idle CPU. Needs coordinated WFP/DNS policy generations and rollback. |
+| LTO/PGO/toolchain settings | Already optimized builds. Require representative A/B CPU and size measurements; no blanket compiler upgrade or `-O3` change. |
+| MTU, offloads, NIC queues/IRQ affinity | Hardware/workload-dependent throughput/latency tradeoffs. No blind production tuning. |
+| Provider endpoint and application connection reuse | Could dominate end-user latency (prior tunnel DNS around 146 ms), but changes the profile/application rather than split overhead. No changes made. |
+
+The resource-bound tests cover output overflow before a newline, stderr floods,
+large simultaneous input/output, hangs, crashes, malformed output and child
+reaping. Worker tests cover fresh inputs, failed checks, artifact replacement,
+process reuse and shutdown. Native ownership tests inject replaced maps, links
+and programs after metadata reuse and require rejection. Windows tests include
+maximum UDP/TCP frames and real socket deadlines; disposable Windows CI also
+checks nested worker cleanup under SCM and the DNS Client/ETW path.
+
+The WSL-backed installer ACL fixture still cannot set Windows ACLs on the Linux
+filesystem. The equivalent PowerShell suites run with Windows-native temporary
+storage, and the throwaway real-SCM recovery test runs from NTFS. The disposable
+native-kernel suite is not run on production: no BPF policy, map or nft rule
+changes are included here. These checks do not establish maximum DNS QPS,
+line-rate throughput or a weeks-long soak.
+
+Private measurements and scripts are retained under `local/performance/20261011/`.

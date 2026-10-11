@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reuse bounded Windows validation and Linux native observation workers while preserving fresh ownership checks and hard timeouts. Linux captures native output with streaming size limits and hashes each owned firewall snapshot once. Windows retains only received UDP request bytes, coalesces TCP DNS frame writes, disposes component handles and avoids redundant tray updates. The Windows worker trades additional resident memory for lower CPU; see the [follow-up audit and remaining opportunities](docs/performance.md#october-11-2026-broader-audit-and-implementation).
+
 - Reduce Windows supervision CPU by querying process image paths without module enumeration, and reduce Linux firewall-inventory allocations. Exact process ownership, complete mark/zone validation and health-check intervals are preserved. See the [paired performance audit](docs/performance.md).
 
 - Windows installs now default to `%ProgramFiles%\WireGuardProgramSplit`. Service and controller child commands support paths with spaces. `Migrate-Installation.ps1` moves an active legacy ProgramData installation with its configuration and permissions, updates services and the tray, and rolls back on activation failure.

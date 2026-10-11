@@ -82,9 +82,12 @@ function Show-Notice([string] $title, [string] $message, [Windows.Forms.ToolTipI
 
 function Update-Ui {
     $status = Get-StatusText
-    $statusItem.Text = "Status: $status"
-    $toggleItem.Text = if (Test-Path -LiteralPath $enabledFile) { 'Disable' } else { 'Enable' }
-    $icon.Text = "WireGuard Program Split - $status"
+    $statusText = "Status: $status"
+    $toggleText = if (Test-Path -LiteralPath $enabledFile) { 'Disable' } else { 'Enable' }
+    $iconText = "WireGuard Program Split - $status"
+    if ($statusItem.Text -ne $statusText) { $statusItem.Text = $statusText }
+    if ($toggleItem.Text -ne $toggleText) { $toggleItem.Text = $toggleText }
+    if ($icon.Text -ne $iconText) { $icon.Text = $iconText }
 }
 
 function Rebuild-RemoveMenu {

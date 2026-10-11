@@ -45,14 +45,27 @@ bool connectBefore(SOCKET socketHandle, const sockaddr_in& target, Deadline dead
     return getsockopt(socketHandle, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &length) == 0 && !error;
 }
 
-bool sendAll(SOCKET socketHandle, const char* data, int size, Deadline deadline) {
-    int sent{};
-    while (sent < size) {
+// Keep the DNS prefix and body in one send without an extra payload copy.
+// Partial scatter/gather writes share the original absolute deadline.
+bool sendDnsFrame(SOCKET socketHandle, const std::vector<char>& packet, Deadline deadline) {
+    if (packet.empty() || packet.size() > 65535) return false;
+    uint16_t length = htons(static_cast<uint16_t>(packet.size()));
+    WSABUF buffers[2]{{sizeof(length), reinterpret_cast<char*>(&length)},
+                     {static_cast<ULONG>(packet.size()), const_cast<char*>(packet.data())}};
+    unsigned first = 0;
+    while (first < 2) {
         if (!socketReady(socketHandle, true, deadline)) return false;
-        const int current = send(socketHandle, data + sent, size - sent, 0);
-        if (current == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
-        if (current <= 0) return false;
-        sent += current;
+        DWORD sent = 0;
+        if (WSASend(socketHandle, buffers + first, 2 - first, &sent, 0, nullptr, nullptr)) {
+            if (WSAGetLastError() == WSAEWOULDBLOCK) continue;
+            return false;
+        }
+        if (!sent) return false;
+        while (first < 2 && sent >= buffers[first].len) {
+            sent -= buffers[first].len;
+            ++first;
+        }
+        if (first < 2) { buffers[first].buf += sent; buffers[first].len -= sent; }
     }
     return true;
 }

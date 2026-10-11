@@ -412,9 +412,7 @@ void handleTcpClient(SOCKET client, Hints& hints, sockaddr_in directSource, sock
         const bool answered = response.has_value();
         if (!response) response = makeServfail(packet);
         const auto responseDeadline = afterMilliseconds(5000);
-        const uint16_t responseLength = htons(static_cast<uint16_t>(response->size()));
-        if (!sendAll(client, reinterpret_cast<const char*>(&responseLength), sizeof(responseLength), responseDeadline) ||
-            !sendAll(client, response->data(), static_cast<int>(response->size()), responseDeadline)) break;
+        if (!sendDnsFrame(client, *response, responseDeadline)) break;
         if (question && tunnel) {
             hints.complete(question->name, question->type);
             logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
@@ -505,16 +503,18 @@ int wmain(int argc, wchar_t** argv) {
             }
         });
 
+        // One ingress buffer; workers retain only the received bytes, rather
+        // than a 64 KiB vector capacity while waiting for attribution/upstream.
+        std::array<char, 65535> receiveBuffer;
         while (gRunning) {
-            std::vector<char> packet(65535);
             sockaddr_in client{};
             int clientSize = sizeof(client);
             if (!socketReady(gUdpListener, false, afterMilliseconds(1000))) continue;
-            const int received = recvfrom(gUdpListener, packet.data(), static_cast<int>(packet.size()), 0,
+            const int received = recvfrom(gUdpListener, receiveBuffer.data(), static_cast<int>(receiveBuffer.size()), 0,
                                           reinterpret_cast<sockaddr*>(&client), &clientSize);
             if (received <= 0) continue;
             const long long queryQpc = qpcNow();
-            packet.resize(received);
+            std::vector<char> packet(receiveBuffer.data(), receiveBuffer.data() + received);
             if (!acquireWorker()) {
                 const auto failure = makeServfail(packet);
                 sendto(gUdpListener, failure.data(), static_cast<int>(failure.size()), 0,
@@ -532,7 +532,7 @@ int wmain(int argc, wchar_t** argv) {
                 }).detach();
             } catch (...) {
                 gActiveWorkers.fetch_sub(1);
-                const auto failure = makeServfail(packet);
+                const auto failure = makeServfail(std::vector<char>(receiveBuffer.data(), receiveBuffer.data() + received));
                 sendto(gUdpListener, failure.data(), static_cast<int>(failure.size()), 0,
                        reinterpret_cast<sockaddr*>(&client), clientSize);
             }
