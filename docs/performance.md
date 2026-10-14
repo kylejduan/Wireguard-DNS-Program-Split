@@ -283,3 +283,45 @@ running, the stack was active, the installation remained under Program Files,
 and the legacy ProgramData directory was absent.
 
 These are short deployment checks, not a long-term stability or saturation proof.
+
+## October 14, 2026: fail-closed release deployment
+
+The fail-closed changes were published as `c5c84ba`.
+[CI for the deployed source](https://github.com/kylejduan/Wireguard-DNS-Program-Split/actions/runs/38596681911)
+passed the Linux unit and native checks and the Windows native, PowerShell,
+real SCM, DNS Client/ETW, persistent WFP and dispatcher supervision checks.
+Locally, 336 Linux unit tests, the native Linux checks, 112 privileged checks in
+a disposable VM, the Windows native self-tests and the PowerShell suites passed.
+
+The Windows workstation was upgraded in place without stopping enforcement:
+the earlier release's controller was ended without teardown, the files were
+replaced with hash and ACL checks, and the persistent filter set was committed
+before the earlier filter host ended. The first attempt stopped on an
+over-strict identity check in the deployment script (WMI reports a renamed
+running image under its original path) and rolled itself back, verified, in
+13 seconds; the corrected attempt succeeded. After deployment:
+
+- `wfp-probe.exe status` reported 20 filters (10 per listed application,
+  8 boot-time), and every component validation passed. The dispatcher reported
+  `etw-filter=query-event`.
+- A listed browser's 14 external connections all used the tunnel address and
+  none the physical address; unlisted egress kept the ISP address. A listed
+  application's DNS went through the tunnel and an unlisted lookup went direct.
+- With the tunnel stopped for 45 seconds, the listed browser was active but had
+  no external connection, while unlisted egress worked; the tunnel recovered
+  33.5 seconds after it was released.
+- A killed dispatcher was replaced and answering in 0.26 seconds. With the
+  controller killed, all 20 filters stayed in place, and the service recovered
+  in 10.8 seconds.
+- Configuration, profiles, drivers, the WireGuard runtime and service settings
+  were unchanged. BFE restart, reboot and uninstall were not exercised on the
+  live host; CI covers them.
+
+On the Linux reference host the CLI, loader and BPF object were replaced with
+the running guard adopted unchanged. A 60-second sample of the controller
+cgroup averaged 2.43% of one core and 17.0 MiB, ready with protection verified
+and no restarts. The new guard programs, 1,024-entry maps and the settle drain
+take effect at the host's next boot. A rehearsal of the same swap in the
+disposable VM marked every one of about 8.3 million sockets created during it.
+
+These are short deployment checks, not a long-term stability or saturation proof.
