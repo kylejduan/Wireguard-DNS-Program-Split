@@ -14,6 +14,7 @@ case "${1:-}" in
         tests/linux/test_classifier.sh native
         python3 tests/linux/test_resolver_ipc.py --native
         python3 tests/linux/test_policy_bulk.py --native
+        python3 tests/linux/test_loader_recovery.py --native
         python3 tests/linux/test_boot.py --native
         python3 tests/linux/test_preemption.py --native
         bash -n scripts/build-linux.sh scripts/wg-program-split tests/run-linux.sh
@@ -41,6 +42,7 @@ case "${1:-}" in
         python3 tests/linux/test_preemption.py --vm
         python3 tests/linux/test_resolver_ipc.py --vm
         python3 tests/linux/test_policy_bulk.py --vm
+        python3 tests/linux/test_loader_recovery.py --vm
         python3 tests/linux/test_dns_paths.py --vm
         python3 tests/linux/test_resolver_integration.py --vm
         python3 tests/linux/test_network_vm.py --vm

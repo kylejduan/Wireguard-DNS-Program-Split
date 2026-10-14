@@ -18,6 +18,16 @@ $reloadFile = Join-Path $state 'reload.request'
 $errorFile = Join-Path $state 'last-error.txt'
 $logFile = Join-Path $logs 'controller.log'
 $includeFile = Join-Path $state 'included-apps.txt'
+# Present whenever persistent payload filters may exist; Invoke-WfpFilters.ps1 owns it.
+$filtersInstalledFile = Join-Path $state 'wfp-filters.installed'
+# The tray's profile import asks to keep the filters through the disable that swaps the profile.
+$keepFiltersFile = Join-Path $state 'keep-filters.request'
+# Every component is up but tunnel DNS did not answer during startup; the tunnel-only restart takes over.
+$tunnelRetryFile = Join-Path $state 'tunnel-retry'
+# While present, controller-service.exe keeps the dispatcher running; see dispatcher-supervisor.h.
+$dispatcherSupervisedFile = Join-Path $state 'dns-dispatcher.supervised'
+# Adapter maintenance inspects only devices under this key; see AdapterMaintenance.ps1.
+$rootAdapterKey = 'HKLM:\SYSTEM\CurrentControlSet\Enum\ROOT\WIREGUARD'
 
 function Get-ControllerElapsed {
     # Monotonic scheduling survives daylight-saving changes and wall-clock corrections.
@@ -40,14 +50,14 @@ function Write-ControllerLog([string] $message) {
     } catch { }
 }
 
-function Start-Component([string] $name, [string] $action) {
+function Start-Component([string] $name, [string] $action, [string[]] $switches = @()) {
     $script = Join-Path $PSScriptRoot $name
     $key = [IO.Path]::GetFileNameWithoutExtension($name)
     $stdout = Join-Path $logs "$key-output.log"
     $stderr = Join-Path $logs "$key-error.log"
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $process = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $script), '-Action', $action
+        @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $script), '-Action', $action) + $switches
     ) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
     # Materialize the process handle before it can exit. Windows PowerShell 5.1 otherwise
     # exposes a null ExitCode for short-lived children created with Start-Process.
@@ -87,13 +97,16 @@ function Complete-Component($component) {
     } finally { $process.Dispose() }
 }
 
-function Invoke-Component([string] $name, [string] $action) {
-    Complete-Component (Start-Component -name $name -action $action)
+function Invoke-Component([string] $name, [string] $action, [string[]] $switches = @()) {
+    Complete-Component (Start-Component -name $name -action $action -switches $switches)
 }
 
 function Invoke-AdapterMaintenance {
     if ((Get-ControllerElapsed) -lt $script:nextAdapterMaintenance) { return }
     $script:nextAdapterMaintenance = (Get-ControllerElapsed) + [TimeSpan]::FromMinutes(5)
+    # Without root WireGuard devices the component has nothing to inspect; skip its PowerShell start,
+    # service query and adapter enumeration. An unreadable key still runs the component, which reports it.
+    try { if (-not (Test-Path -LiteralPath $rootAdapterKey -ErrorAction Stop)) { return } } catch { }
     try { Invoke-Component 'Invoke-AdapterMaintenance.ps1' 'Repair' }
     catch {
         try { Write-ControllerLog "Adapter maintenance incomplete; keeping the stack active: $($_.Exception.Message)" }
@@ -115,50 +128,98 @@ function Get-ExpectedProcesses([string] $processName, [string] $expectedPath) {
     })
 }
 
-function Test-StackActive {
-    $service = Get-Service -Name $configuration.ServiceName -ErrorAction SilentlyContinue
-    $rule = Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-        Where-Object { Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $configuration.NrptDisplayName }
-    return (Test-Path -LiteralPath $activeFile -PathType Leaf) -and
-        $service -and $service.Status -eq 'Running' -and $rule -and
-        (Test-Path -LiteralPath (Join-Path $state 'dns-etw-session.txt') -PathType Leaf) -and
-        (Test-ManagedProcess 'dns-dispatcher.pid' (Join-Path $root 'bin\dns-dispatcher.exe')) -and
-        (Test-ManagedProcess 'wfp-filters.pid' (Join-Path $root 'bin\wfp-probe.exe'))
+function Test-OwnedNrptRulePresent {
+    # An unreadable policy key counts as a missing rule, as the CIM query it replaced did.
+    try {
+        return [bool](Get-ProgramSplitLocalNrptRules |
+            Where-Object { Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $configuration.NrptDisplayName })
+    } catch { return $false }
 }
 
-function Test-StackPresent {
+function Get-StackState {
+    # Runs on every loop pass, so the state files and owned processes are checked before the service
+    # query and the NRPT rule's registry key. The rule stays in this check: once it is gone, selected
+    # applications resolve through the physical resolver until the stack is repaired. The persistent
+    # payload filters survive process, BFE and host restarts, so this pass reads only their install marker;
+    # the 30-second validation verifies the objects themselves.
+    # TunnelDown means every per-application component is in place and only the tunnel host is not running.
+    # The dispatcher process is the supervisor's, which replaces one that ends within about a second, so a
+    # dispatcher between processes is not a reason to repair the stack; the health check validates it.
+    $tunnelRetry = Test-Path -LiteralPath $tunnelRetryFile -PathType Leaf
+    if (-not ($tunnelRetry -or (Test-Path -LiteralPath $activeFile -PathType Leaf)) -or
+        -not (Test-Path -LiteralPath $filtersInstalledFile -PathType Leaf) -or
+        -not (Test-Path -LiteralPath (Join-Path $state 'dns-etw-session.txt') -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $dispatcherSupervisedFile -PathType Leaf)) { return 'Inactive' }
+    $service = Get-Service -Name $configuration.ServiceName -ErrorAction SilentlyContinue
+    if (-not $service) { return 'Inactive' }
+    if (-not (Test-OwnedNrptRulePresent)) { return 'Inactive' }
+    if ($service.Status -eq 'Running' -and -not $tunnelRetry) { return 'Active' }
+    return 'TunnelDown'
+}
+
+function Test-StackActive { (Get-StackState) -eq 'Active' }
+
+function Test-StackPresent([switch] $Import) {
+    # A profile import swaps only the tunnel: the payload filters, the dispatcher, the NRPT rule and the
+    # cache policy stay, so selected applications' DNS keeps failing closed, and only the tunnel counts.
     if (Test-Path -LiteralPath $activeFile -PathType Leaf) { return $true }
     $service = Get-Service -Name $configuration.ServiceName -ErrorAction SilentlyContinue
     if ($service -and $service.Status -ne 'Stopped') { return $true }
-    if (Test-Path -LiteralPath (Join-Path $state 'dns-etw-session.txt') -PathType Leaf) { return $true }
     if (Test-Path -LiteralPath (Join-Path $state 'endpoint-route.txt') -PathType Leaf) { return $true }
-    if (Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-        Where-Object { Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $configuration.NrptDisplayName }) { return $true }
-    return [bool]((Get-ExpectedProcesses 'dns-dispatcher' (Join-Path $root 'bin\dns-dispatcher.exe')) -or
-        (Get-ExpectedProcesses 'wfp-probe' (Join-Path $root 'bin\wfp-probe.exe')))
+    if ($Import) { return $false }
+    if (Test-Path -LiteralPath $filtersInstalledFile -PathType Leaf) { return $true }
+    if (Test-Path -LiteralPath (Join-Path $state 'dns-etw-session.txt') -PathType Leaf) { return $true }
+    if (Test-Path -LiteralPath $dispatcherSupervisedFile -PathType Leaf) { return $true }
+    if (Test-OwnedNrptRulePresent) { return $true }
+    if (Get-ExpectedProcesses 'dns-dispatcher' (Join-Path $root 'bin\dns-dispatcher.exe')) { return $true }
+    # A dynamic-session filter host left running by an earlier release.
+    return [bool](Get-ExpectedProcesses 'wfp-probe' (Join-Path $root 'bin\wfp-probe.exe'))
 }
 
-function Stop-Stack([switch] $RestoreCache, [switch] $ThrowOnFailure) {
+function Test-FilterHoldRequested {
+    # Honored for five minutes, so a tray that exits during an import cannot leave a disabled stack's
+    # filters in place indefinitely; the next disabled pass after that removes them.
+    if (-not (Test-Path -LiteralPath $keepFiltersFile -PathType Leaf)) { return $false }
+    try { return ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc($keepFiltersFile)).TotalMinutes -lt 5 }
+    catch { return $false }
+}
+
+function Stop-Stack([switch] $RestoreCache, [switch] $ThrowOnFailure, [switch] $KeepTunnel, [switch] $RemoveFilters,
+        [switch] $StopDns) {
+    # Repairs and reloads stop only the tunnel, if that: the persistent payload filters, the owned NRPT rule
+    # and the dispatcher stay, and the dispatcher takes new inputs in place. Disable, service stop and
+    # uninstall also stop DNS (the rule first, then the dispatcher and its supervision) and, unless a profile
+    # import holds them, remove the filters before anything else.
     Stop-ValidationWorker
     $cleanupErrors = [Collections.Generic.List[string]]::new()
-    $wfpStopped = $false
-    try {
-        Invoke-Component 'Invoke-WfpFilters.ps1' 'Stop'
-        $wfpStopped = $true
-    } catch { $cleanupErrors.Add([string]$_); Write-ControllerLog $_ }
-    if ($wfpStopped) {
+    if ($RemoveFilters) {
+        try { Invoke-Component 'Invoke-WfpFilters.ps1' 'Stop' }
+        catch { $cleanupErrors.Add([string]$_); Write-ControllerLog $_ }
+    }
+    if ($StopDns) {
+        # The rule must not outlive the dispatcher it names, or every lookup on the host fails.
         try { Invoke-Component 'Invoke-LocalNrpt.ps1' 'Disable' }
         catch { $cleanupErrors.Add([string]$_); Write-ControllerLog $_ }
-    }
-    try { Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Stop' }
-    catch { $cleanupErrors.Add([string]$_); Write-ControllerLog $_ }
-    try { Invoke-Component 'Invoke-Tunnel.ps1' 'Stop' }
-    catch { $cleanupErrors.Add([string]$_); Write-ControllerLog $_ }
-    if ($RestoreCache) {
-        try { Invoke-Component 'Invoke-DnsCachePolicy.ps1' 'Disable' }
+        try { Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Stop' }
         catch { $cleanupErrors.Add([string]$_); Write-ControllerLog $_ }
     }
-    Remove-Item -LiteralPath $activeFile -Force -ErrorAction SilentlyContinue
+    # An included-app reload changes only the dispatcher's inputs and the filters. Keeping the tunnel lets
+    # the restart adopt it instead of waiting for a new handshake; a restart that fails still stops it.
+    if (-not $KeepTunnel) {
+        try { Invoke-Component 'Invoke-Tunnel.ps1' 'Stop' }
+        catch { $cleanupErrors.Add([string]$_); Write-ControllerLog $_ }
+    }
+    if ($RestoreCache) {
+        # The stack can be gone while the cache cap remains; the disable path retries until this clears.
+        try {
+            Invoke-Component 'Invoke-DnsCachePolicy.ps1' 'Disable'
+            $script:cacheRestorePending = $false
+        } catch {
+            $script:cacheRestorePending = $true
+            $cleanupErrors.Add([string]$_); Write-ControllerLog $_
+        }
+    }
+    Remove-Item -LiteralPath $activeFile, $tunnelRetryFile -Force -ErrorAction SilentlyContinue
     if ($ThrowOnFailure -and $cleanupErrors.Count) {
         throw "Stack cleanup failed: $($cleanupErrors -join ' | ')"
     }
@@ -237,8 +298,8 @@ function Test-TunnelDns([int] $TimeoutMilliseconds = 5000, [int] $Attempts = 1) 
 function Test-PhysicalResolverAnswers {
     # The dispatcher answers unlisted names by forwarding them to the physical resolver,
     # so a dead LAN resolver fails the local probe no matter how healthy this stack is.
-    # Restarting cannot fix that, and each restart removes the payload filters, so the
-    # caller holds instead. Returns $false when the resolver is unknown or silent.
+    # Restarting cannot fix that, and each restart stops the dispatcher and tunnel, so
+    # the caller holds instead. Returns $false when the resolver is unknown or silent.
     $resolver = Get-ProgramSplitPhysicalResolver -AdapterName $configuration.AdapterName `
         -TunnelDns $configuration.TunnelDns
     if (-not $resolver) { return $false }
@@ -277,8 +338,8 @@ function Test-LocalDns {
         $detail = $output + $errors -join ' '
         if (-not (Test-PhysicalResolverAnswers)) {
             # Hold: the dispatcher is forwarding to a resolver that is not answering, so the
-            # probe cannot pass and a restart would only strip the payload filters and leave
-            # selected applications on the physical path while unlisted names fail anyway.
+            # probe cannot pass and a restart would only cycle the NRPT rule, dispatcher and
+            # tunnel while unlisted names fail anyway.
             if (-not $script:resolverHoldLogged) {
                 Write-ControllerLog ("Local split-DNS probe failed while the physical resolver is " +
                     "not answering; keeping the stack in place: $detail")
@@ -292,14 +353,105 @@ function Test-LocalDns {
     Write-ControllerLog 'Local split-DNS health probe passed.'
 }
 
+function Invoke-DispatcherValidation {
+    # The physical-network snapshot and the end-to-end probe follow the uplink, so an outage fails them with
+    # every owned component intact. Mark those as transport failures; ownership and ETW failures stay unmarked.
+    try {
+        try { Invoke-Validation 'Invoke-DnsDispatcher.ps1' }
+        catch {
+            # A dispatcher that just ended is replaced by the supervisor within about a second; check its
+            # successor once instead of repairing the stack around it.
+            if ($_.Exception.Message -notmatch 'managed DNS dispatcher process is unavailable|has not loaded the current inputs') { throw }
+            try {
+                Wait-ProgramSplitProbe -Probe { if (-not (Test-ProgramSplitDispatcherReady -Root $root)) { throw 'not ready' } } `
+                    -TimeoutMilliseconds 5000 -RetryMilliseconds 250 -StopEvent $stopEvent
+            } catch { }
+            Invoke-Validation 'Invoke-DnsDispatcher.ps1'
+        }
+    } catch {
+        if ($_.Exception.Message -match ('physical route, source address, or DNS resolver changed|' +
+                'Physical source address or pre-dispatch DNS resolver is unavailable|' +
+                'No physical IPv4 default gateway|Local split-DNS health probe')) {
+            $_.Exception.Data['ProgramSplitStage'] = 'Transport'
+        }
+        throw
+    }
+}
+
 function Test-StackHealth {
-    Assert-ProgramSplitNoIpv6DefaultRoute
+    # The filters are repaired in place, so they are checked first and never wait on the uplink.
+    try { Invoke-Validation 'Invoke-WfpFilters.ps1' }
+    catch {
+        $_.Exception.Data['ProgramSplitStage'] = 'Filters'
+        throw
+    }
     Invoke-Validation 'Invoke-LocalNrpt.ps1'
-    Invoke-Validation 'Invoke-DnsDispatcher.ps1'
-    Test-TunnelDns -TimeoutMilliseconds 1000 -Attempts 3
+    Invoke-DispatcherValidation
+    # NRPT and the dispatcher passed, so a failure from here on is VPN-side: the provider, the server or
+    # the tunnel host. Mark it so recovery can keep the per-application components in place.
+    try { Test-TunnelDns -TimeoutMilliseconds 1000 -Attempts 3 }
+    catch {
+        $_.Exception.Data['ProgramSplitStage'] = 'Tunnel'
+        throw
+    }
+}
+
+function Test-TunnelSettingsUnchanged {
+    # The running filters and dispatcher were started with these addresses and keep them across a
+    # tunnel-only restart. Any change needs the full restart that hands them the new values.
+    try {
+        $current = Get-ProgramSplitConfiguration -Root $root
+        return $current.TunnelAddress -eq $configuration.TunnelAddress -and $current.TunnelDns -eq $configuration.TunnelDns
+    } catch { return $false }
+}
+
+function Restart-Tunnel([string] $Reason, [switch] $StopFirst) {
+    # Fail closed through a VPN-side outage. The payload filters, NRPT rule and dispatcher stay in place,
+    # so selected applications bind to the absent tunnel address and fail instead of leaving directly.
+    # Attempts share the repair backoff; the outage is logged and its evidence saved once.
+    if ($stopEvent -and $stopEvent.WaitOne(0)) { return }
+    if (-not $script:tunnelOutageLogged) {
+        Write-ControllerLog ("Tunnel-side failure; keeping the filters, NRPT rule and dispatcher in place " +
+            "and restarting only the tunnel: $Reason")
+        Save-HealthFailureEvidence -Reason $Reason
+        $script:tunnelOutageLogged = $true
+    }
+    if ((Get-ControllerElapsed) -lt $script:nextRepair) { return }
+    # The dispatcher keeps the direct inputs it started with. If the uplink changed during the outage,
+    # a hostname endpoint cannot resolve through them, so hand that failure to the full health path.
+    try { Invoke-DispatcherValidation }
+    catch {
+        $script:tunnelOutageLogged = $false
+        Invoke-HealthFailure $_
+        return
+    }
+    try {
+        if ($StopFirst) { Invoke-Component 'Invoke-Tunnel.ps1' 'Stop' }
+        Invoke-Component 'Invoke-Tunnel.ps1' 'Start'
+        Wait-ProgramSplitProbe -Probe { Test-TunnelDns -TimeoutMilliseconds 750 } `
+            -TimeoutMilliseconds 20000 -RetryMilliseconds 250 -StopEvent $stopEvent
+        $script:repairDelaySeconds = 2
+        $script:nextRepair = [TimeSpan]::Zero
+        $script:tunnelOutageLogged = $false
+        Write-ControllerLog 'Tunnel restarted; the per-application components stayed in place.'
+        if (Test-Path -LiteralPath $tunnelRetryFile -PathType Leaf) {
+            [IO.File]::WriteAllText($activeFile, (Get-Date).ToString('o'))
+            Remove-Item -LiteralPath $tunnelRetryFile, $errorFile -Force -ErrorAction SilentlyContinue
+            Write-ControllerLog 'Stack active after the tunnel answered.'
+        }
+    } catch {
+        $script:nextRepair = (Get-ControllerElapsed) + [TimeSpan]::FromSeconds($script:repairDelaySeconds)
+        $script:repairDelaySeconds = [Math]::Min(60, $script:repairDelaySeconds * 2)
+    }
 }
 
 function Invoke-Repair {
+    Invoke-RepairAttempt
+}
+
+function Invoke-RepairAttempt {
+    # A stop requested during a restart must not rebuild the stack the stop handler then tears down.
+    if ($stopEvent -and $stopEvent.WaitOne(0)) { return }
     if ((Get-ControllerElapsed) -lt $script:nextRepair) { return }
     try {
         Get-ProgramSplitPhysicalDefault -AdapterName $configuration.AdapterName | Out-Null
@@ -316,10 +468,96 @@ function Invoke-Repair {
         Start-Stack
         $script:repairDelaySeconds = 2
         $script:nextRepair = [TimeSpan]::Zero
+        $script:tunnelOutageLogged = $false
     } catch {
         $script:nextRepair = (Get-ControllerElapsed) + [TimeSpan]::FromSeconds($script:repairDelaySeconds)
         $script:repairDelaySeconds = [Math]::Min(60, $script:repairDelaySeconds * 2)
     }
+}
+
+function Test-DispatcherIdentitiesCurrent {
+    try {
+        return [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $state 'resolved-identities.tsv'))) -ceq
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $state 'dns-dispatcher-loaded-identities.tsv')))
+    } catch { return $false }
+}
+
+function Repair-Filters([string] $Reason) {
+    # Reinstalling replaces the whole persistent set in one transaction; nothing else needs to stop.
+    Write-ControllerLog "Payload filter verification failed; reinstalling the filters in place: $Reason"
+    try {
+        if (-not (Test-PiaDriverReady)) { Invoke-Component 'Invoke-PiaDriver.ps1' 'Install' }
+        Invoke-Component 'Invoke-WfpFilters.ps1' 'Start'
+        Invoke-Validation 'Invoke-WfpFilters.ps1'
+        if (-not (Test-DispatcherIdentitiesCurrent)) {
+            # The reinstall resolved an identity differently; the dispatcher loads the new record in place.
+            Write-ControllerLog 'Resolved identities changed; the DNS dispatcher is loading them.'
+            Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Start'
+        }
+        Write-ControllerLog 'Payload filters reinstalled; the rest of the stack stayed in place.'
+    } catch {
+        Write-ControllerLog "Stack health check failed; restarting the stack: $($_.Exception.Message)"
+        Save-HealthFailureEvidence -Reason $Reason
+        Stop-Stack
+        Invoke-Repair
+    }
+}
+
+function Invoke-HealthFailure($Failure) {
+    $reason = $Failure.Exception.Message
+    $stage = $Failure.Exception.Data['ProgramSplitStage']
+    if ($stage -eq 'Filters') {
+        $script:physicalHoldLogged = $false
+        Repair-Filters -Reason $reason
+    } elseif ($stage -in @('Tunnel', 'Transport') -and
+        (-not (Test-ProgramSplitPhysicalInputs -AdapterName $configuration.AdapterName `
+            -TunnelDns $configuration.TunnelDns) -or -not (Test-PhysicalResolverAnswers))) {
+        # Hold: keep the filters, NRPT rule, dispatcher and tunnel in place so selected
+        # applications stay fail-closed, and re-validate on the next interval. Validation
+        # still restarts the stack once the uplink returns with different inputs. Only a
+        # failure an uplink outage can cause is held; any other invariant is repaired.
+        if (-not $script:physicalHoldLogged) {
+            Write-ControllerLog ("Physical uplink inputs or the physical resolver are " +
+                "unavailable; holding the stack and retrying: $reason")
+            $script:physicalHoldLogged = $true
+        }
+    } elseif ($stage -eq 'Tunnel' -and (Test-TunnelSettingsUnchanged)) {
+        $script:physicalHoldLogged = $false
+        Restart-Tunnel -Reason $reason -StopFirst
+    } else {
+        $script:physicalHoldLogged = $false
+        Write-ControllerLog "Stack health check failed; restarting the stack: $reason"
+        Save-HealthFailureEvidence -Reason $reason
+        Stop-Stack
+        Invoke-Repair
+    }
+}
+
+# Disable, or a profile import, which stops only the tunnel. The dispatcher then takes the new tunnel
+# address and resolver in place when the stack starts again.
+function Stop-StackForDisable([switch] $Import) {
+    if ($Import) { Stop-Stack -ThrowOnFailure }
+    else { Stop-Stack -RestoreCache -ThrowOnFailure -StopDns -RemoveFilters }
+}
+
+# A restoration is pending while any cache setting differs from its saved original, so one that was only
+# partly done before a controller restart is retried. An unreadable record counts as pending.
+function Test-DnsCacheRestorePending(
+        [string] $RecordPath = (Join-Path $state 'dnscache-policy-original.json'),
+        [string] $KeyPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters') {
+    if (-not (Test-Path -LiteralPath $RecordPath -PathType Leaf)) { return $false }
+    try {
+        $key = Get-Item -LiteralPath $KeyPath
+        # Assigned first: Windows PowerShell passes a parsed JSON array down the pipeline as one object.
+        $saved = Get-Content -LiteralPath $RecordPath -Raw | ConvertFrom-Json
+        foreach ($item in $saved) {
+            $actual = $key.GetValue([string]$item.Name, $null)
+            if ($item.Exists) {
+                if ($null -eq $actual -or [int]$actual -ne [int]$item.Value) { return $true }
+            } elseif ($null -ne $actual) { return $true }
+        }
+        return $false
+    } catch { return $true }
 }
 
 function Test-DnsCachePolicyReady {
@@ -351,45 +589,67 @@ function Start-Stack {
     $dispatcherWasRunning = [bool](Test-ManagedProcess 'dns-dispatcher.pid' `
         (Join-Path $root 'bin\dns-dispatcher.exe'))
     Remove-Item -LiteralPath $stackStoppedFile -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $activeFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $activeFile, $tunnelRetryFile -Force -ErrorAction SilentlyContinue
     try {
         Write-ControllerLog 'Starting stack.'
-        Assert-ProgramSplitNoIpv6DefaultRoute
-        if (Get-ExpectedProcesses 'wfp-probe' (Join-Path $root 'bin\wfp-probe.exe')) {
-            Invoke-Component 'Invoke-WfpFilters.ps1' 'Stop'
-        }
-        if (Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {
-            Test-ProgramSplitNrptRuleOwnership -Rule $_ -DisplayName $configuration.NrptDisplayName
-        }) {
-            Invoke-Component 'Invoke-LocalNrpt.ps1' 'Disable'
-        }
-        if (-not (Test-DnsCachePolicyReady)) { Invoke-Component 'Invoke-DnsCachePolicy.ps1' 'Enable' }
-        else { Write-ControllerLog 'DNS cache policy already ready; skipped repair.' }
-
         $startupComponents = [Collections.Generic.List[object]]::new()
         $startupFailures = [Collections.Generic.List[string]]::new()
         try {
+            # Installing or replacing the persistent filters needs neither the tunnel nor the PIA driver: until
+            # both are up, selected applications fail instead of leaving on the physical route. A reload or a
+            # new tunnel address replaces the previous set in one transaction.
+            Write-ControllerLog 'Installing persistent per-application WFP filters.'
+            $startupComponents.Add((Start-Component 'Invoke-WfpFilters.ps1' 'Start'))
+            # Independent of the filters and the dispatcher, so it runs alongside them.
+            if (-not (Test-DnsCachePolicyReady)) {
+                $startupComponents.Add((Start-Component 'Invoke-DnsCachePolicy.ps1' 'Enable'))
+            } else { Write-ControllerLog 'DNS cache policy already ready; skipped repair.' }
             if (-not (Test-PiaDriverReady)) {
                 $startupComponents.Add((Start-Component 'Invoke-PiaDriver.ps1' 'Install'))
             } else { Write-ControllerLog 'PIA WFP callout driver already running; skipped repair.' }
             $startupComponents.Add((Start-Component 'Invoke-Tunnel.ps1' 'Start'))
-            Write-ControllerLog 'Starting DNS dispatcher.'
-            $startupComponents.Add((Start-Component 'Invoke-DnsDispatcher.ps1' 'Start'))
         } catch { $startupFailures.Add([string]$_) }
+        # The dispatcher attributes by the identity record the filter install writes, so it starts after it.
+        $filterInstall = @($startupComponents | Where-Object { $_.Name -eq 'Invoke-WfpFilters.ps1' })
+        if ($filterInstall) {
+            $null = $startupComponents.Remove($filterInstall[0])
+            try { Complete-Component $filterInstall[0] } catch { $startupFailures.Add([string]$_) }
+        }
+        if (-not $startupFailures.Count) {
+            # A running dispatcher takes the new inputs in place; otherwise the supervisor starts one.
+            try {
+                Write-ControllerLog 'Loading DNS dispatcher inputs.'
+                $startupComponents.Insert(0, (Start-Component 'Invoke-DnsDispatcher.ps1' 'Start'))
+            } catch { $startupFailures.Add([string]$_) }
+        }
         foreach ($component in $startupComponents) {
             try { Complete-Component $component }
             catch { $startupFailures.Add([string]$_) }
         }
         if ($startupFailures.Count) { throw "Parallel startup failed: $($startupFailures -join ' | ')" }
-        Wait-ProgramSplitProbe -Probe { Test-TunnelDns -TimeoutMilliseconds 750 } `
-            -TimeoutMilliseconds 20000 -RetryMilliseconds 250
+        # Verify the filters, including the PIA driver's callout registration, during the tunnel readiness wait.
+        $filterCheck = Start-Component 'Invoke-WfpFilters.ps1' 'Validate'
+        $readinessFailure = $null
+        try {
+            Wait-ProgramSplitProbe -Probe { Test-TunnelDns -TimeoutMilliseconds 750 } `
+                -TimeoutMilliseconds 20000 -RetryMilliseconds 250 -StopEvent $stopEvent
+        } catch { $readinessFailure = $_ }
+        Complete-Component $filterCheck
+        if ($readinessFailure -and $stopEvent -and $stopEvent.WaitOne(0)) { throw $readinessFailure }
+        # The DNS path needs no tunnel: selected names fail until it answers, unlisted ones resolve directly.
         Write-ControllerLog 'Enabling local split-DNS NRPT rule.'
         Invoke-Component 'Invoke-LocalNrpt.ps1' 'Enable'
         if ($dispatcherWasRunning) {
             Invoke-Component 'Invoke-DnsDispatcher.ps1' 'Validate'
         } else { Test-LocalDns }
-        Write-ControllerLog 'Starting per-application WFP filters.'
-        Invoke-Component 'Invoke-WfpFilters.ps1' 'Start'
+        if ($readinessFailure) {
+            # Only the tunnel is missing, as in a reload during a provider outage. Keep the dispatcher, NRPT
+            # rule and filters, so selected applications stay fail-closed, and hand over to the tunnel-only
+            # restart with its backoff instead of tearing the DNS path down.
+            [IO.File]::WriteAllText($tunnelRetryFile, (Get-Date).ToString('o'))
+            $readinessFailure.Exception.Data['ProgramSplitStage'] = 'TunnelRetry'
+            throw $readinessFailure
+        }
         $activeAt = Get-Date
         [IO.File]::WriteAllText($activeFile, $activeAt.ToString('o'))
         Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
@@ -412,6 +672,10 @@ function Start-Stack {
         $message = $_ | Out-String
         [IO.File]::WriteAllText($errorFile, $message)
         Write-ControllerLog $message
+        if ($_.Exception.Data['ProgramSplitStage'] -eq 'TunnelRetry') {
+            Write-ControllerLog 'Tunnel DNS did not answer; the dispatcher, NRPT rule and filters stay for the tunnel-only restart.'
+            throw
+        }
         Stop-Stack
         throw
     }
@@ -449,10 +713,13 @@ $nextRepair = [TimeSpan]::Zero
 $repairDelaySeconds = 2
 $nextCleanup = [TimeSpan]::Zero
 $cleanupDelaySeconds = 2
+# A cache setting found changed at startup may be left from a restoration that failed before a restart.
+$cacheRestorePending = Test-DnsCacheRestorePending
 $stopRequestedAt = $null
 $stopCleanupWindow = [TimeSpan]::FromSeconds(150)
 $networkWaitLogged = $false
 $physicalHoldLogged = $false
+$tunnelOutageLogged = $false
 $resolverHoldLogged = $false
 $networkRetryMilliseconds = 250
 $stopEvent = $null
@@ -471,7 +738,8 @@ try {
             # The service host force-ends this process four minutes after the stop control. Retry
             # incomplete cleanup, but check the window after each attempt, which can itself take most
             # of a minute, so the failure is thrown and logged here instead of arriving as a forced end.
-            try { Stop-Stack -RestoreCache -ThrowOnFailure }
+            # A service stop is an explicit stop: it removes the persistent payload filters too.
+            try { Stop-Stack -RestoreCache -ThrowOnFailure -RemoveFilters -StopDns }
             catch {
                 if ((Get-ControllerElapsed) - $stopRequestedAt -ge $stopCleanupWindow) { throw }
                 Write-ControllerLog 'Service-stop cleanup incomplete; retrying.'
@@ -500,26 +768,37 @@ try {
             }
         }
         if (-not $desired) {
-            if ((Test-StackPresent) -and (Get-ControllerElapsed) -ge $nextCleanup) {
-                try {
-                    Stop-Stack -RestoreCache -ThrowOnFailure
-                    if ($cleanupDelaySeconds -gt 2) {
-                        Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
-                        Write-ControllerLog 'Disable cleanup completed after retry.'
+            # Check the backoff deadline before probing the stack, and probe it once per pass unless a
+            # cleanup attempt has just changed it. A failed cache restoration is retried on its own. A
+            # profile import swapping the tunnel profile stops only the tunnel and restores nothing.
+            $keepFilters = Test-FilterHoldRequested
+            $restorePending = $cacheRestorePending -and -not $keepFilters
+            $stackPresent = $null
+            if ((Get-ControllerElapsed) -ge $nextCleanup) {
+                $stackPresent = Test-StackPresent -Import:$keepFilters
+                if ($stackPresent -or $restorePending) {
+                    $stackPresent = $null
+                    try {
+                        Stop-StackForDisable -Import:$keepFilters
+                        if ($cleanupDelaySeconds -gt 2) {
+                            Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
+                            Write-ControllerLog 'Disable cleanup completed after retry.'
+                        }
+                        $cleanupDelaySeconds = 2
+                    } catch {
+                        # Keep supervising: exiting here only makes SCM restart the controller into the
+                        # same failure. Record it for the tray and retry with bounded backoff. Recording
+                        # is best effort so a log or state write error cannot end supervision either.
+                        $cleanupFailure = $_ | Out-String
+                        try { [IO.File]::WriteAllText($errorFile, $cleanupFailure) } catch { }
+                        try { Write-ControllerLog "Disable cleanup incomplete; retrying in $cleanupDelaySeconds s." } catch { }
+                        $nextCleanup = (Get-ControllerElapsed) + [TimeSpan]::FromSeconds($cleanupDelaySeconds)
+                        $cleanupDelaySeconds = [Math]::Min(60, $cleanupDelaySeconds * 2)
                     }
-                    $cleanupDelaySeconds = 2
-                } catch {
-                    # Keep supervising: exiting here only makes SCM restart the controller into the
-                    # same failure. Record it for the tray and retry with bounded backoff. Recording
-                    # is best effort so a log or state write error cannot end supervision either.
-                    $cleanupFailure = $_ | Out-String
-                    try { [IO.File]::WriteAllText($errorFile, $cleanupFailure) } catch { }
-                    try { Write-ControllerLog "Disable cleanup incomplete; retrying in $cleanupDelaySeconds s." } catch { }
-                    $nextCleanup = (Get-ControllerElapsed) + [TimeSpan]::FromSeconds($cleanupDelaySeconds)
-                    $cleanupDelaySeconds = [Math]::Min(60, $cleanupDelaySeconds * 2)
                 }
             }
-            if (-not (Test-StackPresent)) {
+            if ($null -eq $stackPresent) { $stackPresent = Test-StackPresent -Import:$keepFilters }
+            if (-not $stackPresent -and -not ($cacheRestorePending -and -not $keepFilters)) {
                 if (-not (Test-Path -LiteralPath $stackStoppedFile -PathType Leaf)) {
                     try { [IO.File]::WriteAllText($stackStoppedFile, (Get-Date -Format o)) }
                     catch { Write-ControllerLog $_.Exception.Message }
@@ -529,37 +808,25 @@ try {
             }
         } elseif (Test-Path -LiteralPath $reloadFile) {
             Remove-Item -LiteralPath $reloadFile -Force -ErrorAction SilentlyContinue
-            Stop-Stack
+            Stop-Stack -KeepTunnel
             Invoke-Repair
             $lastHealth = Get-ControllerElapsed
-        } elseif (-not (Test-StackActive)) {
-            # Adopt an existing owned tunnel; a stopped tunnel gets adapter preflight before start.
-            Invoke-Repair
+        } elseif (($stackState = Get-StackState) -ne 'Active') {
+            # Adopt an existing owned tunnel; a stopped tunnel gets adapter preflight before start. A tunnel
+            # host that stopped under intact components is started alone, so the filters stay in place.
+            if ($stackState -eq 'TunnelDown' -and (Test-TunnelSettingsUnchanged)) {
+                if (Test-Path -LiteralPath $tunnelRetryFile -PathType Leaf) {
+                    Restart-Tunnel -Reason 'Tunnel DNS did not answer when the stack started.' -StopFirst
+                } else { Restart-Tunnel -Reason 'The tunnel service is not running.' }
+            } else { Invoke-Repair }
             $lastHealth = Get-ControllerElapsed
         } elseif ((Get-ControllerElapsed) - $lastHealth -gt [TimeSpan]::FromSeconds(30)) {
             try {
                 try { Test-StackHealth }
                 catch { Start-Sleep -Milliseconds 250; Test-StackHealth }
                 $script:physicalHoldLogged = $false
-            } catch {
-                if (-not (Test-ProgramSplitPhysicalInputs -AdapterName $configuration.AdapterName `
-                        -TunnelDns $configuration.TunnelDns) -or -not (Test-PhysicalResolverAnswers)) {
-                    # Hold: keep the filters, NRPT rule, dispatcher and tunnel in place so selected
-                    # applications stay fail-closed, and re-validate on the next interval. Validation
-                    # still restarts the stack once the uplink returns with different inputs.
-                    if (-not $script:physicalHoldLogged) {
-                        Write-ControllerLog ("Physical uplink inputs or the physical resolver are " +
-                            "unavailable; holding the stack and retrying: $($_.Exception.Message)")
-                        $script:physicalHoldLogged = $true
-                    }
-                } else {
-                    $script:physicalHoldLogged = $false
-                    Write-ControllerLog "Stack health check failed; restarting the stack: $($_.Exception.Message)"
-                    Save-HealthFailureEvidence -Reason $_.Exception.Message
-                    Stop-Stack
-                    Invoke-Repair
-                }
-            }
+                $script:tunnelOutageLogged = $false
+            } catch { Invoke-HealthFailure $_ }
             $lastHealth = Get-ControllerElapsed
         }
         if ($desired -and (Get-ControllerElapsed) -ge $nextAdapterMaintenance -and (Test-StackActive)) {

@@ -15,6 +15,6 @@ mkdir -p "$output"
 "$compiler" "${common[@]}" -municode "$repo_root/src/native/tunnel-host.cpp" \
   -o "$output/tunnel-host.exe"
 "$compiler" "${common[@]}" -municode "$repo_root/src/native/controller-service.cpp" \
-  -o "$output/controller-service.exe"
+  -o "$output/controller-service.exe" -lws2_32
 "$compiler" "${common[@]}" -municode "$repo_root/src/native/wfp-probe.cpp" \
   -o "$output/wfp-probe.exe" -lfwpuclnt -lrpcrt4 -lole32 -lws2_32

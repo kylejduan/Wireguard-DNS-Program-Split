@@ -76,24 +76,24 @@ Use two different browser executables with browser Secure DNS disabled:
 4. Confirm DNS logs contain `TUNNEL` for selected queries and `DIRECT` for unlisted queries.
 5. Confirm unlisted high-throughput traffic remains near its normal no-VPN baseline.
 
-Also verify the host has no usable IPv6 default route. IPv6 is not redirected in this release:
+Selected applications' IPv6 is blocked, not tunneled. On a host with IPv6, confirm an IPv6 test site reports no IPv6 connectivity for the selected browser and normal IPv6 for the unlisted one, then check the persistent filters from elevated PowerShell:
 
 ```powershell
-Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue
+& 'C:\Program Files\WireGuardProgramSplit\src\Invoke-WfpFilters.ps1' -Action Validate
 ```
 
 ## Move an existing ProgramData installation
 
-From an elevated 64-bit Windows PowerShell session in the updated repository:
+From an elevated 64-bit Windows PowerShell session in a built checkout of the release that is installed:
 
 ```powershell
 ./Migrate-Installation.ps1 -PlanOnly
 ./Migrate-Installation.ps1
 ```
 
-The migration moves the existing protected tree to `%ProgramFiles%\WireGuardProgramSplit`, updates both service commands and the tray task, and installs the three scripts needed for paths with spaces. Configuration, profiles, included applications, logs, binaries, and permissions are preserved. Mutable state remains inside the protected installation tree. Both roots must be on the same volume; the destination must not exist. The installation must be enabled and running with an Automatic controller and Manual tunnel.
+The migration moves the existing protected tree to `%ProgramFiles%\WireGuardProgramSplit`, updates both service commands and the tray task, and installs the three scripts needed for paths with spaces. Every other installed script and project binary must already match this checkout and its `build` output; otherwise the migration changes nothing and lists the differing files, and the supported path is to uninstall and reinstall. Configuration, profiles, included applications, logs, binaries, and permissions are preserved. Mutable state remains inside the protected installation tree. Both roots must be on the same volume; the destination must not exist. The installation must be enabled and running with an Automatic controller and Manual tunnel.
 
-This briefly stops the split tunnel and DNS dispatcher; pause sensitive included-app traffic during the move. The migration validates startup and restores the old location and service commands if activation fails. Original scripts remain under `state\migration-backup-<id>` for inspection. It does not uninstall or reinstall shared drivers.
+This briefly stops the split tunnel and DNS dispatcher and removes the payload filters, as any controller service stop does; pause sensitive included-app traffic during the move. The migration validates startup and restores the old location and service commands if activation fails. Original scripts remain under `state\migration-backup-<id>` for inspection. It does not uninstall or reinstall shared drivers.
 
 For a legacy installation that has not been moved, pass `-DestinationRoot "$env:ProgramData\WireGuardProgramSplit"` to `Uninstall.ps1`. Custom installation paths also require an explicit `-DestinationRoot`.
 
@@ -105,4 +105,4 @@ Run elevated:
 ./Uninstall.ps1
 ```
 
-The uninstaller disables controller recovery, requests ordered stack cleanup, and removes the controller and tunnel services, tray task, dynamic filters, dispatcher, owned NRPT rule, deployed files, and restored DNS/browser policies. It intentionally leaves the signed PIA driver installed because another application may share it.
+The uninstaller disables controller recovery, requests ordered stack cleanup, and removes the controller and tunnel services, tray task, persistent WFP filters, dispatcher, owned NRPT rule, deployed files, and restored DNS/browser policies. If the filters may remain, it stops before deleting the installation so `bin\wfp-probe.exe remove` stays available. It intentionally leaves the signed PIA driver installed because another application may share it.

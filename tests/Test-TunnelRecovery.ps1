@@ -117,4 +117,39 @@ $stuckHost = & $resetHarness -Call Wait -Statuses @('StartPending') -ProcessPath
 Assert-True (@($stuckHost.Killed).Count -eq 1 -and $stuckHost.Failure -like '*was reset so the next attempt starts clean*') `
     'a tunnel host pending far longer than any normal start is reset'
 
+# Stop must stay available after the startup inputs become unusable, or a running tunnel can never be
+# released. Run the real script against a root with settings but no runtime DLLs or profile. Unelevated it
+# stops at the administrator check; elevated, the ownership check refuses any installed same-name service.
+$fixture = Join-Path ([IO.Path]::GetTempPath()) ("wgps-tunnel-stop-{0}" -f [guid]::NewGuid())
+try {
+    $fixtureSource = Join-Path $fixture 'src'
+    [IO.Directory]::CreateDirectory($fixtureSource) | Out-Null
+    [IO.Directory]::CreateDirectory((Join-Path $fixture 'config')) | Out-Null
+    foreach ($name in 'Invoke-Tunnel.ps1', 'Common.ps1') {
+        Copy-Item -LiteralPath (Join-Path $RepositoryRoot "src\powershell\$name") -Destination $fixtureSource
+    }
+    [IO.File]::WriteAllText((Join-Path $fixture 'config\settings.json'),
+        '{"TunnelAddress":"192.0.2.2","TunnelDns":"203.0.113.53"}')
+    function Invoke-TunnelFixture([string] $Action) {
+        $stdout = Join-Path $fixture "$Action-output.log"
+        $stderr = Join-Path $fixture "$Action-error.log"
+        $process = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f (Join-Path $fixtureSource 'Invoke-Tunnel.ps1')),
+            '-Action', $Action
+        ) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
+        $null = $process.Handle
+        Assert-True ($process.WaitForExit(60000)) "tunnel $Action fixture completes"
+        $process.WaitForExit()
+        @(Get-Content -LiteralPath $stdout, $stderr -ErrorAction SilentlyContinue) -join ' '
+    }
+    $stopResult = Invoke-TunnelFixture 'Stop'
+    Assert-True ($stopResult -notmatch 'Missing required file' -and
+        $stopResult -match 'Administrator rights are required|Refusing to stop a same-name foreign tunnel service|Tunnel stopped') `
+        'tunnel stop is dispatched without the startup inputs and keeps its ownership check'
+    $startResult = Invoke-TunnelFixture 'Start'
+    Assert-True ($startResult -match 'Missing required file') 'tunnel start still requires the runtime DLLs and profile'
+} finally {
+    Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Output 'PASS: tunnel service recovery refuses foreign and young hosts and resets stuck ones.'

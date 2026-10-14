@@ -49,14 +49,71 @@ connects; a stream that predates the guard, or whose label a rename, bind or
 guard configuration change invalidated, is labelled again on its next use from
 its own or its peer's bind address, so a generation change costs one resolution
 per socket rather than one per message, and an included process keeps its
-unrelated streams. Ordinary IP sends and ordinary file operations do not repeat the
+unrelated streams. A stream's role and generation are published and read as one
+64-bit word, so concurrent relabels of a socket cannot combine a SAFE role with
+a newer generation. A SAFE label stamped with a generation is stored only by a relabel that read
+that generation before resolving both ends, and only once the stream's peer is
+published; an unconnected socket is decided per call, so a send racing a
+connect cannot replace the label `guard_connect` stored. Every operation that
+can make an end's identity protected advances the generation after its effect
+is visible: tracing programs on `unix_bind` (a pathname or enrolled abstract
+address) and `vfs_rename` (a socket, a rename into a slot, or a directory inside
+`/run`, `/run/systemd` or `/run/user`, whose names the built-in rules read), and
+`inode_post_setattr` for an owner change below `/run/user`, all run before the
+system call returns. A stream connected to `/run/nscd-stage/socket` is thus
+protected once that directory becomes `/run/nscd`. A rename into a slot holds
+the destination role for the inode, in a map entry that the rename's
+completion removes for every participant of an exchange, so a failed one leaves
+nothing protected; an object leaving a slot keeps its role. No
+provisional decision is cached. The loader attaches these invalidating programs
+before any program that caches a label or a "no role" answer and removes them
+last, so an interrupted load never leaves a cache without its invalidation.
+A completion program only sees calls that enter after it attaches, so a new
+guard caches nothing and holds no role until it is settled. The loader walks
+every task's kernel stack with a BPF task iterator: each task present at its
+first scan must have exited or shown one proven walk with no frame inside
+`unix_bind` or `vfs_rename`: the task was off CPU at reads before and after
+the walk and its context-switch count did not change (so it did not run in
+between), the trace is nonempty and shorter than the buffer and
+`kernel.perf_event_max_stack`, and its outermost frame is a real stack bottom
+(the entry text, or the fork return path that ends every kernel thread's
+stack), so an unwind that stopped early does not count. Only then does it set a settled bit in the guard configuration,
+which also invalidates every stamp. Until then each call is decided afresh,
+which is correct but slower. Rescans cover only the pending threads (the
+iterator's thread filter, first proved on a helper thread; otherwise every task
+again), and a thread missing from its rescan, or replaced under the same ID,
+has exited. The whole drain shares one three-second monotonic deadline across
+scans and waits, checked between bounded iterator reads, so a slow scan or a
+task that stays unproved (a call blocked there, a task that never leaves its
+CPU, a very low depth limit) cannot hold the load near the controller's
+30-second command timeout: the load publishes the guard unsettled, and each
+health check retries (`bpf-loader drain`).
+`tests/linux/test_label_model.py` checks this exhaustively over bounded
+interleavings, including interrupted-load prefixes, and reproduces each earlier
+design's failure. Each such bind or rename adds tens of nanoseconds; message
+sends are unchanged.
+
+| Operation that changes what a stream end resolves to | Handling |
+|---|---|
+| `bind` to a pathname or enrolled abstract name | Generation advanced after the address is visible |
+| `connect` (stream, seqpacket) and `accept` | Labelled from the real peer before publication; SAFE cached only with a published peer; a child is unreachable until accepted |
+| `socketpair` | Labelled after both ends exist |
+| `rename` or exchange of the socket, or of a parent directory in `/run`, `/run/systemd`, `/run/user` | Destination role held during the rename and released for both participants; generation advanced afterwards, on failure too |
+| Owner change of a `/run/user` directory | Generation advanced afterwards |
+| `unlink` of a bound name, peer close, `shutdown` | Identity unchanged: a bound socket keeps its dentry and name, a stream never changes peer |
+| Descriptor passing, `setns` or `unshare` | Identity belongs to the socket and its network namespace, not the process |
+| Guard-slot enrollment | Configuration epoch advanced before and after |
+| Hard link of a socket into a slot | Not covered: the socket resolves through the name it was bound with; slot directories are root-owned |
+| A mount over a socket's name or directory | Not covered: a bound socket keeps its own dentry; only root can mount |
+
+Ordinary IP sends and ordinary file operations do not repeat the
 guard's executable-path lookup. A regular file proved to have no resolver role is
 remembered in a bounded 65,536-entry cache keyed by inode identity, so later opens
 and reads of it skip pathname matching. The cache holds only single-link files
 whose names no built-in rule inspects, is stamped with the guard configuration
-epoch, and is consulted after the positive labels a rename into a protected slot
-sets, so a cached answer is exact; a second link or an enrollment change forces a
-recheck. The controller checks health every five seconds;
+epoch plus the role generation, and is consulted after the role a rename into a
+slot holds, so a cached answer is exact; a second link, an enrollment change or
+such a rename forces a recheck. The controller checks health every five seconds;
 successful health checks do not briefly block new sockets. A failed check (an
 ownership mismatch, a lost handshake, or a DNS probe that fails three attempts)
 blocks new included sockets until the next passing check, at least five seconds
@@ -201,6 +258,14 @@ explicit disable/uninstall followed by installation; retained configuration must
 match the supplied input. For an update to a new policy ABI (ABI 3 to ABI 4 adds
 the negative-role cache map), use the installed old CLI to disable/uninstall before
 replacing artifacts; each ABI deliberately refuses old pins. Stop affected application trees during that explicit maintenance boundary.
+Within ABI 4, a loader built with 1,024-entry `guard_slots` and `endpoint_names`
+maps also manages a running guard loaded with the earlier 128-entry maps. Its
+programs and capacity stay in force until the next guard load, at the next boot
+or an explicit disable and activation; that guard refuses guard-slot additions
+beyond 128 entries. The loader likewise manages such a guard's twelve links,
+which lack the three invalidating links and the held-role map; it recognizes
+that generation by its 128-entry maps, never by missing pins, and requires every
+pin otherwise.
 
 ## Operate
 
@@ -247,7 +312,19 @@ firewall and terminal fallback routing. Tunnel/underlay failure does not authori
 direct fallback. Checks can repair a missing owned preferred route or deleted
 WireGuard interface while their exact firewall/fallback/rule/zone anchors remain
 intact. Foreign replacements, missing safety anchors and ambiguous interrupted
-acquisitions remain blocked/degraded for inspection.
+acquisitions remain blocked/degraded for inspection. Activation journals that
+network acquisition started only after the empty receipt is durable and before
+the first change, so a controller killed earlier retries on the next activation
+instead of reporting a missing receipt. Only an initial acquisition, one whose
+receipt never recorded every required resource and under which no socket was
+ever marked, is rolled back that way; a repair that was interrupted keeps the
+firewall, policy rule and fallback route, removes its own temporary
+configuration and is retried. A controller killed during acquisition
+leaves a receipt that names what it acquired: the next activation (also from the
+health loop) keeps the guard blocked, removes exactly those resources the way
+disable does, and prepares again. A changed recorded resource, or a reserved
+interface, table, route or rule that is live but unrecorded, still stops for
+inspection.
 
 The early unit orders guard loading before ordinary system startup. **Ordering
 does not make a failed guard load stop host boot.** Active supported hooks are a
@@ -266,9 +343,21 @@ Explicit disable stops/disables verified owned services and releases owned
 networking before removing BPF pins. It also completes after a foreign ruleset
 flush removed the whole owned nftables table, flushing the owned conntrack zone
 by number, and removes a private configuration directory orphaned by an
-interrupted preparation. A guard load interrupted midway leaves a staging
-directory named after the pin directory with a `_new` suffix; its links keep
-protecting, and the next load replaces it. Removal preserves private profile/settings.
+interrupted preparation. A disable interrupted while removing pins resumes:
+each pin that remains must carry the identity journaled when the guard was
+adopted (a map of that ID and name, or a link of that ID running the recorded
+program), and only those are removed. A guard load interrupted midway leaves a staging
+directory named after the pin directory with a `_new` (or `_next`) suffix. The
+next load verifies that it holds only this loader's maps and links on the same
+cgroup, sets it to the blocked configuration, and keeps its links attached until
+the replacement is attached and published; only then is it removed. A failed
+load leaves it attached for the next attempt. Unknown entries, a link set that
+is not a prefix of the pin order, or two interrupted loads whose policies
+differ are refused. Before publishing, the loader also writes the exact map and
+link identities to `guard-birth.json` in the controller's state directory; if
+it is killed after publishing, the next activation, guard or disable adopts the
+published directory only when its identities match that record, then detaches
+any interrupted generation beside it. Removal preserves private profile/settings.
 If an installed artifact was changed or replaced, uninstall defers artifact
 deletion and retains a runnable command for a later retry. It reports the retained
 paths; it does not overwrite or delete the replacement. Unproved runtime ownership
@@ -332,4 +421,7 @@ Fixed native commands have a 32 MiB stdout limit and 1 MiB stderr limit enforced
 while reading; excessive or incomplete output fails the operation instead of
 becoming a partial inventory. Timeout and overflow kill/reap the owned command.
 Network commands keep their 15-second timeout and native operations 30 seconds.
+The conntrack flow table is the exception to the stdout limit: allocation reads
+one listing streamed under the same 15-second deadline, keeping only the set of
+zone numbers and one partial line (at most 64 KiB) while discarding flow details.
 See the [follow-up measurements and tradeoffs](performance.md#october-11-2026-broader-audit-and-implementation).

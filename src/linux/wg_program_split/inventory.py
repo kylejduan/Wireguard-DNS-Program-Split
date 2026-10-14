@@ -11,7 +11,7 @@ import shutil
 import subprocess
 
 from .errors import NetworkError
-from .command import capture
+from .command import capture, stream
 
 
 _TOOL_PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
@@ -23,6 +23,14 @@ def run_command(argv, *, input=None):
     """Run fixed argv with a trusted executable search path, no shell, no logs."""
     if not argv or argv[0] not in {'ip', 'wg', 'nft', 'conntrack', 'sysctl', *_IPTABLES_DUMPS}:
         raise NetworkError('unsupported network command')
+    if (len(argv) == 3 and tuple(argv[:2]) == ('sysctl', '-n') and
+            re.fullmatch(r'[a-z0-9_]+(?:\.[a-z0-9_]+)+', argv[2])):
+        # A readback is the procfs file sysctl would print; no process is needed.
+        try:
+            with open('/proc/sys/' + argv[2].replace('.', '/'), 'rb') as file:
+                return file.read(4096).decode('utf-8')
+        except (OSError, UnicodeError):
+            raise NetworkError('network command failed, timed out or exceeded output limits; inspect effective state') from None
     try:
         return capture(tuple(argv), input=input.encode('utf-8') if input is not None else None, timeout=15)
     except (OSError, UnicodeError, subprocess.SubprocessError):
@@ -328,3 +336,57 @@ def _legacy_zones(text):
         except (ValueError, IndexError):
             raise NetworkError('unsupported legacy conntrack zone state') from None
     return zones
+
+
+_CONNTRACK_LIST = ('conntrack', '-L', '-o', 'extended')
+_ZONE_TOKEN = re.compile(rb'zone(?:-orig|-reply)?=([0-9]{1,5})')
+
+
+class _ZoneScan:
+    """Incremental flow-table parser: keeps only the bounded set of zone numbers
+    (at most 65,535) and one partial line, discarding flow details as they stream."""
+    LINE_MAXIMUM = 64 * 1024
+
+    def __init__(self):
+        self.zones, self.partial = set(), b''
+
+    def feed(self, chunk):
+        lines = (self.partial + chunk).split(b'\n')
+        self.partial = lines.pop()
+        if len(self.partial) > self.LINE_MAXIMUM:
+            raise NetworkError('conntrack flow line exceeds its limit')
+        for line in lines:
+            self._line(line)
+
+    def finish(self):
+        self._line(self.partial)
+        self.partial = b''
+        return self.zones
+
+    def _line(self, line):
+        for token in line.split():
+            if b'zone' in token:
+                match = _ZONE_TOKEN.fullmatch(token)
+                if not match:
+                    raise NetworkError('unparseable conntrack zone inventory')
+                number = int(match[1])
+                if number > 65535:
+                    raise NetworkError('invalid conntrack zone inventory')
+                self.zones.add(number)
+
+
+def conntrack_zones(runner, *, timeout=15):
+    """Zones referenced by any live flow, from one listing under one deadline.
+
+    The production runner streams the listing; a busy flow table is never held
+    whole in memory. Substitute runners return the same listing as text.
+    """
+    scan = _ZoneScan()
+    if runner is run_command:
+        try:
+            stream(_CONNTRACK_LIST, scan.feed, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            raise NetworkError('network command failed, timed out or exceeded output limits; inspect effective state') from None
+    else:
+        scan.feed(_call(runner, *_CONNTRACK_LIST).encode('utf-8', 'surrogateescape'))
+    return scan.finish()

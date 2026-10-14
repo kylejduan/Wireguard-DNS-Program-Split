@@ -11,16 +11,19 @@ if ($Serve) {
     $inputReader = [IO.StreamReader]::new([Console]::OpenStandardInput(), [Text.UTF8Encoding]::new($false, $true), $true)
     [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
     while ($null -ne ($request = $inputReader.ReadLine())) {
-        if ($request -notin @('Invoke-LocalNrpt.ps1', 'Invoke-DnsDispatcher.ps1')) { exit 2 }
+        if ($request -notin @('Invoke-LocalNrpt.ps1', 'Invoke-DnsDispatcher.ps1', 'Invoke-WfpFilters.ps1')) { exit 2 }
         try {
             # Invocation (not dot sourcing) gives each request a fresh script scope.
             # The scripts reload configuration and observe live state on every call.
             $LASTEXITCODE = 0
             $output = @(& (Join-Path $PSScriptRoot $request) -Action Validate *>&1)
             if ($LASTEXITCODE -ne 0) { throw "Validation exited with code $LASTEXITCODE." }
-            $message = $output -join ' '
-            if ($message.Length -gt 16384) { throw 'Validation output exceeded its limit.' }
-            $reply = @{ Ok = $true; Message = $message }
+            # Warnings travel separately so the supervisor can report a standing condition once.
+            $message = @($output | Where-Object { $_ -isnot [Management.Automation.WarningRecord] }) -join ' '
+            $warning = @($output | Where-Object { $_ -is [Management.Automation.WarningRecord] } |
+                ForEach-Object { $_.Message }) -join ' '
+            if ($message.Length -gt 16384 -or $warning.Length -gt 16384) { throw 'Validation output exceeded its limit.' }
+            $reply = @{ Ok = $true; Message = $message; Warning = $warning }
         } catch {
             $message = [string]$_.Exception.Message
             if ($message.Length -gt 16384) { $message = $message.Substring(0, 16384) }
@@ -86,7 +89,7 @@ namespace ProgramSplit {
             } catch { Dispose(); throw; }
         }
         public string Validate(string name, int timeoutMilliseconds) {
-            if (name != "Invoke-LocalNrpt.ps1" && name != "Invoke-DnsDispatcher.ps1")
+            if (name != "Invoke-LocalNrpt.ps1" && name != "Invoke-DnsDispatcher.ps1" && name != "Invoke-WfpFilters.ps1")
                 throw new ArgumentException("Unsupported validation.");
             try {
                 // StreamWriter may emit a BOM when the supervisor console is
@@ -122,6 +125,7 @@ namespace ProgramSplit {
 '@
 }
 $script:validationWorker = $null
+$script:validationWarnings = @{}
 
 function Stop-ValidationWorker {
     if ($script:validationWorker) {
@@ -139,6 +143,12 @@ function Invoke-Validation([string] $Name) {
         $reply = $script:validationWorker.Validate($Name, 45000) | ConvertFrom-Json
         if ($reply.Ok -isnot [bool] -or -not $reply.Ok) { throw "$Name Validate failed: $($reply.Message)" }
         Write-ControllerLog ([string]$reply.Message)
+        # Log a warning when it first appears or changes, not on every 30-second check.
+        $warning = if ($reply.PSObject.Properties['Warning']) { [string]$reply.Warning } else { '' }
+        if ($warning -ne [string]$script:validationWarnings[$Name]) {
+            $script:validationWarnings[$Name] = $warning
+            if ($warning) { Write-ControllerLog "WARNING: $warning" }
+        }
         Write-ControllerLog "$Name Validate completed in $($timer.ElapsedMilliseconds) ms."
     } catch {
         Stop-ValidationWorker

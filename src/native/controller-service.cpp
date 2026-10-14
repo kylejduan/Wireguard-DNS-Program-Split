@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #define _WIN32_WINNT 0x0A00
+#include <winsock2.h>
 #include <windows.h>
 
 #include <cstdlib>
@@ -9,7 +10,9 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <thread>
 #include "log-pipe.h"
+#include "parse-number.h"
 #include "log-self-test.h"
 
 namespace {
@@ -126,6 +129,8 @@ std::wstring powerShellPath() {
     return (std::filesystem::path(directory.data()) / L"WindowsPowerShell" / L"v1.0" /
             L"powershell.exe").wstring();
 }
+
+#include "dispatcher-supervisor.h"
 
 bool launchController(HANDLE job, HANDLE& child, HANDLE log) {
     const std::filesystem::path script(gControllerScript);
@@ -256,6 +261,22 @@ void WINAPI serviceMain(DWORD, wchar_t**) {
     }
 
     reportStatus(SERVICE_RUNNING);
+    // Dispatcher supervision runs beside the controller and never waits on it.
+    HANDLE supervisorStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::thread supervisor;
+    if (supervisorStop) {
+        const auto root = std::filesystem::path(gControllerScript).parent_path().parent_path();
+        supervisor = std::thread([root, supervisorStop] { superviseDispatcher(root, supervisorStop); });
+    }
+    struct SupervisorStop {
+        HANDLE event;
+        std::thread& thread;
+        ~SupervisorStop() {
+            if (event) SetEvent(event);
+            if (thread.joinable()) thread.join();
+            if (event) CloseHandle(event);
+        }
+    } supervisorStopper{supervisorStop, supervisor};
     HANDLE waits[] = {gStopEvent, child, gShutdownEvent};
     const DWORD result = WaitForMultipleObjects(3, waits, FALSE, INFINITE);
     if (result == WAIT_OBJECT_0 + 2) {
@@ -337,6 +358,11 @@ int selfTest() {
     if (describeStop(StopPath::ServiceStopForced, 0).find(L"forced") == std::wstring::npos) return 14;
     if (describeStop(StopPath::ServiceStop, 0).find(L"clean") == std::wstring::npos) return 15;
     if (!wgps::logSelfTest()) return 16;
+    if (statusProcessId("pid=1234\r\ngeneration=2\r\n") != 1234 || statusProcessId("generation=2") != 0 ||
+        statusProcessId("pid=") != 0 || statusProcessId("pid=99999999999") != 0 ||
+        statusProcessId("pid=4294967295\n") != 4294967295UL || statusProcessId("pid=4294967296") != 0 ||
+        statusProcessId("pid=99999999999999999999999999") != 0 || statusProcessId("pid=12x") != 0 ||
+        statusProcessId("pid=-1") != 0 || statusProcessId("pid= 12") != 0) return 17;
     std::wcout << L"PASS: bounded logs and controller service command-line setup and exit reporting.\n";
     return 0;
 }
@@ -345,6 +371,13 @@ int selfTest() {
 
 int wmain(int argc, wchar_t** argv) {
     if (argc == 2 && std::wcscmp(argv[1], L"--self-test") == 0) return selfTest();
+    // The supervisor alone, for tests against an installation-shaped directory; ends when the process does.
+    if (argc == 3 && std::wcscmp(argv[1], L"--supervise-dispatcher") == 0) {
+        HANDLE never = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        gHostLog = std::make_unique<wgps::BoundedLog>(std::filesystem::path(argv[2]) / L"logs" / L"controller-service.log");
+        superviseDispatcher(std::filesystem::path(argv[2]), never);
+        return 0;
+    }
     if (argc != 3 || std::wcscmp(argv[1], L"/service") != 0) {
         std::wcerr << L"Usage: controller-service.exe /service <Controller.ps1>\n";
         return 2;

@@ -10,8 +10,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import select
 import signal
-import threading
 import time
 import uuid
 
@@ -25,6 +25,8 @@ from .preflight import (ControllerError, NativeGuard, check_host, process_snapsh
 
 _JOURNAL_MAX_BYTES = 80 * 1024 * 1024
 _RESTART_DETAIL_BYTES = 8 * 1024 * 1024
+_PERIODIC_AUDIT_SECONDS = 60
+_BIRTH = 'guard-birth.json'
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,7 @@ class Controller:
         self.select_allocation = select_allocation or (lambda profile: allocate(inspect(profile, require_underlay=False)))
         self.probe = probe or (lambda profile, allocation: readiness_probe(profile, allocation, self.kernel))
         self.processes = processes
+        self._audited_at = None
 
     @contextmanager
     def _locked(self, *, create=True):
@@ -182,10 +185,46 @@ class Controller:
         return self.network_factory(profile, state, owner_uid=self.owner_uid,
                                     allocation=Allocation(**journal['allocation']), receipt=receipt)
 
+    def _forget_birth(self, state):
+        if _present(state, _BIRTH):
+            os.unlink(_BIRTH, dir_fd=state)
+            os.fsync(state)
+
+    def _claim_birth(self, state, journal, identity):
+        """Journal the published guard this lifetime's load created.
+
+        The loader durably records the exact map and link identities before it
+        publishes, so a load killed after publication is completed here rather
+        than refused; pins without a matching record are never adopted.
+        """
+        birth = None
+        if _present(state, _BIRTH):
+            raw, _ = read_private(state, _BIRTH, 65536)
+            try:
+                birth = json.loads(raw)
+            except (ValueError, RecursionError):
+                pass
+        observed = self.kernel.snapshot()
+        if not isinstance(birth, dict) or set(birth) != {'maps', 'links'} or not _same(observed['pins'], birth):
+            raise ControllerError('guard birth was not journaled; existing pins cannot be adopted')
+        if (observed['state'] != 'blocked' or observed['mask'] != journal['allocation']['mask'] or
+                observed['mark'] != journal['allocation']['mark'] or
+                sorted(observed['paths']) != sorted(journal['policy'])):
+            raise ControllerError('new guard did not satisfy blocked policy readback')
+        # A load killed after publishing can leave an interrupted generation
+        # attached beside it; the published one protects, so detach it.
+        self.kernel.settle()
+        journal['pins'] = observed['pins']
+        self._audit(journal, journal['policy'])
+        identity = self._save(state, journal, identity)
+        self._forget_birth(state)
+        return identity
+
     def _audit(self, journal, paths=()):
         if not paths and not journal['restart_required']:
             return  # No enrollment or retained lineage to inspect; sticky flag stays intact.
         observed = restart_audit(paths, self.processes(), journal['restart_required'])
+        self._audited_at = time.monotonic()
         if observed:
             journal['restart_boundary_unresolved'] = True
         # Diagnostic truncation never clears the boot-lifetime uncertainty flag.
@@ -252,17 +291,11 @@ class Controller:
         if journal['pending'] is None and sorted(policy) != sorted(journal['policy']):
             raise ControllerError('settings differ from the committed generation; use include commands')
         if journal['pins'] is None:
-            if self.kernel.exists():
-                raise ControllerError('guard birth was not journaled; existing pins cannot be adopted')
-            self.kernel.load(journal['policy'], Allocation(**journal['allocation']))
-            observed = self.kernel.snapshot()
-            if (observed['state'] != 'blocked' or observed['mask'] != journal['allocation']['mask'] or
-                    observed['mark'] != journal['allocation']['mark'] or
-                    sorted(observed['paths']) != sorted(journal['policy'])):
-                raise ControllerError('new guard did not satisfy blocked policy readback')
-            journal['pins'] = observed['pins']
-            self._audit(journal, journal['policy'])
-            identity = self._save(state, journal, identity)
+            if not self.kernel.exists():
+                self._forget_birth(state)
+                self.kernel.load(journal['policy'], Allocation(**journal['allocation']),
+                                 record=self.paths.state / _BIRTH)
+            identity = self._claim_birth(state, journal, identity)
         if journal['pending'] is not None:
             identity = self._recover_edit(state, config, journal, identity, policy, settings_identity)
         self._block(journal)
@@ -287,14 +320,23 @@ class Controller:
         except (OSError, ValueError, RuntimeError):
             raise ControllerError('guard activation failed; existing protection was retained') from None
 
-    def _ready(self, state, profile, journal, identity):
+    def _ready(self, state, profile, journal, identity, *, periodic=False):
         observed = self._observed(journal)
+        if observed.get('settled') is False:
+            # Unsettled guards decide every call afresh (correct, slower); retry
+            # the proof that lets them cache again. Failing it changes nothing.
+            try:
+                self.kernel.drain()
+            except (OSError, ValueError, RuntimeError):
+                pass
         was_ready = observed['state'] == 'ready' and journal['state'] == 'ready'
         if not was_ready:
             self._block(journal)
         network = self._network(state, profile, journal)
         health = network.health()
-        if health.missing and not health.changed:
+        if not health.ready and not health.changed:
+            # Missing tunnel resources, or the temporary configuration an
+            # interrupted repair left: repair under a blocked guard.
             self._block(journal)
             was_ready = False
             network.repair_missing(guard_blocked=True)
@@ -304,6 +346,8 @@ class Controller:
         proof = self.probe(profile, Allocation(**journal['allocation']))
         if proof.get('dns') is not True or proof.get('handshake_recent') is not True:
             raise ControllerError('live readiness evidence is incomplete')
+        # A foreign rule clearing the reserved mark can appear during the
+        # probe; the full inventory, not only owned state, gates ready.
         health = network.health()
         if not health.ready or health.changed or health.missing:
             raise ControllerError('owned network changed during readiness probe')
@@ -314,7 +358,11 @@ class Controller:
         if observed['state'] != 'ready':
             raise ControllerError('ready state readback failed')
         journal.update(state='ready', reason=None, probe_at=time.time())
-        self._audit(journal)
+        # Health checks rescan /proc at most once a minute; enrollment, activation
+        # and status keep their full audit.
+        if (not periodic or self._audited_at is None or
+                time.monotonic() - self._audited_at >= _PERIODIC_AUDIT_SECONDS):
+            self._audit(journal)
         self._save(state, journal, identity)
         return self._result(journal, protection=True)
 
@@ -322,18 +370,49 @@ class Controller:
         try:
             with self._locked() as (state, config):
                 profile, journal, identity = self._guard(state, config, activate=True)
+                network = None
                 try:
                     if journal['network_started'] and not _present(state, 'receipt.json'):
                         raise ControllerError('the owned network receipt disappeared')
+                    if journal['network_started']:
+                        interrupted = self._network(state, profile, journal)
+                        if interrupted.incomplete():
+                            # A death mid-acquisition: the guard is blocked, so release
+                            # exactly what the receipt records, then prepare again.
+                            interrupted.rollback_interrupted(guard_blocked=True)
+                            # Journal first while the verified empty receipt remains: a
+                            # death before its removal is the unjournaled-empty case below.
+                            journal['network_started'] = False
+                            identity = self._save(state, journal, identity)
+                            self._discard_receipt(state)
+                    if not journal['network_started'] and _present(state, 'receipt.json'):
+                        # Died after publishing the receipt but before journaling it:
+                        # prepare journals before any mutation, so none was made.
+                        if own.read_receipt(state).resources:
+                            raise ControllerError('an unjournaled network receipt records acquisitions')
+                        os.unlink('receipt.json', dir_fd=state)
+                        os.fsync(state)
                     journal['state'] = 'preparing'
-                    journal['network_started'] = True
                     identity = self._save(state, journal, identity)
                     if not _present(state, 'receipt.json'):
-                        self._network(state, profile, journal).prepare(guard_blocked=True)
+                        network = self._network(state, profile, journal)
+
+                        def started():
+                            # The receipt is durable and nothing is acquired yet. From
+                            # here a death leaves acquisitions only the receipt names.
+                            nonlocal identity
+                            journal['network_started'] = True
+                            identity = self._save(state, journal, identity)
+                        network.prepare(guard_blocked=True, on_receipt=started)
                     return self._ready(state, profile, journal, identity)
                 except (OSError, ValueError, RuntimeError):
                     # Refresh CAS identity if readiness persisted before a later failure.
                     _, identity = self._journal(state)
+                    if (network is not None and network.receipt is None and not network.uncertain and
+                            not _present(state, 'receipt.json')):
+                        # Preflight failed before the receipt, so nothing was acquired. A later
+                        # activation may retry instead of reporting a disappeared receipt.
+                        journal['network_started'] = False
                     self._degrade(state, journal, identity)
                     raise
         except (OSError, ValueError, RuntimeError):
@@ -398,7 +477,7 @@ class Controller:
                 profile, digest, policy, _ = self._inputs(config)
                 if digest != journal['profile_digest'] or sorted(policy) != sorted(journal['policy']) or journal['pending']:
                     raise ControllerError('configuration needs guarded recovery')
-                return self._ready(state, profile, journal, identity)
+                return self._ready(state, profile, journal, identity, periodic=True)
             except (OSError, ValueError, RuntimeError):
                 _, identity = self._journal(state)
                 self._degrade(state, journal, identity)
@@ -500,10 +579,15 @@ class Controller:
                 if journal['pending'] is not None:
                     _, _, disk_policy, settings_identity = self._inputs(config)
                     identity = self._recover_edit(state, config, journal, identity, disk_policy, settings_identity)
+                if journal['pins'] is None and self.kernel.exists():
+                    identity = self._claim_birth(state, journal, identity)
+                # Network cleanup finished before the pins are removed; a disable
+                # interrupted after that may leave only part of the pin set.
+                removing = journal['state'] == 'disabling' and not _present(state, 'receipt.json')
                 if not self.kernel.exists():
-                    if journal['state'] != 'disabling' or _present(state, 'receipt.json'):
+                    if not removing:
                         raise ControllerError('guard disappeared outside verified final disable')
-                else:
+                elif not removing:
                     self._block(journal)
                 self._audit(journal, journal['policy'])
                 journal['state'] = 'disabling'
@@ -515,15 +599,11 @@ class Controller:
                     receipt = network.disable(guard_blocked=True)
                     if receipt.resources:
                         raise ControllerError('network cleanup is incomplete')
-                    identity_receipt = own.file_identity(state, 'receipt.json')
-                    if own.read_receipt(state).resources:
-                        raise ControllerError('network receipt changed during cleanup')
-                    own.verify_file(state, 'receipt.json', identity_receipt)
-                    os.unlink('receipt.json', dir_fd=state)
-                    os.fsync(state)
+                    self._discard_receipt(state)
                 if self.kernel.exists():
-                    self._observed(journal)
-                    self.kernel.unload()
+                    # Every remaining pin must carry the identity journaled at
+                    # load, so a removal interrupted after any unpin resumes.
+                    self.kernel.discard(journal['pins'])
                 if self.kernel.exists():
                     raise ControllerError('guard removal did not complete')
                 journal.update(state='disabled', pins=None, pending=None, reason=None, probe_at=None)
@@ -532,17 +612,53 @@ class Controller:
         except (OSError, ValueError, RuntimeError):
             raise ControllerError('disable stopped because resource ownership or cleanup could not be verified') from None
 
+    def _discard_receipt(self, state):
+        """Remove a receipt whose recorded resources were all released."""
+        identity_receipt = own.file_identity(state, 'receipt.json')
+        if own.read_receipt(state).resources:
+            raise ControllerError('network receipt changed during cleanup')
+        own.verify_file(state, 'receipt.json', identity_receipt)
+        os.unlink('receipt.json', dir_fd=state)
+        os.fsync(state)
+
+    def _needs_activation(self):
+        with self._locked() as (state, config):
+            journal, _ = self._journal(state)
+            if journal is None:
+                return False
+            if journal['pending'] is not None or journal['pins'] is None or not journal['network_started']:
+                return True
+            # An acquisition interrupted by a death is rolled back by activation.
+            return (_present(state, 'receipt.json') and
+                    self._network(state, self._inputs(config)[0], journal).incomplete())
+
     def watch(self, *, interval=5, stop=None):
         if not 1 <= interval <= 60:
             raise ControllerError('health interval must be between one and sixty seconds')
-        event = stop or threading.Event()
         if isinstance(self.kernel, NativeGuard):
             self.kernel.persistent = True
-        old = {}
-        if stop is None:
-            for signum in (signal.SIGTERM, signal.SIGINT):
-                old[signum] = signal.signal(signum, lambda *_: event.set())
+        old, stopping, wakeup, previous = {}, [], None, None
+
+        def wait():
+            if stop is not None:
+                return stop.wait(interval)
+            deadline = time.monotonic() + interval
+            while not stopping and (remaining := deadline - time.monotonic()) > 0:
+                if select.select([wakeup[0]], [], [], remaining)[0]:
+                    try:
+                        os.read(wakeup[0], 4096)
+                    except BlockingIOError:
+                        pass
+            return bool(stopping)
+
         try:
+            if stop is None:
+                # Event.set() in a handler can deadlock on the lock Event.wait()
+                # holds; a flag plus the wakeup pipe takes no lock in signal context.
+                wakeup = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+                previous = signal.set_wakeup_fd(wakeup[1])
+                for signum in (signal.SIGTERM, signal.SIGINT):
+                    old[signum] = signal.signal(signum, lambda *_: stopping.append(True))
             with self._locked() as (state, _):
                 journal, _ = self._journal(state)
                 disabled = journal is not None and journal['state'] in ('disabled', 'disabling')
@@ -556,12 +672,13 @@ class Controller:
                         pass  # Uncertain startup still requires guarded activation.
                 if checked not in ('ready', 'disabled', 'disabling'):
                     self.activate()
-            while not event.wait(interval):
+            while not wait():
                 try:
-                    if self.check().get('state') == 'degraded':
-                        # A pending edit or interrupted preparation needs the
-                        # guarded recovery only activation performs; a plain
-                        # check would leave the host blocked until a command.
+                    if self.check().get('state') == 'degraded' and self._needs_activation():
+                        # A pending edit, unloaded guard or unstarted network needs
+                        # the guarded recovery only activation performs; check()
+                        # already retried readiness, so repeating it would only
+                        # double the probe time during an outage.
                         self.activate()
                 except (OSError, ValueError, RuntimeError):
                     pass  # Blocked protection is retained; the next interval retries.
@@ -571,4 +688,9 @@ class Controller:
                 self.kernel.persistent = False
             for signum, handler in old.items():
                 signal.signal(signum, handler)
+            if previous is not None:
+                signal.set_wakeup_fd(previous)
+            if wakeup is not None:
+                os.close(wakeup[0])
+                os.close(wakeup[1])
             # Deliberately leave pinned links, marks, routes, and firewall intact.

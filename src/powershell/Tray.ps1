@@ -14,6 +14,7 @@ $enabledFile = Join-Path $state 'enabled'
 $activeFile = Join-Path $state 'active'
 $stackStoppedFile = Join-Path $state 'stack-stopped'
 $reloadFile = Join-Path $state 'reload.request'
+$keepFiltersFile = Join-Path $state 'keep-filters.request'
 $errorFile = Join-Path $state 'last-error.txt'
 $activeProfile = $configuration.ProfilePath
 $activeSettings = $configuration.SettingsPath
@@ -153,10 +154,13 @@ $importItem.add_Click({
             throw 'A preserved recovery backup exists; resolve it before importing another profile.'
         }
         Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile
+        # Swapping the profile is not a disable: the persistent payload filters stay, so selected
+        # applications fail closed until the stack returns with the new tunnel address.
+        if ($wasEnabled) { [IO.File]::WriteAllText($keepFiltersFile, (Get-Date -Format o)) }
         Remove-Item -LiteralPath $enabledFile -Force -ErrorAction SilentlyContinue
         $disableRequested = $true
-        $deadline = (Get-Date).AddSeconds(20)
-        while (-not (Test-Path -LiteralPath $stackStoppedFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+        $stopWait = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath $stackStoppedFile) -and $stopWait.Elapsed.TotalSeconds -lt 20) { Start-Sleep -Milliseconds 250 }
         if (-not (Test-Path -LiteralPath $stackStoppedFile)) { throw 'The controller did not stop the managed stack.' }
         $stopConfirmed = $true
 
@@ -172,8 +176,8 @@ $importItem.add_Click({
         if ($wasEnabled) {
             Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile
             [IO.File]::WriteAllText($enabledFile, (Get-Date -Format o))
-            $deadline = (Get-Date).AddSeconds(50)
-            while (-not (Test-Path -LiteralPath $activeFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+            $startWait = [Diagnostics.Stopwatch]::StartNew()
+            while (-not (Test-Path -LiteralPath $activeFile) -and $startWait.Elapsed.TotalSeconds -lt 50) { Start-Sleep -Milliseconds 500 }
             if (-not (Test-Path -LiteralPath $activeFile)) {
                 throw 'The imported profile failed its tunnel-DNS readiness check.'
             }
@@ -214,7 +218,11 @@ $importItem.add_Click({
         }
         Show-Notice 'Profile import failed' $failure 'Error'
     }
-    finally { $dialog.Dispose(); Update-Ui }
+    finally {
+        # Without the request, a stack the import leaves disabled loses its filters on the next pass.
+        Remove-Item -LiteralPath $keepFiltersFile -Force -ErrorAction SilentlyContinue
+        $dialog.Dispose(); Update-Ui
+    }
 })
 
 $logsItem.add_Click({ Start-Process explorer.exe $logs })

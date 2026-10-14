@@ -111,10 +111,12 @@ function Invoke-Cleanup([string] $ScriptName, [string] $Action) {
     catch { $script:errors.Add("$ScriptName $Action failed: $($_.Exception.Message)") }
 }
 
-$beforeWfp = $errors.Count
+# The persistent payload filters outlive the controller and every reboot until they are removed here.
 Invoke-Cleanup 'Invoke-WfpFilters.ps1' 'Stop'
-$wfpStopped = $errors.Count -eq $beforeWfp
-if ($wfpStopped) { Invoke-Cleanup 'Invoke-LocalNrpt.ps1' 'Disable' }
+if (Test-Path -LiteralPath (Join-Path $fullRoot 'state\wfp-filters.installed')) {
+    $errors.Add("Persistent WFP payload filters may remain; run $(Join-Path $fullRoot 'bin\wfp-probe.exe') remove.")
+}
+Invoke-Cleanup 'Invoke-LocalNrpt.ps1' 'Disable'
 Invoke-Cleanup 'Invoke-DnsDispatcher.ps1' 'Stop'
 Invoke-Cleanup 'Invoke-Tunnel.ps1' 'Stop'
 Invoke-Cleanup 'Invoke-DnsCachePolicy.ps1' 'Disable'

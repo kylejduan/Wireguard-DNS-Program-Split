@@ -51,6 +51,48 @@ try {
     }
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }
+# Migration swaps three scripts, so it must refuse an installation whose other components are another release's.
+$legacy = Join-Path ([IO.Path]::GetTempPath()) ('WireGuard legacy layout ' + [guid]::NewGuid())
+try {
+    $installed = Join-Path $legacy 'installed'
+    $build = Join-Path $legacy 'build'
+    foreach ($directory in @((Join-Path $installed 'src'), (Join-Path $installed 'bin'), $build)) {
+        [IO.Directory]::CreateDirectory($directory) | Out-Null
+    }
+    $replaced = @('Common.ps1', 'Controller.ps1', 'Invoke-Tunnel.ps1')
+    $executables = @('controller-service.exe', 'wfp-probe.exe')
+    foreach ($script in Get-ChildItem -LiteralPath (Join-Path $RepositoryRoot 'src\powershell') -Filter '*.ps1') {
+        # Line endings differ between checkouts without changing the release.
+        [IO.File]::WriteAllText((Join-Path $installed "src\$($script.Name)"),
+            [IO.File]::ReadAllText($script.FullName).Replace("`r`n", "`n").Replace("`n", "`r`n"))
+    }
+    [IO.File]::WriteAllText((Join-Path $installed 'src\Controller.ps1'), '# an older controller, replaced by the migration')
+    foreach ($name in $executables) {
+        [IO.File]::WriteAllText((Join-Path $build $name), "current $name")
+        [IO.File]::WriteAllText((Join-Path $installed "bin\$name"), "current $name")
+    }
+    $mismatches = @(Get-ProgramSplitMigrationMismatches -InstalledRoot $installed -RepositoryRoot $RepositoryRoot `
+        -BuildDirectory $build -ReplacedScripts $replaced -Executables $executables)
+    Assert-True ($mismatches.Count -eq 0) "an installation of this release migrates: $($mismatches -join ', ')"
+    # The layout before persistent filters: a dynamic-session wrapper and host, and no validation worker.
+    [IO.File]::WriteAllText((Join-Path $installed 'src\Invoke-WfpFilters.ps1'), "param([ValidateSet('Start', 'Stop', 'Status')] [string] `$Action)")
+    Remove-Item -LiteralPath (Join-Path $installed 'src\ValidationWorker.ps1')
+    [IO.File]::WriteAllText((Join-Path $installed 'bin\wfp-probe.exe'), 'dynamic session host')
+    $mismatches = @(Get-ProgramSplitMigrationMismatches -InstalledRoot $installed -RepositoryRoot $RepositoryRoot `
+        -BuildDirectory $build -ReplacedScripts $replaced -Executables $executables)
+    Assert-True ((($mismatches | Sort-Object) -join ',') -eq 'bin\wfp-probe.exe,src\Invoke-WfpFilters.ps1,src\ValidationWorker.ps1') `
+        "a legacy layout is refused with every differing component named: $($mismatches -join ', ')"
+    Remove-Item -LiteralPath (Join-Path $build 'controller-service.exe')
+    Assert-True (@(Get-ProgramSplitMigrationMismatches -InstalledRoot $installed -RepositoryRoot $RepositoryRoot `
+        -BuildDirectory $build -ReplacedScripts $replaced -Executables $executables) -contains 'bin\controller-service.exe') `
+        'a missing build output is a mismatch, not a pass'
+} finally { Remove-Item -LiteralPath $legacy -Recurse -Force -ErrorAction SilentlyContinue }
+$migrationSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'Migrate-Installation.ps1'))
+Assert-True ($migrationSource.IndexOf('Get-ProgramSplitMigrationMismatches') -gt 0 -and
+    $migrationSource.IndexOf('Get-ProgramSplitMigrationMismatches') -lt $migrationSource.IndexOf('if ($PlanOnly) { return $plan }') -and
+    $migrationSource.IndexOf('if ($mismatches.Count)') -lt $migrationSource.IndexOf('$stopped = $true')) `
+    'migration refuses another release before planning or stopping anything'
+
 $removal = & (Join-Path $RepositoryRoot 'Uninstall.ps1') -PlanOnly
 Assert-True ($removal.DestinationRoot -eq (Join-Path $env:ProgramFiles 'WireGuardProgramSplit')) `
     'uninstall defaults to Program Files'

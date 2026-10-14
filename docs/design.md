@@ -2,19 +2,19 @@
 
 ## Goal
 
-On Windows 11, route all IPv4 TCP and UDP sockets created by an explicit list of executable paths through one WireGuard tunnel. Route ordinary Windows DNS for those executables to the DNS resolver supplied by that WireGuard profile. Leave every unlisted application's payload on the native Windows route and resolve its ordinary DNS through the DNS server configured on the active physical adapter.
+On Windows 11, route all IPv4 TCP and UDP sockets created by an explicit list of executable paths through one WireGuard tunnel, and block their IPv6. Route ordinary Windows DNS for those executables to the DNS resolver supplied by that WireGuard profile. Leave every unlisted application's payload on the native Windows route and resolve its ordinary DNS through the DNS server configured on the active physical adapter.
 
 ## Architecture
 
 - A standard WireGuard profile is imported into a DNS-free, `Table = off` working profile. Its IPv4 interface address and IPv4 DNS address are retained in local settings.
 - A WireGuard tunnel service creates the adapter. A deliberately high-metric tunnel default route exists only as the route selected by per-process WFP binding; the physical default remains preferred globally.
-- A signed PIA WFP callout driver and a small dynamic user-mode WFP session bind listed executables to the tunnel address. Unlisted payload never crosses a universal TUN or user-mode packet proxy.
+- A signed PIA WFP callout driver and persistent WFP filters owned by a fixed project provider bind listed executables to the tunnel address. Hard block filters refuse any of their IPv4 that does not use the tunnel address, and all their non-loopback IPv6, so fail-closed does not depend on the driver. Unlisted payload never crosses a universal TUN or user-mode packet proxy.
 - An NRPT catch-all sends ordinary Windows DNS to a loopback dispatcher. Windows DNS Client ETW events attribute requests to executable paths; the dispatcher forwards selected requests from the tunnel address to tunnel DNS and other requests from the physical address to the physical adapter's current DNS server.
 - A SYSTEM controller owns recovery and health checks. An interactive tray owns the enable switch, profile import, and executable list.
 
 ## Fast startup
 
-The controller service starts automatically through the Windows Service Control Manager; the tunnel service is Manual so Windows cannot create its adapter ahead of preflight. The controller waits for a physical IPv4 default route without entering failure backoff, serializes tunnel starts, clears eligible root-enumerated orphans before starting a stopped tunnel (or adopts an already running owned tunnel), polls a short tunnel-DNS probe until its first success instead of imposing a fixed delay, then enables and validates the dispatcher and NRPT path before dynamic WFP filters. Ongoing 30-second checks retry transient failures and verify the absence of an IPv6 default route, the real Windows DNS Client, ETW attribution, loopback dispatcher, physical resolver snapshot, NRPT ownership, and tunnel DNS.
+The controller service starts automatically through the Windows Service Control Manager; the tunnel service is Manual so Windows cannot create its adapter ahead of preflight. The controller waits for a physical IPv4 default route without entering failure backoff, serializes tunnel starts, clears eligible root-enumerated orphans before starting a stopped tunnel (or adopts an already running owned tunnel), polls a short tunnel-DNS probe until its first success instead of imposing a fixed delay, then enables and validates the dispatcher and NRPT path. The persistent payload filters are installed or replaced in parallel with the first steps, since a redirect to an absent tunnel only blocks. Ongoing 30-second checks retry transient failures and verify the payload filters, the real Windows DNS Client, ETW attribution, loopback dispatcher, physical resolver snapshot, NRPT ownership, and tunnel DNS. A filter mismatch is reinstalled in place, a tunnel-only failure restarts just the tunnel, an uplink outage holds the stack, and other failures restart the rest of the stack; none of them removes the payload filters.
 
 The small native controller host exists because measured Task Scheduler startup added roughly 24 seconds on the reference machine. It adds no routing logic: it supplies SCM lifecycle, cooperative shutdown, and restart-on-failure around the existing PowerShell controller.
 
@@ -23,9 +23,9 @@ The small native controller host exists because measured Task Scheduler startup 
 - WireGuard private keys and machine-specific settings are local-only and must never enter Git history.
 - Deployed runtime files live beneath a locked `C:\Program Files\WireGuardProgramSplit` tree writable only by SYSTEM and Administrators.
 - The public project does not redistribute WireGuard or PIA binaries. Installation requires separately obtained compatible WireGuard runtime DLLs and a signed PIA WFP callout package; signatures are checked before installation.
-- WFP objects are dynamic and disappear if their host exits. The controller restores them, but a controller or host failure is fail-open for payload unless optional persistent firewall guards are added.
+- WFP objects are persistent and owned by one fixed provider. They survive controller and tool crashes, BFE restarts, repairs and reboots, so selected applications' payload fails closed until the stack is back. Only an explicit tray disable, a controller service stop and uninstallation remove them; `wfp-probe.exe remove` recovers a broken installation.
 - Application-owned DoH, DoT, and DoQ bypass ordinary Windows DNS and are outside the DNS split. Browser secure-DNS policy can be disabled explicitly.
-- The initial release is IPv4-only. Profiles containing IPv6 are rejected rather than partially routed.
+- The tunnel is IPv4-only. Profiles containing IPv6 are rejected rather than partially routed, and selected applications' IPv6 is blocked so they fall back to IPv4 through the tunnel.
 
 ## Public and local separation
 

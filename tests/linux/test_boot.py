@@ -258,7 +258,7 @@ def positive(stage):
     assert result == {'boot_id': boot_id(), 'nonce': stage.data['nonce'], 'socket_errno': errno.EPERM, 'mark': None}
     stage.capture(path)
     pins = stage.native('snapshot'); policy = stage.native('policy')
-    assert pins['ready'] is False and len(pins['links']) == 12 and policy == [str(stage.root / 'probe')]
+    assert pins['ready'] is False and len(pins['links']) == 15 and policy == [str(stage.root / 'probe')]
     journal = json.loads((STATE / 'controller.json').read_text())
     assert journal['boot_id'] == boot_id() and journal['state'] == 'blocked'
     assert journal['pins'] == {'maps': pins['maps'], 'links': pins['links']}

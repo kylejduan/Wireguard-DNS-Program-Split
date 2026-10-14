@@ -57,8 +57,14 @@ def validate_nss(text):
         raise ControllerError('unsupported hosts NSS configuration')
 
 
+# Container, changed-root and cgroup v2 mount facts cannot change for this
+# process; root, namespaces and NSS are still rechecked on every call.
+_invariants_verified = False
+
+
 def check_host():
     """Only the proved native Ubuntu/kernel envelope; loading proves exact hooks."""
+    global _invariants_verified
     try:
         release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
                        if '=' in line)
@@ -67,7 +73,7 @@ def check_host():
                 not re.match(r'^7\.0(?:\.|-)', os.uname().release) or
                 'microsoft' in os.uname().release.lower()):
             raise ControllerError('requires root on supported native Ubuntu 26.04/kernel 7.0')
-        for option in ('--container', '--chroot'):
+        for option in () if _invariants_verified else ('--container', '--chroot'):
             result = subprocess.run(['/usr/bin/systemd-detect-virt', option], capture_output=True, timeout=5)
             if result.returncode != 1:
                 raise ControllerError('container or changed-root enrollment is unsupported')
@@ -79,10 +85,12 @@ def check_host():
             raise ControllerError('BPF LSM is not active')
         if not Path('/sys/kernel/btf/vmlinux').is_file():
             raise ControllerError('kernel BTF is unavailable')
-        if command('/usr/bin/stat', '-f', '-c', '%T', '/sys/fs/cgroup').strip() != 'cgroup2fs':
+        if (not _invariants_verified and
+                command('/usr/bin/stat', '-f', '-c', '%T', '/sys/fs/cgroup').strip() != 'cgroup2fs'):
             raise ControllerError('unified cgroup v2 is required')
         nss = Path('/etc/nsswitch.conf').read_text()
         validate_nss(nss)
+        _invariants_verified = True
     except (OSError, ValueError, subprocess.TimeoutExpired):
         raise ControllerError('host capability preflight failed') from None
 
@@ -131,7 +139,8 @@ class NativeGuard:
     def exists(self):
         return os.path.lexists(self.pins)
 
-    def load(self, paths, allocation):
+    def load(self, paths, allocation, record=None):
+        """record: a path the loader fills with the published identities before publishing."""
         verify_artifact(self.object)
         records = []
         for path in paths:
@@ -143,13 +152,24 @@ class NativeGuard:
                 raise ControllerError('policy exceeds native stdin capacity or contains NUL')
             records.append(value + b'\0')
         self._run('load-policy-stdin', self.object, self.pins, '/sys/fs/cgroup',
-                  hex(allocation.mask), hex(allocation.mark), input=b''.join(records))
+                  hex(allocation.mask), hex(allocation.mark), *([record] if record else []),
+                  input=b''.join(records))
+
+    def drain(self):
+        """Retry proving no pre-attachment bind or rename runs; then labels cache."""
+        verify_artifact(self.object)
+        self._run('drain', self.pins, self.object)
+
+    def settle(self):
+        """Detach verified interrupted generations once the published one protects."""
+        self._run('settle', self.pins, '/sys/fs/cgroup')
 
     def snapshot(self):
         try:
             data = json.loads(self._run('snapshot', self.pins))
             return {'abi': data['abi'], 'state': 'ready' if data['ready'] else 'blocked',
                     'mask': data['mask'], 'mark': data['mark'], 'paths': data['paths'],
+                    'settled': data.get('settled', True) is True,
                     'pins': {'maps': data['maps'], 'links': data['links']}}
         except (ValueError, KeyError, TypeError):
             raise ControllerError('native guard returned an invalid observation') from None
@@ -165,6 +185,13 @@ class NativeGuard:
 
     def unload(self):
         self._run('remove', self.pins)
+
+    def discard(self, pins):
+        """Remove the remaining pins, each verified against its journaled identity."""
+        lines = [f'map {name} {int(value)}' for name, value in sorted(pins['maps'].items())]
+        lines += [f'link {name} {int(value["id"])} {int(value["program_id"])}'
+                  for name, value in sorted(pins['links'].items())]
+        self._run('discard', self.pins, input=('\n'.join(lines) + '\n').encode())
 
     def probe_dns(self, *, attempts=3):
         """One lost datagram is not an ownership failure; retry within the check."""

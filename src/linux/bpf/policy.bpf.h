@@ -27,7 +27,15 @@ enum object_role { ROLE_SOCKET=1, ROLE_CACHE=2, ROLE_CACHE_DIR=4,
                    ROLE_SYSTEMD=64 };
 enum stream_role { STREAM_SAFE=1, STREAM_PROTECTED=2 };
 struct role_version { __u64 topology, configuration; };
-struct stream_label { struct role_version version; __u32 role; __u32 reserved; };
+/* A stream's role and stamp are published together in one naturally aligned
+ * word: (role_generation + guard_config) << 1, plus 1 when SAFE. Both counters
+ * only grow, so their sum changes whenever either does. The value keeps the
+ * earlier 24-byte size, so pins loaded before this layout still verify. */
+struct stream_label { __u64 word, reserved; __u32 legacy_role, legacy_reserved; };
+/* guard_config bit set once the loader proved no unix_bind or vfs_rename call
+ * that began before the invalidating programs attached is still running.
+ * Until then no stream label, held role or "no role" answer is cached. */
+#define GUARD_SETTLED (1ULL << 62)
 #ifdef WGPS_BPF
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);

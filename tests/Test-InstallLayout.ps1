@@ -78,6 +78,26 @@ Endpoint = 198.51.100.10:51820
         -WireGuardRuntimeDirectory $runtime -PiaDriverDirectory $driver -BuildDirectory $build -PlanOnly
     Assert-True ($defaultPlan.DestinationRoot -eq (Join-Path $env:ProgramFiles 'WireGuardProgramSplit')) `
         'installer defaults to the Windows Program Files directory'
+    # Ownership checks compare running images' final paths with the root, so aliases are refused.
+    $junctionTarget = Join-Path $temporary 'junction target'
+    $junction = Join-Path $temporary 'junction'
+    [IO.Directory]::CreateDirectory($junctionTarget) | Out-Null
+    New-Item -ItemType Junction -Path $junction -Target $junctionTarget | Out-Null
+    # Windows PowerShell's full-path normalization already expands an existing short name.
+    $shortPlan = & (Join-Path $RepositoryRoot 'Install.ps1') -Profile $profile -Applications $application `
+        -WireGuardRuntimeDirectory $runtime -PiaDriverDirectory $driver -BuildDirectory $build `
+        -DestinationRoot 'C:\PROGRA~1\WireGuardProgramSplit' -PlanOnly
+    Assert-True ($shortPlan.DestinationRoot -notmatch '~') "installer plans an existing short name as its long form: $($shortPlan.DestinationRoot)"
+    foreach ($alias in @('C:\NOSUCH~1\WireGuardProgramSplit', (Join-Path $junction 'WireGuardProgramSplit'))) {
+        $refused = $false
+        try {
+            & (Join-Path $RepositoryRoot 'Install.ps1') -Profile $profile -Applications $application `
+                -WireGuardRuntimeDirectory $runtime -PiaDriverDirectory $driver -BuildDirectory $build `
+                -DestinationRoot $alias -PlanOnly | Out-Null
+        } catch { $refused = $_.Exception.Message -match 'short \(8\.3\) names|junction or symbolic link' }
+        Assert-True $refused "installer refuses an aliased installation root: $alias"
+    }
+    [IO.Directory]::Delete($junction)
 
     $removal = & (Join-Path $RepositoryRoot 'Uninstall.ps1') `
         -DestinationRoot 'C:\Program Files\WireGuardProgramSplit' -PlanOnly

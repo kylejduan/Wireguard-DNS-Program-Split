@@ -4,8 +4,10 @@ import base64
 import json
 import os
 from pathlib import Path
+import signal
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -36,21 +38,40 @@ class Kernel:
         self.ids = {'link': 100, 'paths': 101}
         self.events = []
         self.fail_add = False
+        self.killed_after_publish = False
+        self.interrupted = False
+        self.die_during_discard = False
+        self.partial = False
 
     def exists(self):
         return self.state is not None
 
-    def load(self, paths, allocation):
+    def load(self, paths, allocation, record=None):
         if self.exists():
             raise RuntimeError('existing pins')
         self.events.append('load-blocked')
         self.state, self.paths = 'blocked', sorted(paths)
+        if record is not None:
+            # The loader records exact identities before it publishes.
+            fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.write(fd, json.dumps({'maps': {'paths': self.ids['paths']},
+                                     'links': {'link': self.ids['link']}}).encode())
+            os.close(fd)
+        if self.killed_after_publish:
+            self.killed_after_publish = False
+            self.interrupted = True
+            raise RuntimeError('loader killed after publication')
+
+    def settle(self):
+        self.events.append('settle')
+        self.interrupted = False
 
     def snapshot(self):
-        if not self.exists():
+        if not self.exists() or self.partial:
             raise RuntimeError('missing pins')
-        return {'abi': 4, 'state': self.state, 'mask': ALLOCATION.mask,
-                'mark': ALLOCATION.mark, 'pins': dict(self.ids), 'paths': sorted(self.paths)}
+        return {'abi': 4, 'state': self.state, 'mask': ALLOCATION.mask, 'mark': ALLOCATION.mark,
+                'pins': {'maps': {'paths': self.ids['paths']}, 'links': {'link': self.ids['link']}},
+                'paths': sorted(self.paths)}
 
     def set_state(self, state):
         self.events.append('state-' + state)
@@ -68,15 +89,34 @@ class Kernel:
         if path in self.paths:
             self.paths.remove(path)
 
+    def discard(self, pins):
+        assert pins == self.snapshot_pins()
+        if self.die_during_discard:
+            self.die_during_discard = False
+            self.partial = True  # Some pins are gone: whole-set verification fails.
+            raise Died()
+        self.partial = False
+        self.unload()
+
+    def snapshot_pins(self):
+        return {'maps': {'paths': self.ids['paths']}, 'links': {'link': self.ids['link']}}
+
     def unload(self):
         self.events.append('unload')
         self.state = None
+
+
+class Died(BaseException):
+    """A process death: no exception handler of the controller runs."""
 
 
 class NetworkFixture:
     def __init__(self, events):
         self.events, self.present = events, False
         self.fail_prepare = False
+        self.fail_preflight = False
+        self.foreign = False
+        self.die_at = None
         self.changed = False
         self.missing = False
         self.repairable = False
@@ -85,24 +125,50 @@ class NetworkFixture:
         outer = self
 
         class Instance:
-            def prepare(self, *, guard_blocked):
+            receipt = kwargs.get('receipt')
+            uncertain = False
+
+            def prepare(self, *, guard_blocked, on_receipt=None):
                 if not guard_blocked:
                     raise RuntimeError('unguarded network')
                 outer.events.append('network-prepare')
-                outer.present = True
+                if outer.die_at == 'preflight':
+                    raise Died()
+                if outer.fail_preflight:
+                    raise RuntimeError('injected preflight failure before the receipt')
                 receipt = own.new_receipt()
                 own.write_receipt(directory_fd, receipt)
+                self.receipt = receipt
+                if outer.die_at == 'receipt':
+                    raise Died()
+                if on_receipt is not None:
+                    on_receipt()
+                if outer.die_at == 'journaled':
+                    raise Died()  # Before the first acquisition is recorded.
+                outer.present = True
                 if outer.fail_prepare:
                     raise RuntimeError('injected prepare failure')
                 return receipt
 
-            def health(self):
+            def health(self, *, conflicts=True):
+                # Models Network.health: a foreign mark claim is visible only
+                # to the full inventory, never to an owned-state-only read.
                 if kwargs.get('receipt') is None:
                     return Health((), (), ())
+                foreign = conflicts and outer.foreign
+                changed = (('nft_table:owned',) if outer.changed else ()) + (('allocation:foreign',) if foreign else ())
                 return Health(('nft_table:owned',) if outer.present else (),
-                              ('interface:owned',) if outer.missing else (),
-                              ('nft_table:owned',) if outer.changed else (),
-                              ready=outer.present and not outer.missing and not outer.changed)
+                              ('interface:owned',) if outer.missing else (), changed,
+                              ready=outer.present and not outer.missing and not changed)
+
+            def incomplete(self):
+                return self.receipt is not None and not outer.present
+
+            def rollback_interrupted(self, *, guard_blocked):
+                if not guard_blocked or outer.changed or not self.incomplete():
+                    raise RuntimeError('unverified interrupted acquisition')
+                outer.events.append('network-rollback')
+                return self.receipt
 
             def disable(self, *, guard_blocked):
                 if not guard_blocked or outer.changed:
@@ -264,6 +330,77 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.kernel.state, 'blocked')
         self.assertNotIn('unload', self.kernel.events)
         self.assertNotIn('network-disable', self.kernel.events)
+
+    def test_failure_before_receipt_allows_a_later_activation_to_retry(self):
+        self.network.fail_preflight = True
+        with self.assertRaises(ControllerError):
+            self.controller.activate()
+        self.assertEqual(self.kernel.state, 'blocked')
+        self.network.fail_preflight = False
+        self.assertEqual(self.controller.activate()['state'], 'ready')
+        self.assertEqual(self.kernel.events.count('network-prepare'), 2)
+
+    def test_death_at_each_acquisition_boundary_recovers_or_stays_guarded(self):
+        for boundary in ('preflight', 'receipt', 'journaled', 'journaled-then-changed'):
+            with self.subTest(boundary=boundary):
+                self.setUp()
+                self.network.die_at = boundary.split('-')[0]
+                with self.assertRaises(Died):
+                    self.controller.activate()
+                self.network.die_at = None
+                journal = json.loads((self.paths.state / 'controller.json').read_text())
+                self.assertEqual(journal['network_started'], boundary.startswith('journaled'))
+                self.assertEqual(self.kernel.state, 'blocked')
+                restarted = self.new_controller()
+                self.assertEqual(restarted.check()['state'], 'degraded')
+                self.assertEqual(self.kernel.state, 'blocked')
+                # The watch loop reaches activation for every interrupted boundary.
+                self.assertTrue(restarted._needs_activation())
+                if boundary == 'journaled-then-changed':
+                    # A recorded resource changed: never removed without an operator.
+                    self.network.changed = True
+                    with self.assertRaises(ControllerError):
+                        restarted.activate()
+                    self.assertEqual(self.kernel.state, 'blocked')
+                    self.assertNotIn('network-rollback', self.kernel.events)
+                    self.assertEqual(self.kernel.events.count('network-prepare'), 1)
+                    continue
+                self.kernel.events.clear()
+                self.assertEqual(restarted.activate()['state'], 'ready')
+                self.assertEqual('network-rollback' in self.kernel.events, boundary == 'journaled')
+                self.assertNotIn('unload', self.kernel.events)
+                self.assertEqual(self.kernel.events.count('network-prepare'), 1)
+                self.assertFalse(restarted._needs_activation())
+
+    def test_death_while_finalizing_a_rollback_recovers_on_the_next_activation(self):
+        for point in ('before-journal', 'before-removal'):
+            with self.subTest(point=point):
+                self.setUp()
+                self.network.die_at = 'journaled'
+                with self.assertRaises(Died):
+                    self.controller.activate()
+                self.network.die_at = None
+                recovering = self.new_controller()
+                if point == 'before-journal':
+                    save = recovering._save
+
+                    def dying_save(state, journal, identity):
+                        if not journal['network_started']:
+                            raise Died()  # The rollback is done; its journal update is not.
+                        return save(state, journal, identity)
+                    recovering._save = dying_save
+                else:
+                    def dying_discard(state):
+                        raise Died()  # Journaled; the empty receipt is not yet removed.
+                    recovering._discard_receipt = dying_discard
+                with self.assertRaises(Died):
+                    recovering.activate()
+                self.assertTrue((self.paths.state / 'receipt.json').exists())
+                self.assertEqual(self.kernel.state, 'blocked')
+                restarted = self.new_controller()
+                self.assertTrue(restarted._needs_activation())
+                self.assertEqual(restarted.activate()['state'], 'ready')
+                self.assertEqual(self.kernel.events.count('network-prepare'), 2)
 
     def test_new_controller_adopts_only_matching_pinned_ids_and_observed_network(self):
         self.controller.activate()
@@ -432,6 +569,91 @@ class LifecycleTests(unittest.TestCase):
         self.new_controller().watch(stop=stop)
         self.assertEqual(self.kernel.events, [])
         self.assertFalse(self.kernel.exists())
+
+    def test_degraded_watch_activates_only_when_check_cannot_recover(self):
+        for condition in ('probe', 'pending'):
+            with self.subTest(condition=condition):
+                self.setUp()
+                self.controller.activate()
+                path = self.paths.state / 'controller.json'
+
+                def degrade():
+                    if condition == 'probe':
+                        self.probe_ok = False
+                    else:
+                        journal = json.loads(path.read_text())
+                        journal['pending'] = {'action': 'add', 'path': '/pending/helper', 'generation': 2,
+                                              'policy': sorted([*journal['policy'], '/pending/helper'])}
+                        path.write_text(json.dumps(journal))
+                    self.kernel.events.clear()
+
+                class Stop:
+                    calls = 0
+
+                    def wait(self, interval):
+                        self.calls += 1
+                        if self.calls == 1:
+                            degrade()
+                        return self.calls > 1
+
+                watcher = self.new_controller()
+                with patch.object(watcher, 'activate', wraps=watcher.activate) as activate:
+                    watcher.watch(stop=Stop())
+                if condition == 'probe':
+                    activate.assert_not_called()
+                    self.assertEqual(self.kernel.events.count('probe'), 1)
+                    self.assertEqual(self.kernel.state, 'blocked')
+                else:
+                    activate.assert_called_once()
+                    self.assertEqual(self.kernel.state, 'ready')
+                    self.assertIn('/pending/helper', self.kernel.paths)
+
+    def test_foreign_mark_claim_during_the_readiness_probe_keeps_protection_blocked(self):
+        self.controller.activate()
+        self.probe_ok = False
+        self.assertEqual(self.controller.check()['state'], 'degraded')
+        self.assertEqual(self.kernel.state, 'blocked')
+        self.probe_ok = True
+        probe = self.controller.probe
+
+        def foreign_rule_after_dns_answer(profile, allocation):
+            result = probe(profile, allocation)
+            self.network.foreign = True  # e.g. an OUTPUT rule clearing the reserved mark
+            return result
+        self.controller.probe = foreign_rule_after_dns_answer
+        self.kernel.events.clear()
+        result = self.controller.check()
+        self.assertEqual(result['state'], 'degraded')
+        self.assertFalse(result['protection_verified'])
+        self.assertEqual(self.kernel.state, 'blocked')
+        self.assertNotIn('state-ready', self.kernel.events)
+
+    def test_periodic_check_rate_limits_the_process_restart_audit(self):
+        self.controller.activate()
+        self.assertTrue(self.controller.check()['restart_required'])
+        scans = []
+        self.controller.processes = lambda: scans.append(1) or list(self.processes)
+        self.assertEqual(self.controller.check()['state'], 'ready')
+        self.assertEqual(scans, [])
+        self.controller._audited_at -= 61
+        self.controller.check()
+        self.assertEqual(len(scans), 1)
+        self.assertTrue(self.controller.status()['restart_required'])
+        self.assertEqual(len(scans), 2)
+
+    def test_termination_signal_wakes_watch_without_locking_in_the_handler(self):
+        self.controller.activate()
+        previous = signal.getsignal(signal.SIGTERM)
+        timer = threading.Timer(0.2, os.kill, (os.getpid(), signal.SIGTERM))
+        started = time.monotonic()
+        timer.start()
+        try:
+            self.new_controller().watch(interval=60)
+        finally:
+            timer.cancel()
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+        self.assertEqual(signal.set_wakeup_fd(-1), -1)
 
     def test_disable_between_startup_snapshot_and_check_is_not_reactivated(self):
         self.controller.activate()
@@ -602,11 +824,56 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(result['protection_verified'])
         self.assertFalse(result['restart_boundary_unresolved'])
 
+    def test_disable_interrupted_while_removing_pins_resumes_from_journaled_identities(self):
+        self.controller.activate()
+        self.kernel.die_during_discard = True
+        with self.assertRaises(Died):
+            self.controller.disable()
+        journal = json.loads((self.paths.state / 'controller.json').read_text())
+        self.assertEqual(journal['state'], 'disabling')
+        self.assertTrue(self.kernel.exists() and self.kernel.partial)
+        restarted = self.new_controller()
+        with self.assertRaises(ControllerError):
+            restarted.activate()  # Only the interrupted disable may finish this.
+        self.assertEqual(restarted.disable()['state'], 'disabled')
+        self.assertFalse(self.kernel.exists())
+        self.assertEqual(restarted.activate()['state'], 'ready')
+
+    def test_load_killed_after_publication_is_completed_only_from_its_birth_record(self):
+        for case in ('complete', 'disable', 'changed', 'missing'):
+            with self.subTest(case=case):
+                self.setUp()
+                birth = self.paths.state / 'guard-birth.json'
+                self.kernel.killed_after_publish = True
+                with self.assertRaises(ControllerError):
+                    self.controller.guard()
+                self.assertTrue(self.kernel.exists() and self.kernel.interrupted and birth.exists())
+                self.assertIsNone(json.loads((self.paths.state / 'controller.json').read_text())['pins'])
+                if case == 'changed':
+                    self.kernel.ids['link'] += 1
+                if case == 'missing':
+                    birth.unlink()
+                if case in ('changed', 'missing'):
+                    with self.assertRaises(ControllerError):
+                        self.new_controller().guard()
+                    self.assertTrue(self.kernel.interrupted)
+                    self.assertEqual(self.kernel.events.count('load-blocked'), 1)
+                    continue
+                if case == 'disable':
+                    self.assertEqual(self.new_controller().disable()['state'], 'disabled')
+                    self.assertFalse(self.kernel.exists())
+                else:
+                    self.assertEqual(self.new_controller().activate()['state'], 'ready')
+                    journal = json.loads((self.paths.state / 'controller.json').read_text())
+                    self.assertEqual(journal['pins'], self.kernel.snapshot()['pins'])
+                self.assertEqual(self.kernel.events.count('load-blocked'), 1)
+                self.assertFalse(self.kernel.interrupted or birth.exists())
+
     def test_selected_process_born_during_guard_attachment_is_audited_after_load(self):
         self.processes = []
         load = self.kernel.load
-        def birth(paths, allocation):
-            load(paths, allocation)
+        def birth(paths, allocation, record=None):
+            load(paths, allocation, record)
             self.processes = [{'pid': 99, 'ppid': 1, 'starttime': 110, 'exe': '/missing/selected'}]
         self.kernel.load = birth
         result = self.controller.guard()
@@ -681,6 +948,32 @@ class PreflightTests(unittest.TestCase):
         for hosts in ('resolve files dns', 'files myhostname dns', 'dns', 'files dns\nhosts: files dns'):
             with self.assertRaises(ControllerError):
                 validate_nss('hosts: ' + hosts)
+
+    def test_host_check_caches_only_process_invariant_spawns(self):
+        from wg_program_split import preflight
+        files = {'/etc/os-release': 'ID=ubuntu\nVERSION_ID="26.04"\n', '/sys/kernel/security/lsm': 'lockdown,bpf',
+                 '/etc/nsswitch.conf': 'hosts: files dns\n'}
+        class FakePath:
+            def __init__(self, path):
+                self.path = path
+            def read_text(self):
+                return files[self.path]
+            def is_file(self):
+                return True
+        identity = os.stat('/')
+        with patch.object(preflight, '_invariants_verified', False), \
+                patch.object(preflight, 'Path', FakePath), \
+                patch.object(preflight.os, 'geteuid', return_value=0), \
+                patch.object(preflight.os, 'uname', return_value=os.uname_result(('Linux', 'h', '7.0.0-1-generic', '', ''))), \
+                patch.object(preflight.os, 'stat', return_value=identity) as stat, \
+                patch.object(preflight.subprocess, 'run', return_value=type('R', (), {'returncode': 1})) as run, \
+                patch.object(preflight, 'command', return_value='cgroup2fs\n') as command:
+            preflight.check_host()
+            preflight.check_host()
+            self.assertEqual((run.call_count, command.call_count, stat.call_count), (2, 1, 16))
+            files['/etc/nsswitch.conf'] = 'hosts: files myhostname dns\n'
+            with self.assertRaises(ControllerError):
+                preflight.check_host()
 
     def test_restart_lineage_keeps_child_after_parent_exit_and_rejects_pid_reuse(self):
         initial = [{'pid': 10, 'starttime': 1, 'ppid': 1, 'exe': '/selected'},

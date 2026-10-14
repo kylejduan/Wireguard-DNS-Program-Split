@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "parse-number.h"
 
 namespace {
 
@@ -67,21 +68,15 @@ ProbeResult probe(unsigned attempts, const std::function<Attempt()>& exchange,
 }
 
 unsigned parseAttempts(const char* text) {
-    size_t consumed{};
-    const unsigned long value = std::stoul(text, &consumed);
-    if (consumed != std::string(text).size() || value < 1 || value > 10) {
-        throw std::runtime_error("Invalid attempt count");
-    }
-    return static_cast<unsigned>(value);
+    const auto value = wgps::parseDecimal(text, 10);
+    if (!value || *value < 1) throw std::runtime_error("Invalid attempt count");
+    return static_cast<unsigned>(*value);
 }
 
 DWORD parseTimeout(const char* text) {
-    size_t consumed{};
-    const unsigned long value = std::stoul(text, &consumed);
-    if (consumed != std::string(text).size() || value < 100 || value > 30000) {
-        throw std::runtime_error("Invalid timeout");
-    }
-    return static_cast<DWORD>(value);
+    const auto value = wgps::parseDecimal(text, 30000);
+    if (!value || *value < 100) throw std::runtime_error("Invalid timeout");
+    return static_cast<DWORD>(*value);
 }
 
 Attempt querySystemDns(const char* name) {
@@ -242,7 +237,7 @@ int main(int argc, char** argv) {
             echoed[13] = 'x';
             if (validDnsResponse(query, echoed.data(), static_cast<int>(echoed.size()), target, target)) return 21;
             if (parseAttempts("3") != 3) return 15;
-            for (const char* invalid : {"0", "11", "2x"}) {
+            for (const char* invalid : {"0", "11", "2x", "", "+3", "99999999999999999999999"}) {
                 bool rejected = false;
                 try { parseAttempts(invalid); } catch (const std::exception&) { rejected = true; }
                 if (!rejected) return 16;

@@ -80,8 +80,6 @@ class Kernel:
             return json.dumps(self.nft)
         if argv == ('wg', 'show', 'all', 'fwmark'):
             return self.wgmarks
-        if argv == ('conntrack', '-L', '-o', 'extended'):
-            return self.conntrack
         if argv in (('iptables-legacy-save',), ('ip6tables-legacy-save',)):
             return self.legacy
         if argv in (('iptables-nft-save',), ('ip6tables-nft-save',)):
@@ -181,8 +179,12 @@ class Kernel:
         if argv[:3] == ('conntrack', '-D', '--zone'):
             self.conntrack = ''
             return ''
-        if argv[:3] == ('conntrack', '-L', '--zone'):
+        if argv == ('conntrack', '-L', '-o', 'extended'):
             return self.conntrack
+        if argv[:2] == ('conntrack', '-L') and argv[4:] == ('-o', 'extended'):
+            token = {'--zone': 'zone=', '--orig-zone': 'zone-orig=', '--reply-zone': 'zone-reply='}[argv[2]]
+            return ''.join(line + '\n' for line in self.conntrack.splitlines()
+                           if token + argv[3] in line.split())
         raise AssertionError('unexpected command ' + str(argv))
 
 
@@ -223,6 +225,44 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(allocation.mask.bit_count(), 2)
         self.assertEqual((allocation.routing_table, allocation.zone), (57001, 2))
         self.assertLess(allocation.priority, 100)
+
+    def test_zone_inventory_is_one_flow_listing_regardless_of_occupied_zones(self):
+        kernel = Kernel()
+        kernel.legacy = '-A OUTPUT -j CT --zone 2\n'
+        rows = ['udp 17 23 src=192.0.2.2 dst=192.0.2.3 zone=1', 'udp 17 23 src=192.0.2.2 dst=192.0.2.4 zone-orig=3',
+                'udp 17 23 src=192.0.2.2 dst=192.0.2.5 zone-reply=4']
+        rows += [f'tcp 6 30 src=192.0.2.2 dst=192.0.2.9 zone={zone}' for zone in range(5, 1005)]
+        kernel.conntrack = '\n'.join(rows) + '\n'
+        self.assertEqual(network.allocate(network.inspect(PROFILE, runner=kernel)).zone, 1005)
+        listed = [c for c in kernel.calls if c[0] == 'conntrack']
+        self.assertEqual(listed, [('conntrack', '-L', '-o', 'extended')])
+        for invalid in ('zone=65536', 'zone=1x', 'zonex=1'):
+            kernel.conntrack = 'udp 17 23 ' + invalid + '\n'
+            with self.assertRaises(network.NetworkError):
+                network.inspect(PROFILE, runner=kernel)
+
+    def test_streamed_zone_scan_keeps_only_zone_numbers_across_chunk_boundaries(self):
+        from wg_program_split import inventory
+        listing = b''.join(b'udp 17 23 src=192.0.2.2 dst=192.0.2.3 sport=5353 dport=53 mark=0 zone=%d use=1\n'
+                           % (zone % 7 + 1) for zone in range(20000))
+        chunks = []
+
+        def stream(argv, consume, *, timeout):
+            self.assertEqual((argv, timeout), (('conntrack', '-L', '-o', 'extended'), 15))
+            for offset in range(0, len(listing), 4093):  # Splits lines and zone tokens.
+                consume(listing[offset:offset + 4093]); chunks.append(1)
+        with patch.object(inventory, 'stream', stream):
+            self.assertEqual(inventory.conntrack_zones(inventory.run_command), set(range(1, 8)))
+        self.assertGreater(len(chunks), 100)
+        scan = inventory._ZoneScan()
+        with self.assertRaises(network.NetworkError):
+            scan.feed(b'x' * (scan.LINE_MAXIMUM + 1))
+
+        def failing(argv, consume, *, timeout):
+            raise subprocess.SubprocessError('native command timed out')
+        with patch.object(inventory, 'stream', failing):
+            with self.assertRaises(network.NetworkError):
+                inventory.conntrack_zones(inventory.run_command)
 
     def test_tailscale_mask_preserving_assignment_does_not_consume_unrelated_bits(self):
         kernel = Kernel()
@@ -317,6 +357,13 @@ class AllocationTests(unittest.TestCase):
                     with self.assertRaises(network.NetworkError) as error:
                         network.run_command(('wg', 'show', 'all', 'fwmark'))
                 self.assertNotIn(PRIVATE, str(error.exception))
+
+    def test_runner_reads_sysctl_values_from_procfs_without_a_process(self):
+        with patch('wg_program_split.inventory.capture', side_effect=AssertionError('spawned')):
+            self.assertEqual(network.run_command(('sysctl', '-n', 'kernel.ostype')), 'Linux\n')
+            for name in ('net.ipv4.conf.wgpsabsent0.route_localnet', 'kernel.absent_setting'):
+                with self.assertRaises(network.NetworkError):
+                    network.run_command(('sysctl', '-n', name))
 
 
 class NetworkTests(unittest.TestCase):
@@ -472,6 +519,39 @@ class NetworkTests(unittest.TestCase):
         self.net.disable(guard_blocked=True)
         self.assertEqual(self.net.receipt.resources, ())
         self.assertEqual(list(self.wireguard.iterdir()), [])
+
+    def test_interrupted_acquisition_rolls_back_only_recorded_resources(self):
+        for unrecorded in (False, True):
+            with self.subTest(unrecorded=unrecorded):
+                self.setUp()
+                self.kernel.fail_prefix = ('ip', 'link', 'add')  # A death before the interface.
+                with self.assertRaises(network.NetworkError):
+                    self.net.prepare(guard_blocked=True)
+                self.kernel.fail_prefix = None
+                recorded = {r.kind for r in self.net.receipt.resources}
+                self.assertTrue({'route', 'rule', 'nft_table'} <= recorded and 'interface' not in recorded)
+                restarted = network.Network(PROFILE, self.fd, runner=self.kernel, boot_id=BOOT,
+                                            wireguard_root=self.wireguard, owner_uid=os.getuid(),
+                                            receipt=ownership.read_receipt(self.fd))
+                self.assertTrue(restarted.incomplete())
+                if unrecorded:
+                    # Created by a command whose record a death prevented.
+                    self.kernel.links.append({'ifindex': 9, 'ifname': 'wgps0', 'mtu': 1420})
+                    with self.assertRaises(network.NetworkError):
+                        restarted.rollback_interrupted(guard_blocked=True)
+                    self.assertTrue(self.kernel.nft['nftables'] and ownership.read_receipt(self.fd).resources)
+                    continue
+                with self.assertRaises(network.NetworkError):
+                    restarted.rollback_interrupted(guard_blocked=False)
+                self.assertEqual(restarted.rollback_interrupted(guard_blocked=True).resources, ())
+                self.assertFalse(any(x.get('table') == 'wg_program_split' for entry in self.kernel.nft['nftables']
+                                     for x in entry.values() if isinstance(x, dict)))
+                self.assertEqual([x['priority'] for x in self.kernel.rules], [0, 32766, 32767])
+        self.setUp()
+        self.net.prepare(guard_blocked=True)
+        self.assertFalse(self.net.incomplete())
+        with self.assertRaises(network.NetworkError):
+            self.net.rollback_interrupted(guard_blocked=True)
 
     def test_successful_command_without_effective_delete_retains_ownership_record(self):
         self.net.prepare(guard_blocked=True)
@@ -666,6 +746,55 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(list(self.wireguard.iterdir()), [])
         self.assertEqual(ownership.read_receipt(self.fd), repaired)
         self._assert_anchors_retained()
+
+    def test_interrupted_repair_is_retried_with_its_safety_anchors_intact(self):
+        receipt = self._repair_fixture(delete_interface=True)
+        self.kernel.fail_prefix = ('wg', 'setconf')  # Dies after recording its temporary configuration.
+        with self.assertRaises(network.NetworkError):
+            self.net.repair_missing(guard_blocked=True)
+        self.kernel.fail_prefix = None
+        self.assertTrue(any(r.kind == 'private_file' for r in ownership.read_receipt(self.fd).resources))
+        self.kernel(('ip', 'link', 'delete', 'dev', 'wgps0'))  # The replacement disappears too.
+        restarted = network.Network(PROFILE, self.fd, runner=self.kernel, boot_id=BOOT,
+                                    wireguard_root=self.wireguard, owner_uid=os.getuid(),
+                                    receipt=ownership.read_receipt(self.fd))
+        self.assertFalse(restarted.incomplete())  # Never an initial acquisition to roll back.
+        health = restarted.health()
+        self.assertFalse(health.ready or health.changed)
+        self.kernel.calls.clear()
+        repaired = restarted.repair_missing(guard_blocked=True)
+        self.assertTrue(restarted.health().ready)
+        self.assertEqual(repaired.attempt_id, receipt.attempt_id)
+        self.assertFalse(any(r.kind.startswith('private') for r in repaired.resources))
+        self.assertEqual(list(self.wireguard.iterdir()), [])
+        self.net = restarted
+        self._assert_anchors_retained()
+
+    def test_repair_interrupted_at_each_step_resumes_with_its_replacement_left_in_place(self):
+        steps = (('ip', 'link', 'set', 'dev', 'wgps0', 'alias'), ('ip', '-4', 'address', 'add'),
+                 ('wg', 'setconf'), ('sysctl', '-w'), ('ip', 'link', 'set', 'dev', 'wgps0', 'up'),
+                 ('ip', '-4', 'route', 'add'))
+        for step in steps:
+            with self.subTest(step=step):
+                self.setUp()
+                self._repair_fixture(delete_interface=True)
+                self.kernel.fail_prefix = step  # Dies right before this step of the repair.
+                with self.assertRaises(network.NetworkError):
+                    self.net.repair_missing(guard_blocked=True)
+                self.kernel.fail_prefix = None
+                restarted = network.Network(PROFILE, self.fd, runner=self.kernel, boot_id=BOOT,
+                                            wireguard_root=self.wireguard, owner_uid=os.getuid(),
+                                            receipt=ownership.read_receipt(self.fd))
+                self.assertFalse(restarted.incomplete())
+                self.assertFalse(restarted.health().changed)
+                restarted.repair_missing(guard_blocked=True)
+                self.assertTrue(restarted.health().ready)
+                self.assertEqual(list(self.wireguard.iterdir()), [])
+                self.assertTrue(all(r in restarted.receipt.resources for r in self.anchors))
+                self.assertEqual(self.kernel.conntrack, 'udp 17 30 src=10.20.0.2 dst=10.20.0.1 zone=1\n')
+                # Only the partial replacement itself may have been deleted.
+                self.assertFalse(any(('delete' in c or '-D' in c or c[:2] == ('nft', '-f')) and
+                                     c != ('ip', 'link', 'delete', 'dev', 'wgps0') for c in self.kernel.calls))
 
     def test_repair_rejects_foreign_interface_without_any_mutation(self):
         self._repair_fixture(delete_interface=True)

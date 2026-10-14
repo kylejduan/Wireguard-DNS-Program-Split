@@ -37,6 +37,17 @@ if ([IO.Path]::GetPathRoot($fullDestinationRoot).TrimEnd('\') -eq $fullDestinati
     throw 'DestinationRoot cannot be a filesystem root.'
 }
 $DestinationRoot = $fullDestinationRoot.TrimEnd('\')
+# Ownership checks compare running images' final paths with this root, so it must be a final path itself:
+# no junction or symbolic link on the way and no short (8.3) name.
+if (($DestinationRoot -split '\\') -match '~\d') { throw 'DestinationRoot must use long names, not short (8.3) names.' }
+$ancestor = $DestinationRoot
+while ($ancestor) {
+    $item = Get-Item -LiteralPath $ancestor -Force -ErrorAction SilentlyContinue
+    if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "DestinationRoot cannot pass through a junction or symbolic link: $ancestor"
+    }
+    $ancestor = Split-Path -Parent $ancestor
+}
 $applicationPaths = @($Applications | ForEach-Object {
     $item = Get-Item -LiteralPath $_ -ErrorAction Stop
     if ($item.PSIsContainer -or $item.Extension -ine '.exe') { throw "Included application must be an .exe file: $_" }
@@ -174,9 +185,9 @@ try {
         & (Join-Path $DestinationRoot 'src\Invoke-BrowserDnsPolicy.ps1') -Action Enable | Out-Null
     }
     Start-Service -Name $plan.ControllerServiceName
-    $deadline = (Get-Date).AddSeconds(60)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
     $activeFile = Join-Path $DestinationRoot 'state\active'
-    while (-not (Test-Path -LiteralPath $activeFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+    while (-not (Test-Path -LiteralPath $activeFile) -and $timer.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Milliseconds 250 }
     if (-not (Test-Path -LiteralPath $activeFile)) {
         $errorPath = Join-Path $DestinationRoot 'state\last-error.txt'
         $detail = if (Test-Path -LiteralPath $errorPath) { Get-Content -LiteralPath $errorPath -Raw } else { 'No controller error was recorded.' }

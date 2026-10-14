@@ -100,13 +100,18 @@ std::optional<std::vector<char>> udpExchange(const std::vector<char>& packet, so
     if (bind(upstream, reinterpret_cast<sockaddr*>(&source), sizeof(source)) == 0 &&
         connectBefore(upstream, resolver, deadline) &&
         socketReady(upstream, true, deadline) &&
-        send(upstream, packet.data(), static_cast<int>(packet.size()), 0) == static_cast<int>(packet.size()) &&
-        socketReady(upstream, false, deadline)) {
-        std::vector<char> response(65535);
-        const int received = recv(upstream, response.data(), static_cast<int>(response.size()), 0);
-        if (received > 0) {
-            response.resize(received);
-            if (matchingResponse(packet, response) && zeroResponseTtls(response)) result = std::move(response);
+        send(upstream, packet.data(), static_cast<int>(packet.size()), 0) == static_cast<int>(packet.size())) {
+        // Receive on the stack and retain only the answer. A connected socket admits only the
+        // resolver's address; a stale or mismatched datagram is skipped until the deadline.
+        std::array<char, 65535> buffer;
+        while (socketReady(upstream, false, deadline)) {
+            const int received = recv(upstream, buffer.data(), static_cast<int>(buffer.size()), 0);
+            if (received == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
+            if (received <= 0) break;
+            std::vector<char> response(buffer.data(), buffer.data() + received);
+            if (!matchingResponse(packet, response)) continue;
+            if (zeroResponseTtls(response)) result = std::move(response);
+            break;
         }
     }
     return result;

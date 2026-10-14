@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import stat
 
 from .config import Profile
@@ -14,7 +13,7 @@ from .inventory import (  # noqa: F401  (re-exported for callers and tests)
     _BUILTIN_TABLES, _IPTABLES_DUMPS, _OPAQUE_MARK_EXTENSIONS, _TABLE_DIRS, _TABLE_FILES,
     _TOOL_PATH, _call, _has_mark, _iptables_dumps, _json, _legacy_mask, _legacy_zones,
     _named_tables, _nft_usage, _opaque_marks, _require_mark_visibility, _split_mark,
-    _table, _u32, _wireguard_state, run_command,
+    _table, _u32, _wireguard_state, conntrack_zones, run_command,
 )
 from .firewall import Firewall
 from . import ownership as own
@@ -110,14 +109,7 @@ def _inspect(profile, *, runner, require_underlay):
     for text in dumps.values():
         used |= _legacy_mask(text)
         zones |= _legacy_zones(text)
-    for token in _call(runner, 'conntrack', '-L', '-o', 'extended').split():
-        if 'zone' in token:
-            if not re.fullmatch(r'zone(?:-orig|-reply)?=[0-9]{1,5}', token):
-                raise NetworkError('unparseable conntrack zone inventory')
-            number = int(token.split('=')[1])
-            if number > 65535:
-                raise NetworkError('invalid conntrack zone inventory')
-            zones.add(number)
+    zones |= conntrack_zones(runner)
     underlay, mtu = _underlay(profile, links, runner) if require_underlay else ('', 0)
     return Inventory(used, frozenset(tables), frozenset(priorities), frozenset(zones), underlay, mtu)
 
@@ -489,7 +481,8 @@ class Network:
         self._run('ip', 'link', 'set', 'dev', a.interface, 'up')
         self._capture('interface', a.interface)
 
-    def prepare(self, *, guard_blocked):
+    def prepare(self, *, guard_blocked, on_receipt=None):
+        """on_receipt runs once the new empty receipt is durable, before any mutation."""
         if guard_blocked is not True:
             raise NetworkError('controller must establish a blocked selected-process guard first')
         if self.receipt is not None or self.uncertain:
@@ -502,6 +495,8 @@ class Network:
         fd = own.open_private_dir(self.wireguard_root, owner_uid=self.owner_uid)
         os.close(fd)
         self._publish(own.new_receipt(boot_id=self.boot_id))
+        if on_receipt is not None:
+            on_receipt()
         a = self.allocation
         self._acquire('route', 'fallback', *self._route_argv('add', 'fallback'))
         self._acquire('rule', 'vpn', *self._rule_argv('add'))
@@ -536,7 +531,10 @@ class Network:
             label = resource.kind + ':' + resource.name
             try:
                 live = self._observe(resource, snapshot)
-                if live is None:
+                if live is None or (resource.kind == 'sysctl' and resource.identity.get('repair_pending') and
+                                    _canonical(live) != _canonical(resource.identity)):
+                    # A fenced per-interface setting on a replacement interface
+                    # is still to be applied by the repair, not a foreign change.
                     missing.append(label)
                 elif _canonical(live) == _canonical(resource.identity):
                     matching.append(label)
@@ -552,12 +550,52 @@ class Network:
             changed.append('routing_table:foreign')
         if self._allocation_conflict(snapshot):
             changed.append('allocation:foreign')
-        a = self.allocation
-        required = {'route:fallback', 'route:preferred', 'rule:vpn', 'interface:' + a.interface,
-                    'nft_table:' + a.nft_table, 'conntrack_zone:vpn', 'sysctl:route_localnet'}
+        required = {kind + ':' + name for kind, name in self._required()}
         private_pending = any(r.kind in ('private_file', 'private_directory') for r in self.receipt.resources)
         ready = self._configured_interface() and required.issubset(matching) and not missing and not changed and not private_pending
         return Health(tuple(matching), tuple(missing), tuple(changed), ready)
+
+    def _required(self):
+        a = self.allocation
+        return {('route', 'fallback'), ('route', 'preferred'), ('rule', 'vpn'), ('interface', a.interface),
+                ('nft_table', a.nft_table), ('conntrack_zone', 'vpn'), ('sysctl', 'route_localnet')}
+
+    def incomplete(self):
+        """The receipt records an initial acquisition that never finished: some
+        required resource was never recorded, so the network was never ready
+        and no socket was marked under it. A repair re-records resources in
+        place and never drops one, so its leftovers (temporary configuration
+        records, a missing interface) never look like this; repair_missing
+        handles them and keeps the safety anchors."""
+        if self.receipt is None:
+            return False
+        return not self._required().issubset({(r.kind, r.name) for r in self.receipt.resources})
+
+    def rollback_interrupted(self, *, guard_blocked):
+        """Remove exactly what an interrupted acquisition recorded, verified as in
+        disable. A reserved resource that is live but unrecorded (a death between
+        a change and its record) or a changed recorded one needs an operator."""
+        if guard_blocked is not True or self.uncertain or not self.incomplete():
+            raise NetworkError('rollback requires a blocked guard and an interrupted, unambiguous receipt')
+        a = self.allocation
+        recorded = {(r.kind, r.name) for r in self.receipt.resources}
+        snapshot = self._snapshot()
+        routes = {_canonical(r.identity['state']) for r in self.receipt.resources if r.kind == 'route'}
+        rule = next((r.identity['state'] for r in self.receipt.resources if r.kind == 'rule'), None)
+        if ((('interface', a.interface) not in recorded and
+             any(link.get('ifname') == a.interface for link in snapshot['links'])) or
+                (('nft_table', a.nft_table) not in recorded and snapshot['owned_nft'] is not None) or
+                any(_table(r.get('table', 254)) == a.routing_table and _canonical(r) not in routes
+                    for r in snapshot['routes']) or
+                any(r.get('priority') == a.priority and (rule is None or _canonical(r) != _canonical(rule))
+                    for r in snapshot['rules'])):
+            raise NetworkError('an unrecorded acquisition is live; inspect before cleanup')
+        if self.receipt.resources:
+            if self.health().changed:
+                raise NetworkError('interrupted acquisition changed; retain guard and inspect live resources')
+            if self.disable(guard_blocked=True).resources:
+                raise NetworkError('interrupted acquisition cleanup is incomplete')
+        return self.receipt
 
     def _configured_interface(self):
         a, p = self.allocation, self.profile
@@ -585,14 +623,42 @@ class Network:
         health = self.health()
         if health.ready:
             return self.receipt
+        temporary = [r for r in self.receipt.resources if r.kind in ('private_file', 'private_directory')]
+        if temporary and not health.changed:
+            # An interrupted repair left its temporary configuration; remove
+            # exactly that (verified), then repair what is still missing.
+            for kind in ('private_file', 'private_directory'):
+                for resource in [r for r in temporary if r.kind == kind]:
+                    self._remove(resource)
+            self._sweep_private(self.receipt.attempt_id)
+            health = self.health()
+            if health.ready:
+                return self.receipt
         a = self.allocation
         anchors = {'route:fallback', 'rule:vpn', 'nft_table:' + a.nft_table, 'conntrack_zone:vpn'}
         replaceable = {'route:preferred', 'interface:' + a.interface, 'sysctl:route_localnet'}
         recorded = {r.kind + ':' + r.name for r in self.receipt.resources}
+        interface = 'interface:' + a.interface
+        if (not health.changed and anchors.issubset(health.matching) and interface in health.matching and
+                not self._configured_interface()):
+            # An interrupted repair left its replacement interface only partly
+            # configured. Its recorded identity is verified live; delete it and
+            # recreate it below like any missing interface. Its records stay,
+            # so the receipt remains complete and a death here is just a missing
+            # interface again; the usual fence precedes the new birth.
+            resource = next(r for r in self.receipt.resources if r.kind + ':' + r.name == interface)
+            own.verify_resource(self.receipt, resource.kind, resource.name,
+                                self._observe(resource, self._snapshot()),
+                                boot_id=self.boot_id, attempt_id=self.receipt.attempt_id)
+            self._run('ip', 'link', 'delete', 'dev', a.interface)
+            health = self.health()
         missing = set(health.missing)
         if (health.changed or not anchors.issubset(health.matching) or
-                recorded != anchors | replaceable or not self._configured_interface() or
-                missing not in ({'route:preferred'}, replaceable)):
+                recorded != anchors | replaceable or missing not in ({'route:preferred'}, replaceable) or
+                # A kept interface must be the configured one; a missing one, even
+                # a half-configured replacement an interrupted repair recorded,
+                # is recreated and configured from the profile.
+                (missing == {'route:preferred'} and not self._configured_interface())):
             raise NetworkError('repair requires intact safety anchors and only missing tunnel resources')
         _underlay(self.profile, self._snapshot()['links'], self.runner)
         # A same-attribute route can be recreated after disappearance. Fence its

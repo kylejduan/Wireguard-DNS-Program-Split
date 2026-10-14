@@ -78,6 +78,18 @@ Start-Sleep -Seconds 60
     $stage = 'supervisor recovery'
     Invoke-Validation 'Invoke-LocalNrpt.ps1'
     Assert-True ($messages -contains 'PASS: recovered') 'supervisor creates a fresh worker after failure'
+    [IO.File]::WriteAllText($fixture, "Write-Warning 'Foreign NRPT namespace rules bypass the dispatcher: .corp.example'; Write-Output 'PASS: warned'; exit 0")
+    $stage = 'standing warning'
+    $script:messages = @()
+    Invoke-Validation 'Invoke-LocalNrpt.ps1'
+    Invoke-Validation 'Invoke-LocalNrpt.ps1'
+    $warnings = @($script:messages | Where-Object { $_ -like 'WARNING:*' })
+    Assert-True ($warnings.Count -eq 1 -and $warnings[0] -match '\.corp\.example' -and
+        @($script:messages | Where-Object { $_ -eq 'PASS: warned' }).Count -eq 2) `
+        'a standing validation warning is logged once and kept out of the pass message'
+    [IO.File]::WriteAllText($fixture, "Write-Warning 'Foreign NRPT namespace rules bypass the dispatcher: .other.example'; Write-Output 'PASS: warned'; exit 0")
+    Invoke-Validation 'Invoke-LocalNrpt.ps1'
+    Assert-True (@($script:messages | Where-Object { $_ -like 'WARNING:*' }).Count -eq 2) 'a changed warning set is logged again'
     Stop-ValidationWorker
     [IO.File]::WriteAllText($fixture, '[Console]::WriteLine(("x" * 70000))')
     $worker = [ProgramSplit.ValidationWorker]::new($path)

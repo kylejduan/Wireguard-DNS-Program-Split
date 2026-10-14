@@ -4,6 +4,7 @@
 param(
     [string] $SourceRoot = (Join-Path $env:ProgramData 'WireGuardProgramSplit'),
     [string] $DestinationRoot = (Join-Path $env:ProgramFiles 'WireGuardProgramSplit'),
+    [string] $BuildDirectory = (Join-Path $PSScriptRoot 'build'),
     [switch] $PlanOnly
 )
 $ErrorActionPreference = 'Stop'
@@ -139,6 +140,16 @@ try {
                 (Join-Path $PSScriptRoot "src\powershell\$name"))) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing migration input: $path" }
         }
+    }
+    # Relocation swaps three scripts. Anything else from another release would leave the controller running
+    # against components it does not match, so a different release is refused before anything changes.
+    $mismatches = @(Get-ProgramSplitMigrationMismatches -InstalledRoot $SourceRoot -RepositoryRoot $PSScriptRoot `
+        -BuildDirectory $BuildDirectory -ReplacedScripts $scriptNames -Executables @(
+            'controller-service.exe', 'dns-dispatcher.exe', 'dns-probe.exe', 'tunnel-host.exe', 'wfp-probe.exe'))
+    if ($mismatches.Count) {
+        throw ("Migration only relocates an installation of this release and replaces $($scriptNames -join ', '). " +
+            "These installed files differ from this repository and its build: $($mismatches -join ', '). " +
+            'Run Migrate-Installation.ps1 from the checkout that installed it, or uninstall and reinstall.')
     }
     $plan = [pscustomobject]@{ SourceRoot = $SourceRoot; DestinationRoot = $DestinationRoot
         ScriptBackup = Join-Path $DestinationRoot $backupRelative; ServicesRestarted = @($controllerName, $tunnelName) }

@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from wg_program_split.command import capture
+from wg_program_split.command import capture, stream
 
 
 class CommandTests(unittest.TestCase):
@@ -38,6 +38,24 @@ class CommandTests(unittest.TestCase):
                 code = f'import os,time; open({str(pid)!r},"w").write(str(os.getpid())); ' + ending
                 with self.assertRaises(subprocess.SubprocessError):
                     self.run_script(code, timeout=.2, maximum=128)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pid.read_text()), 0)
+
+    def test_stream_delivers_large_output_incrementally_and_reaps_on_failure(self):
+        sizes = []
+        stream([sys.executable, '-c', 'import os\nfor _ in range(64): os.write(1,b"z"*1048576)'],
+               lambda chunk: sizes.append(len(chunk)), timeout=30)
+        self.assertEqual(sum(sizes), 64 * 1048576)
+        self.assertLessEqual(max(sizes), 65536)
+        with tempfile.TemporaryDirectory() as temp:
+            pid = Path(temp) / 'pid'
+            prefix = f'import os,time; open({str(pid)!r},"w").write(str(os.getpid())); '
+            def reject(chunk):
+                raise ValueError('consumer refused')
+            for code, consume, error in ((prefix + 'time.sleep(60)', len, subprocess.SubprocessError),
+                                         (prefix + 'os.write(1,b"x"); time.sleep(60)', reject, ValueError)):
+                with self.assertRaises(error):
+                    stream([sys.executable, '-c', code], consume, timeout=.5)
                 with self.assertRaises(ProcessLookupError):
                     os.kill(int(pid.read_text()), 0)
 

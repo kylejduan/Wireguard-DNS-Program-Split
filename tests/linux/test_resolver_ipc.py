@@ -99,6 +99,360 @@ int main() {
     print('PASS native JSON preserves valid UTF-8 and surrogateescape filesystem bytes')
 
 
+# Each round binds a fresh endpoint below a staging directory and connects one
+# stream that several sender threads share, so concurrent relabels of the same
+# stale socket race each other while the directory is renamed to a standard
+# name. A send that starts and ends while the standard name is stable must be
+# denied (any other result, even a full buffer, means the guard allowed it).
+# The endpoint inode is new every round, so no earlier label can help.
+RENAME_RACE = r'''#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
+#define SENDERS 4
+static atomic_ulong sequence, denied, allowed, racing;
+static atomic_int at_final, client = -1, go, stop_request, stopped[SENDERS], done;
+static void pause_us(long us) { struct timespec t = {0, us * 1000}; nanosleep(&t, 0); }
+static void *sender(void *slot) {
+    int index = (int)(long)slot;
+    while (!atomic_load(&done)) {
+        int request = atomic_load(&stop_request);
+        if (!atomic_load(&go)) { atomic_store(&stopped[index], request); continue; }
+        unsigned long before = atomic_load(&sequence);
+        int standard = atomic_load(&at_final);
+        long result = send(atomic_load(&client), "x", 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+        int error = errno;
+        if (before != atomic_load(&sequence) || (before & 1)) { atomic_fetch_add(&racing, 1); continue; }
+        if (!standard) continue;
+        atomic_fetch_add(result < 0 && error == EACCES ? &denied : &allowed, 1);
+    }
+    return 0;
+}
+static void move(const char *from, const char *to, int destination) {
+    atomic_fetch_add(&sequence, 1);
+    if (rename(from, to)) { perror("rename"); exit(3); }
+    atomic_store(&at_final, destination);
+    atomic_fetch_add(&sequence, 1);
+}
+int main(int argc, char **argv) {
+    if (argc != 5) return 2;
+    const char *stage = argv[1], *final = argv[2], *name = argv[3];
+    long rounds = atol(argv[4]);
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s/%s", stage, name);
+    char moved[sizeof(address.sun_path)];
+    snprintf(moved, sizeof(moved), "%s/%s", final, name);
+    pthread_t threads[SENDERS];
+    for (long i = 0; i < SENDERS; i++)
+        if (pthread_create(&threads[i], 0, sender, (void *)i)) return 2;
+    for (int round = 1; round <= rounds; round++) {
+        int listener = socket(AF_UNIX, SOCK_STREAM, 0), stream = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (listener < 0 || stream < 0 || bind(listener, (struct sockaddr *)&address, sizeof(address)) ||
+            listen(listener, 1) || connect(stream, (struct sockaddr *)&address, sizeof(address))) { perror("setup"); return 3; }
+        int peer = accept(listener, 0, 0);
+        if (peer < 0) { perror("accept"); return 3; }
+        atomic_store(&client, stream);
+        atomic_store(&go, 1);
+        pause_us(20);
+        move(stage, final, 1);
+        pause_us(100);
+        atomic_store(&go, 0);
+        atomic_store(&stop_request, round);
+        for (int i = 0; i < SENDERS; i++) while (atomic_load(&stopped[i]) != round) {}
+        close(peer); close(stream); close(listener);
+        if (unlink(moved)) { perror("unlink"); return 3; }
+        move(final, stage, 0);
+    }
+    atomic_store(&done, 1);
+    for (int i = 0; i < SENDERS; i++) pthread_join(threads[i], 0);
+    printf("{\"standard_denied\":%lu,\"standard_allowed\":%lu,\"racing\":%lu,\"rounds\":%ld,\"senders\":%d}\n",
+           atomic_load(&denied), atomic_load(&allowed), atomic_load(&racing), rounds, SENDERS);
+    return 0;
+}
+'''
+
+
+# Each round several sender threads hammer one end of a fresh socketpair while
+# the other end is bound to a protected slot. A send that starts after bind()
+# returned must be denied (any other result means the guard allowed it).
+BIND_RACE = r'''#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
+#define SENDERS 4
+static atomic_ulong denied, allowed;
+static atomic_int target = -1, bound, go, stop_request, stopped[SENDERS], done;
+static void pause_us(long us) { struct timespec t = {0, us * 1000}; nanosleep(&t, 0); }
+static void *sender(void *slot) {
+    int index = (int)(long)slot;
+    while (!atomic_load(&done)) {
+        int request = atomic_load(&stop_request);
+        if (!atomic_load(&go)) { atomic_store(&stopped[index], request); continue; }
+        int after = atomic_load(&bound);
+        long result = send(atomic_load(&target), "x", 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+        int error = errno;
+        if (after) atomic_fetch_add(result < 0 && error == EACCES ? &denied : &allowed, 1);
+    }
+    return 0;
+}
+int main(int argc, char **argv) {
+    if (argc != 3) return 2;
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", argv[1]);
+    long rounds = atol(argv[2]);
+    pthread_t threads[SENDERS];
+    for (long i = 0; i < SENDERS; i++)
+        if (pthread_create(&threads[i], 0, sender, (void *)i)) return 2;
+    for (int round = 1; round <= rounds; round++) {
+        int pair[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) { perror("socketpair"); return 3; }
+        atomic_store(&target, pair[1]);
+        atomic_store(&bound, 0);
+        atomic_store(&go, 1);
+        pause_us(20);
+        if (bind(pair[0], (struct sockaddr *)&address, sizeof(address))) { perror("bind"); return 3; }
+        atomic_store(&bound, 1);
+        pause_us(50);
+        atomic_store(&go, 0);
+        atomic_store(&stop_request, round);
+        for (int i = 0; i < SENDERS; i++) while (atomic_load(&stopped[i]) != round) {}
+        close(pair[0]); close(pair[1]);
+        if (unlink(address.sun_path)) { perror("unlink"); return 3; }
+    }
+    atomic_store(&done, 1);
+    for (int i = 0; i < SENDERS; i++) pthread_join(threads[i], 0);
+    printf("{\"after_bind_denied\":%lu,\"after_bind_allowed\":%lu,\"rounds\":%ld,\"senders\":%d}\n",
+           atomic_load(&denied), atomic_load(&allowed), rounds, SENDERS);
+    return 0;
+}
+'''
+
+
+# The two interleavings that defeated pre-operation invalidation, under load.
+# two-ended: senders hammer B while A binds an ordinary path, A then sends once,
+# senders hammer A while B binds a protected slot; a send on A begun after that
+# bind returned must be denied. ordinary: senders hammer B while A binds an
+# ordinary path; afterwards one send on each end must succeed.
+BIND_SEQUENCE = r'''#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
+#define SENDERS 4
+static atomic_ulong denied, allowed;
+static atomic_int target = -1, judged, go, stop_request, stopped[SENDERS], done;
+static void pause_us(long us) { struct timespec t = {0, us * 1000}; nanosleep(&t, 0); }
+static void *sender(void *slot) {
+    int index = (int)(long)slot;
+    while (!atomic_load(&done)) {
+        int request = atomic_load(&stop_request);
+        if (!atomic_load(&go)) { atomic_store(&stopped[index], request); continue; }
+        int judge = atomic_load(&judged);
+        long result = send(atomic_load(&target), "x", 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+        int error = errno;
+        if (judge) atomic_fetch_add(result < 0 && error == EACCES ? &denied : &allowed, 1);
+    }
+    return 0;
+}
+static int request;
+static void hammer(int fd) { atomic_store(&target, fd); atomic_store(&judged, 0); atomic_store(&go, 1); pause_us(20); }
+static void quiesce(void) {
+    pause_us(50);
+    atomic_store(&go, 0);
+    atomic_store(&stop_request, ++request);
+    for (int i = 0; i < SENDERS; i++) while (atomic_load(&stopped[i]) != request) {}
+}
+static void bind_to(int fd, const char *path) {
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address))) { perror("bind"); exit(3); }
+}
+static void drain(int fd) { char buffer[4096]; while (recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT) > 0) {} }
+int main(int argc, char **argv) {
+    if (argc != 5) return 2;
+    int two_ended = !strcmp(argv[1], "two-ended");
+    const char *ordinary = argv[2], *protected_slot = argv[3];
+    long rounds = atol(argv[4]);
+    unsigned long later_sent = 0, later_refused = 0;
+    pthread_t threads[SENDERS];
+    for (long i = 0; i < SENDERS; i++)
+        if (pthread_create(&threads[i], 0, sender, (void *)i)) return 2;
+    for (long round = 0; round < rounds; round++) {
+        int pair[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) { perror("socketpair"); return 3; }
+        hammer(pair[1]);
+        bind_to(pair[0], ordinary);
+        quiesce();
+        drain(pair[0]); drain(pair[1]);
+        if (two_ended) {
+            send(pair[0], "x", 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+            hammer(pair[0]);
+            bind_to(pair[1], protected_slot);
+            atomic_store(&judged, 1);
+            quiesce();
+            unlink(protected_slot);
+        } else {
+            for (int end = 0; end < 2; end++) {
+                if (send(pair[end], "x", 1, MSG_DONTWAIT | MSG_NOSIGNAL) == 1) later_sent++;
+                else later_refused++;
+            }
+        }
+        close(pair[0]); close(pair[1]);
+        unlink(ordinary);
+    }
+    atomic_store(&done, 1);
+    for (int i = 0; i < SENDERS; i++) pthread_join(threads[i], 0);
+    printf("{\"after_protected_bind_denied\":%lu,\"after_protected_bind_allowed\":%lu,"
+           "\"later_sent\":%lu,\"later_refused\":%lu,\"rounds\":%ld}\n",
+           atomic_load(&denied), atomic_load(&allowed), later_sent, later_refused, rounds);
+    return 0;
+}
+'''
+
+
+# A stream socket is shared by two processes, as an inherited or received file
+# is: each round the connector process (unlisted) creates it, passes it to the
+# sender process and connects it to a listener on a protected slot while the
+# sender's threads hammer it. A send begun after connect() returned must be
+# denied for a selected sender. State is shared through a mapped file.
+CONNECT_RACE = r'''#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
+#define SENDERS 4
+struct shared {
+    atomic_int target, ready, go, connected, stop_request, stopped[SENDERS], done;
+    atomic_ulong denied, allowed;
+};
+static struct shared *state;
+static void pause_us(long us) { struct timespec t = {0, us * 1000}; nanosleep(&t, 0); }
+static void *sender(void *slot) {
+    int index = (int)(long)slot;
+    while (!atomic_load(&state->done)) {
+        int request = atomic_load(&state->stop_request);
+        if (!atomic_load(&state->go)) { atomic_store(&state->stopped[index], request); continue; }
+        int after = atomic_load(&state->connected);
+        long result = send(atomic_load(&state->target), "x", 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+        int error = errno;
+        if (after) atomic_fetch_add(result < 0 && error == EACCES ? &state->denied : &state->allowed, 1);
+    }
+    return 0;
+}
+/* Pathname binds advance the generation, so the senders relabel the shared
+ * socket over and over instead of once per round. */
+static char churn_path[108];
+static atomic_int churning = 1;
+static void *churn(void *unused) {
+    (void)unused;
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", churn_path);
+    while (atomic_load(&churning)) {
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0 && !bind(fd, (struct sockaddr *)&address, sizeof(address))) unlink(address.sun_path);
+        if (fd >= 0) close(fd);
+    }
+    return 0;
+}
+static int receive_fd(int channel) {
+    char byte; char control[CMSG_SPACE(sizeof(int))];
+    struct iovec io = {&byte, 1};
+    struct msghdr message = {.msg_iov = &io, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
+    if (recvmsg(channel, &message, 0) != 1) return -1;
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    if (!header) return -2;
+    int fd; memcpy(&fd, CMSG_DATA(header), sizeof(fd)); return fd;
+}
+static void send_fd(int channel, int fd) {
+    char byte = 'f'; char control[CMSG_SPACE(sizeof(int))] = {0};
+    struct iovec io = {&byte, 1};
+    struct msghdr message = {.msg_iov = &io, .msg_iovlen = 1};
+    if (fd >= 0) {
+        message.msg_control = control; message.msg_controllen = sizeof(control);
+        struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+        header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(header), &fd, sizeof(fd));
+    }
+    if (sendmsg(channel, &message, 0) != 1) { perror("sendmsg"); exit(3); }
+}
+int main(int argc, char **argv) {
+    if (argc < 4) return 2;
+    int file = open(argv[2], O_RDWR), channel = atoi(argv[3]);
+    state = mmap(0, sizeof(*state), PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+    if (file < 0 || state == MAP_FAILED) return 2;
+    if (!strcmp(argv[1], "sender")) {
+        pthread_t threads[SENDERS];
+        for (long i = 0; i < SENDERS; i++) if (pthread_create(&threads[i], 0, sender, (void *)i)) return 2;
+        for (int round = 1;; round++) {
+            int fd = receive_fd(channel);
+            if (fd < 0) break;
+            int old = atomic_exchange(&state->target, fd);
+            if (old > 0) close(old);
+            atomic_store(&state->ready, round);
+        }
+        atomic_store(&state->done, 1);
+        for (int i = 0; i < SENDERS; i++) pthread_join(threads[i], 0);
+        return 0;
+    }
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", argv[4]);
+    snprintf(churn_path, sizeof(churn_path), "%s-churn", argv[4]);
+    long rounds = atol(argv[5]);
+    pthread_t churner;
+    if (pthread_create(&churner, 0, churn, 0)) return 2;
+    for (int round = 1; round <= rounds; round++) {
+        int listener = socket(AF_UNIX, SOCK_STREAM, 0), client = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (bind(listener, (struct sockaddr *)&address, sizeof(address)) || listen(listener, 4)) { perror("listen"); return 3; }
+        atomic_store(&state->connected, 0);
+        send_fd(channel, client);
+        while (atomic_load(&state->ready) != round) {}
+        atomic_store(&state->go, 1);
+        pause_us(20);
+        if (connect(client, (struct sockaddr *)&address, sizeof(address))) { perror("connect"); return 3; }
+        atomic_store(&state->connected, 1);
+        pause_us(50);
+        atomic_store(&state->go, 0);
+        atomic_store(&state->stop_request, round);
+        for (int i = 0; i < SENDERS; i++) while (atomic_load(&state->stopped[i]) != round) {}
+        close(client); close(listener);
+        if (unlink(address.sun_path)) { perror("unlink"); return 3; }
+    }
+    atomic_store(&churning, 0);
+    pthread_join(churner, 0);
+    send_fd(channel, -1);
+    printf("{\"after_connect_denied\":%lu,\"after_connect_allowed\":%lu,\"rounds\":%ld,\"senders\":%d}\n",
+           atomic_load(&state->denied), atomic_load(&state->allowed), rounds, SENDERS);
+    return 0;
+}
+'''
+
+
 def late_standard(repo, work, included):
     """Fresh standard parent objects, without changing package-owned directories."""
     assert os.stat('/proc/self/ns/mnt').st_ino != os.stat('/proc/1/ns/mnt').st_ino
@@ -137,6 +491,34 @@ def late_standard(repo, work, included):
         fd=os.open(dynamic,os.O_RDONLY); descriptors.append(fd); dynamic.unlink()
         check(included,'mmap',fd,errno.EACCES,pass_fds=(fd,))
         check(work/'direct-python','mmap',fd,0,pass_fds=(fd,))
+        # Renaming a directory to a standard parent name relabels the SAFE streams
+        # already connected below it, although no socket was renamed.
+        for stage,final,name in ((Path('/run/dbus-stage'),Path('/run/dbus'),'system_bus_socket'),
+                                 (Path('/run/user/stage-99997'),Path('/run/user/99997'),'bus')):
+            stage.mkdir()
+            if final.parent==Path('/run/user'): os.chown(stage,99997,99997)
+            server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); sockets.append(server)
+            server.bind(str(stage/name)); server.listen(8)
+            client=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); sockets.append(client)
+            client.connect(str(stage/name)); peer,_=server.accept(); sockets.append(peer)
+            check(included,'sendfd',client.fileno(),0,pass_fds=(client.fileno(),))
+            stage.rename(final)
+            check(included,'sendfd',client.fileno(),errno.EACCES,pass_fds=(client.fileno(),))
+            check(work/'direct-python','sendfd',client.fileno(),0,pass_fds=(client.fileno(),))
+        # The rename hook runs before the move is visible; a relabel racing it
+        # must still see the destination name.
+        source=work/'rename-race.c'; source.write_text(RENAME_RACE)
+        race=work/'rename-race'; run(['cc','-O2','-std=c11','-pthread','-Wall','-Wextra','-Werror',source,'-o',race])
+        selected_race=work/'rename-race-selected'; shutil.copy2(race,selected_race)
+        control('path-add',pins,selected_race)
+        stage,final=Path('/run/systemd/resolve-stage'),Path('/run/systemd/resolve')
+        stage.mkdir()
+        races={label:json.loads(run([executable,stage,final,'io.systemd.Resolve',3000]).stdout)
+               for label,executable in (('selected',selected_race),('unlisted',race))}
+        (work/'rename-race.json').write_text(json.dumps(races,indent=2))
+        selected,unlisted=races['selected'],races['unlisted']
+        assert selected['standard_allowed']==0 and selected['standard_denied']>0,races
+        assert unlisted['standard_denied']==0 and unlisted['standard_allowed']>0,races
         (work/'late-namespace.json').write_text(json.dumps({'mount_namespace':os.stat('/proc/self/ns/mnt').st_ino,
             'late_directories':directories,'created_after_attachment':True,'custom_slots':False}))
     finally:
@@ -261,7 +643,7 @@ char LICENSE[] SEC("license")="GPL";
         snapshot=json.loads(control('snapshot',pins).stdout)
         assert snapshot['paths']==expected, 'snapshot must include policy under the same ownership lock'
         assert snapshot['abi']==4 and snapshot['ready'] is False
-        assert len(snapshot['maps'])==14 and len(snapshot['links'])==12
+        assert len(snapshot['maps'])==15 and len(snapshot['links'])==15
         assert snapshot['mask']==0x00ff0000 and snapshot['mark']==0x00010000
         foreign=pins/'unexpected'
         run(['bpftool','map','pin','id',snapshot['maps']['paths'],foreign])
@@ -359,6 +741,96 @@ char LICENSE[] SEC("license")="GPL";
         one,two=socket.socketpair(); sockets.extend((one,two)); one.bind(str(pair_path))
         check(included,'sendfd',two.fileno(),pass_fds=(two.fileno(),))
         passed('binding a previously unnamed safe socketpair invalidates both endpoint roles')
+        source=work/'bind-race.c'; source.write_text(BIND_RACE)
+        race=work/'bind-race'; run(['cc','-O2','-std=c11','-pthread','-Wall','-Wextra','-Werror',source,'-o',race])
+        selected_race=work/'bind-race-selected'; shutil.copy2(race,selected_race)
+        control('path-add',pins,selected_race)
+        race_path=work/'bind-race-slot'; add('socket',race_path)
+        races={label:json.loads(run([executable,race_path,3000]).stdout)
+               for label,executable in (('selected',selected_race),('unlisted',race))}
+        (work/'bind-race.json').write_text(json.dumps(races,indent=2))
+        assert races['selected']['after_bind_allowed']==0 and races['selected']['after_bind_denied']>0,races
+        assert races['unlisted']['after_bind_denied']==0 and races['unlisted']['after_bind_allowed']>0,races
+        control('path-del',pins,selected_race)
+        passed('concurrent senders on a socketpair never pass after its peer is bound to a protected slot')
+        source=work/'bind-sequence.c'; source.write_text(BIND_SEQUENCE)
+        sequence=work/'bind-sequence'; run(['cc','-O2','-std=c11','-pthread','-Wall','-Wextra','-Werror',source,'-o',sequence])
+        selected_sequence=work/'bind-sequence-selected'; shutil.copy2(sequence,selected_sequence)
+        control('path-add',pins,selected_sequence)
+        sequences={f'{mode}-{label}':json.loads(run([executable,mode,work/'bind-ordinary',race_path,2000]).stdout)
+                   for mode in ('two-ended','ordinary')
+                   for label,executable in (('selected',selected_sequence),('unlisted',sequence))}
+        (work/'bind-sequence.json').write_text(json.dumps(sequences,indent=2))
+        assert sequences['two-ended-selected']['after_protected_bind_allowed']==0,sequences
+        assert sequences['two-ended-selected']['after_protected_bind_denied']>0,sequences
+        assert sequences['two-ended-unlisted']['after_protected_bind_denied']==0,sequences
+        for label in ('selected','unlisted'):
+            assert sequences['ordinary-'+label]['later_refused']==0,sequences
+        control('path-del',pins,selected_sequence)
+        passed('two-ended bind never passes after the protected bind; an ordinary bind leaves the pair usable')
+        source=work/'connect-race.c'; source.write_text(CONNECT_RACE)
+        connector=work/'connect-race'; run(['cc','-O2','-std=c11','-pthread','-Wall','-Wextra','-Werror',source,'-o',connector])
+        selected_connector=work/'connect-race-selected'; shutil.copy2(connector,selected_connector)
+        control('path-add',pins,selected_connector)
+        def shared_connect(sender_executable):
+            shared=work/'connect-race.shm'; shared.write_bytes(bytes(4096)); shared.chmod(0o666)
+            ours,theirs=socket.socketpair(); sockets.extend((ours,theirs))
+            sending=subprocess.Popen([str(sender_executable),'sender',str(shared),str(theirs.fileno())],pass_fds=(theirs.fileno(),))
+            try:
+                result=run([connector,'connector',shared,ours.fileno(),race_path,3000],pass_fds=(ours.fileno(),))
+            finally:
+                if sending.wait(timeout=30): raise AssertionError('sender failed')
+            return json.loads(result.stdout)
+        connects={label:shared_connect(executable)
+                  for label,executable in (('selected',selected_connector),('unlisted',connector))}
+        (work/'connect-race.json').write_text(json.dumps(connects,indent=2))
+        assert connects['selected']['after_connect_allowed']==0 and connects['selected']['after_connect_denied']>0,connects
+        assert connects['unlisted']['after_connect_denied']==0,connects
+        control('path-del',pins,selected_connector)
+        passed('a relabel racing connect never leaves SAFE for a protected peer')
+        # A rename into a slot that fails after the rename hook (the target is a
+        # mount point) must not leave the moved socket protected.
+        failing_slot=work/'failing-slot'; add('socket',failing_slot); failing_slot.write_bytes(b'')
+        cover=work/'failing-cover'; cover.write_bytes(b'')
+        run(['mount','--bind',cover,failing_slot]); mounts.append(failing_slot)
+        movable=work/'movable.sock'; movable_server=listen(movable)
+        movable_client=connect(movable); movable_peer,_=movable_server.accept(); sockets.append(movable_peer)
+        check(included,'sendfd',movable_client.fileno(),0,pass_fds=(movable_client.fileno(),))
+        try:
+            movable.rename(failing_slot); raise AssertionError('rename onto a mount point succeeded')
+        except OSError as error:
+            assert error.errno==errno.EBUSY,error
+        # Any later invalidation relabels the stream from the listener's inode.
+        listen(work/'invalidating.sock')
+        check(included,'sendfd',movable_client.fileno(),0,pass_fds=(movable_client.fileno(),))
+        passed('a rename into a slot that fails after the hook leaves its socket unprotected')
+        # Exchanging a slot's socket with an ordinary one, in both argument
+        # orders: a failure (EBUSY after both hooks) leaves the ordinary socket
+        # unprotected; a success protects a stream to the socket now in the slot.
+        for order in ('slot-first','ordinary-first'):
+            for fails in (True,False):
+                tag=f'{order}-{"failing" if fails else "working"}'
+                slot=work/('exchange-slot-'+tag); add('socket',slot); listen(slot)
+                plain=work/('exchange-plain-'+tag); plain_server=listen(plain)
+                stream=connect(plain); peer,_=plain_server.accept(); sockets.append(peer)
+                check(included,'sendfd',stream.fileno(),0,pass_fds=(stream.fileno(),))
+                if fails:
+                    cover=work/('exchange-cover-'+tag); cover.write_bytes(b'')
+                    run(['mount','--bind',cover,slot]); mounts.append(slot)
+                first,second=(slot,plain) if order=='slot-first' else (plain,slot)
+                result=libc.renameat2(-100,os.fsencode(first),-100,os.fsencode(second),2)
+                if fails:
+                    assert result!=0 and ctypes.get_errno()==errno.EBUSY,(tag,result,ctypes.get_errno())
+                    # Immediately (the hook already advanced the generation) and
+                    # after a later invalidation.
+                    check(included,'sendfd',stream.fileno(),0,pass_fds=(stream.fileno(),))
+                    listen(work/('exchange-invalidate-'+tag))
+                    check(included,'sendfd',stream.fileno(),0,pass_fds=(stream.fileno(),))
+                else:
+                    assert result==0,(tag,ctypes.get_errno())
+                    check(included,'sendfd',stream.fileno(),pass_fds=(stream.fileno(),))
+                check(direct,'sendfd',stream.fileno(),0,pass_fds=(stream.fileno(),))
+        passed('slot exchanges in both orders: a failed one protects nothing, a successful one protects the moved socket')
         cache=work/'hosts-cache'; cache.write_bytes(b'h'*4096)
         cachefd=os.open(cache,os.O_RDONLY); descriptors.append(cachefd); add('cache',cache)
         aliases=[cache,Path('/proc/self/root')/str(cache).lstrip('/')]
@@ -471,7 +943,7 @@ char LICENSE[] SEC("license")="GPL";
         if directory_identity()!=before: failures.append('host package/runtime directories changed')
         (work/'host-directories.json').write_text(json.dumps(before,indent=2))
         if failures: raise RuntimeError('late-standard supervisor cleanup failed: '+'; '.join(failures))
-    passed('late standard nscd/Avahi/user bus directories and unlinked cache covered by ancestor rules')
+    passed('late standard nscd/Avahi/user bus directories, directory renames into standard names and unlinked cache covered by ancestor rules')
     (work/'results.json').write_text(json.dumps(results,indent=2))
     (work/'links-after.json').write_text(run(['bpftool','-j','link','show']).stdout)
 

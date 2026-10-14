@@ -2,13 +2,14 @@
 
 Per-executable WireGuard split tunneling with split DNS. Selected executables' IPv4 TCP, UDP, and ordinary DNS go through a WireGuard profile; every unlisted application keeps its payload and DNS on the normal host/router path. There is a Windows 11 implementation (WFP) and an experimental Linux implementation (BPF LSM and nftables, see [Linux include mode](#linux-include-mode)). Neither uses a userspace packet proxy or launcher.
 
-> **Experimental:** this is a source release for advanced users. It installs privileged networking components, currently supports IPv4 only, and the Windows implementation has explicit fail-open cases. Read [Limitations](docs/limitations.md) and the [Linux operating limits](docs/linux.md) before using it.
+> **Experimental:** this is a source release for advanced users. It installs privileged networking components, currently tunnels IPv4 only, and the Windows implementation still has documented fail-open cases, such as selected applications' ordinary DNS when a repair cannot restart the dispatcher. Read [Limitations](docs/limitations.md) and the [Linux operating limits](docs/linux.md) before using it.
 
 ## What is different
 
 | Traffic | Selected executable | Unlisted executable |
 |---|---|---|
 | IPv4 TCP/UDP | WireGuard tunnel | Native Windows route |
+| IPv6 (Windows) | Blocked except loopback | Native Windows route |
 | Windows DNS API | Profile DNS through WireGuard | Active physical-adapter DNS |
 | Application-owned DoH/DoT/DoQ | Application decides | Application decides |
 
@@ -57,7 +58,7 @@ See [Installation](docs/installation.md), [Architecture](docs/architecture.md), 
 - The imported profile is copied locally with locked ACLs and never printed by the scripts.
 - The physical default route remains globally preferred.
 - DNS without a process-attribution event returns `SERVFAIL`; it is not guessed onto either resolver. The one exception is a repeat of a name and type answered within the previous three seconds, which reuses that answer's route so Windows DNS Client retransmissions and TCP fallback succeed.
-- Dynamic WFP filters vanish if their host exits. The controller repairs them, but this release is not a persistent per-application kill switch.
+- Windows payload filters are persistent WFP objects. Controller or tool crashes, BFE restarts, repairs and reboots leave them in place, so selected applications cannot connect until the tunnel is back instead of leaving directly, whether or not the PIA driver has loaded. Only an explicit tray disable, `Stop-Service WireGuardProgramSplitController` and `Uninstall.ps1` remove them; `bin\wfp-probe.exe remove` recovers a broken installation.
 - Existing connections must be closed and reopened after changing the included-app list.
 
 ## Development

@@ -242,9 +242,9 @@ def vm_tests():
         native.load(values, SimpleNamespace(mask=0xffff0000, mark=0x10000)); active = True
         observed = native.snapshot()
         assert sorted(observed['paths']) == sorted(values)
-        assert observed['state'] == 'blocked' and len(observed['pins']['links']) == 12
+        assert observed['state'] == 'blocked' and len(observed['pins']['links']) == 15
         snapshot = json.loads(invoke([loader, 'snapshot', pins]).stdout)
-        assert snapshot['abi'] == 4 and len(snapshot['maps']) == 14
+        assert snapshot['abi'] == 4 and len(snapshot['maps']) == 15
         for name, width in (('paths_short', 256), ('paths', 4096)):
             info = json.loads(invoke(['bpftool', '-j', 'map', 'show', 'pinned', pins / name]).stdout)
             assert info['bytes_key'] == width and info['max_entries'] == 1024

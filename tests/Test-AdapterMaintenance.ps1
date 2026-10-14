@@ -140,6 +140,14 @@ Assert-True ($function.Count -eq 1) 'controller defines one maintenance schedule
 . ([scriptblock]::Create($function[0].Extent.Text))
 $script:elapsed = [TimeSpan]::Zero
 function Get-ControllerElapsed { $script:elapsed }
+# Test-Path remains stubbed by $script:registryPresent; the controller must probe the component's own key.
+$controllerSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Controller.ps1'))
+$maintenanceSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\AdapterMaintenance.ps1'))
+$keyPattern = [regex]::Escape("'HKLM:\SYSTEM\CurrentControlSet\Enum\ROOT\WIREGUARD'")
+Assert-True ($controllerSource -match "\`$rootAdapterKey = $keyPattern" -and
+    $maintenanceSource -match "\`$registryPath = $keyPattern") 'controller skips maintenance on the same key the component checks first'
+$rootAdapterKey = 'HKLM:\SYSTEM\CurrentControlSet\Enum\ROOT\WIREGUARD'
+$script:registryPresent = $true
 $script:calls = 0
 $script:messages = [Collections.Generic.List[string]]::new()
 function Invoke-Component { param($name,$action) $script:calls++; throw 'Mock maintenance failure' }
@@ -156,4 +164,9 @@ Assert-True ($script:calls -eq 2) 'even a maintenance logging failure does not e
 $script:elapsed = [TimeSpan]::FromMinutes(6)
 Invoke-AdapterMaintenance
 Assert-True ($script:calls -eq 3) 'maintenance resumes when the monotonic five-minute deadline passes'
+$script:registryPresent = $false
+$script:elapsed = [TimeSpan]::FromMinutes(12)
+Invoke-AdapterMaintenance
+Assert-True ($script:calls -eq 3 -and $script:nextAdapterMaintenance -eq [TimeSpan]::FromMinutes(17)) `
+    'maintenance launches no component without root WireGuard devices and still waits five minutes'
 Write-Output 'PASS: adapter maintenance preserves active/foreign devices, rechecks identity, and isolates failures.'

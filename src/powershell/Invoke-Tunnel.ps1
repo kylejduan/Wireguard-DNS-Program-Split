@@ -69,12 +69,12 @@ function Start-TunnelAfterPreflight($ServiceState) {
 }
 
 function Wait-Adapter {
-    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
     do {
         $adapter = Get-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue
         if ($adapter -and $adapter.Status -eq 'Up') { return $adapter }
         Start-Sleep -Milliseconds 250
-    } while ([DateTime]::UtcNow -lt $deadline)
+    } while ($timer.Elapsed.TotalSeconds -lt 20)
     throw 'WireGuard adapter did not become ready.'
 }
 
@@ -98,9 +98,9 @@ function Reset-PendingService([int] $SettleSeconds) {
     # timeout, and ending a young host there would make a slow tunnel unable to ever come up.
     $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
     if (-not $service) { return }
-    $deadline = [DateTime]::UtcNow.AddSeconds($SettleSeconds)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
     while (($service.Status -eq 'StartPending' -or $service.Status -eq 'StopPending') -and
-        [DateTime]::UtcNow -lt $deadline) {
+        $timer.Elapsed.TotalSeconds -lt $SettleSeconds) {
         Start-Sleep -Milliseconds 500
         $service.Refresh()
     }
@@ -116,9 +116,9 @@ function Reset-PendingService([int] $SettleSeconds) {
     Write-Output "Tunnel service stuck in $($service.Status); terminating owned host process $($process.Id)."
     $process.Kill()
     $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(10))
-    $adapterDeadline = [DateTime]::UtcNow.AddSeconds(3)
+    $adapterTimer = [Diagnostics.Stopwatch]::StartNew()
     while ((Get-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue) -and
-        [DateTime]::UtcNow -lt $adapterDeadline) { Start-Sleep -Milliseconds 500 }
+        $adapterTimer.Elapsed.TotalSeconds -lt 3) { Start-Sleep -Milliseconds 500 }
     if (Get-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue) {
         Write-Output "The $adapterName adapter is still present after the host process ended."
     }
@@ -129,14 +129,14 @@ function Wait-ServiceRunning([int] $TimeoutSeconds = 20) {
     # is merely slow is left running: the next repair attempt adopts the same pending service and
     # keeps waiting. Only a host that has outlived any plausible start is treated as stuck and reset.
     $service = Get-Service -Name $serviceName
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
     while ($true) {
         $service.Refresh()
         if ($service.Status -eq 'Running') { return }
         if ($service.Status -eq 'Stopped') {
             throw 'The tunnel service stopped while starting; check the profile and the matched runtime DLL pair.'
         }
-        if ([DateTime]::UtcNow -ge $deadline) { break }
+        if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { break }
         Start-Sleep -Milliseconds 250
     }
     $status = $service.Status
@@ -206,7 +206,9 @@ function Set-OwnedEndpointRouteState($routeState) {
     } finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
 }
 
-$endpointHost = Assert-Inputs
+# Stop needs only the ownership check below. Requiring the startup inputs here would leave a running
+# tunnel unreleasable once tunnel.dll is quarantined or the profile is edited into an invalid state.
+if ($Action -ne 'Stop') { $endpointHost = Assert-Inputs }
 if ($Action -eq 'Validate') {
     Write-Output 'PASS: tunnel host and DNS-free Table=off profile are ready.'
     exit 0
@@ -251,9 +253,14 @@ if ($Action -eq 'Stop') {
     exit 0
 }
 
-Assert-ProgramSplitNoIpv6DefaultRoute
-if (Get-DnsClientNrptPolicy -Effective | Where-Object { $_.Namespace -contains '.' }) {
-    throw 'A foreign catch-all NRPT policy is active; disconnect the other VPN first.'
+# A tunnel-only restart keeps the owned loopback rule in place; any other catch-all belongs to another VPN.
+$catchAllPolicies = @(Get-DnsClientNrptPolicy -Effective | Where-Object { $_.Namespace -contains '.' })
+if ($catchAllPolicies.Count) {
+    try {
+        Assert-ProgramSplitNrptRulesCompatible -Rules @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue) `
+            -DisplayName $configuration.NrptDisplayName -RequireOwned
+        Assert-ProgramSplitEffectiveNrptPolicy -Policies $catchAllPolicies
+    } catch { throw 'A foreign catch-all NRPT policy is active; disconnect the other VPN first.' }
 }
 
 $physical = Get-ProgramSplitPhysicalDefault -AdapterName $adapterName

@@ -23,6 +23,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -32,45 +33,21 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
+#include <algorithm>
+#include <csignal>
 #include <sstream>
+#include <thread>
 #include "../bpf/policy.bpf.h"
 
 namespace {
 namespace fs = std::filesystem;
+#include "json-string.h"
 constexpr uint32_t abi = POLICY_ABI;
 using PathKey = policy_path;
 using Configuration = policy_config;
 static_assert(sizeof(Configuration) == 40);
-struct MapSpec { const char *name; uint32_t key, value, type, entries; };
-const std::array<MapSpec,14> maps{{
-    {"paths",sizeof(PathKey),4,BPF_MAP_TYPE_HASH,1024},
-    {"paths_short",sizeof(policy_short_path),4,BPF_MAP_TYPE_HASH,1024},
-    {"policy_cfg",4,sizeof(Configuration),BPF_MAP_TYPE_ARRAY,1},
-    {"scratch",4,sizeof(path_scratch),BPF_MAP_TYPE_PERCPU_ARRAY,1},
-    {"stats",4,8,BPF_MAP_TYPE_PERCPU_ARRAY,9},
-    {"guard_slots",sizeof(guard_slot),4,BPF_MAP_TYPE_HASH,128},
-    {"guard_dirs",sizeof(object_id),4,BPF_MAP_TYPE_HASH,32},
-    {"endpoint_names",sizeof(endpoint_name),4,BPF_MAP_TYPE_HASH,128},
-    {"object_roles",4,4,BPF_MAP_TYPE_INODE_STORAGE,0},
-    {"stream_roles",4,sizeof(stream_label),BPF_MAP_TYPE_SK_STORAGE,0},
-    {"role_generation",4,8,BPF_MAP_TYPE_ARRAY,1},
-    {"guard_config",4,8,BPF_MAP_TYPE_ARRAY,1},
-    {"guard_stats",4,8,BPF_MAP_TYPE_PERCPU_ARRAY,4},
-    {"negative_roles",sizeof(negative_key),8,BPF_MAP_TYPE_LRU_HASH,65536}}};
-struct LinkSpec { const char *pin, *program, *hook; bool cgroup; };
-const std::array<LinkSpec,12> links{{
-    {"link","classify","socket_post_create",true},
-    {"link_connect","guard_connect","unix_stream_connect",false},
-    {"link_datagram","guard_datagram","unix_may_send",false},
-    {"link_pair","guard_pair","socket_socketpair",false},
-    {"link_open","guard_open","file_open",false},
-    {"link_mmap","guard_mmap","mmap_file",false},
-    {"link_read","guard_read","file_permission",false},
-    {"link_receive","guard_receive","file_receive",false},
-    {"link_send","guard_send","socket_sendmsg",false},
-    {"link_recv","guard_recv","socket_recvmsg",false},
-    {"link_rename","guard_rename","inode_rename",false},
-    {"link_bind","guard_bind","socket_bind",false}}};
+#include "pin-set.h"
 struct Fd {
     int value;
     explicit Fd(int fd) : value(fd) {
@@ -208,6 +185,13 @@ void initialize_paths(bpf_object *object, const std::vector<PathKey> &keys) {
         check(bpf_map_update_elem(fd,&key,&selected,BPF_NOEXIST)==0,"initialize path");
     }
 }
+/* Earlier builds pinned 128-entry guard_slots and endpoint_names maps; the
+ * layout and programs are otherwise identical. Accepting that capacity lets a
+ * newer loader manage a guard lifetime loaded before an upgrade without
+ * unloading it. Every new load creates the current capacity. */
+bool legacy_capacity(const std::string &name, uint32_t entries) {
+    return entries == 128 && (name == "guard_slots" || name == "endpoint_names");
+}
 int map_fd(const fs::path &dir, const char *name, uint32_t key_size,
            uint32_t value_size, uint32_t type, uint32_t entries) {
     int fd = bpf_obj_get((dir / name).c_str());
@@ -215,7 +199,8 @@ int map_fd(const fs::path &dir, const char *name, uint32_t key_size,
     bpf_map_info info{};
     uint32_t length = sizeof(info);
     if (bpf_obj_get_info_by_fd(fd, &info, &length) || info.key_size != key_size ||
-        info.value_size != value_size || info.type != type || info.max_entries != entries ||
+        info.value_size != value_size || info.type != type ||
+        (info.max_entries != entries && !legacy_capacity(name, info.max_entries)) ||
         std::string(info.name) != name) {
         close(fd);
         fail("pinned map ABI mismatch: " + std::string(name));
@@ -231,14 +216,14 @@ Configuration configuration(const fs::path &dir) {
     return cfg;
 }
 // Kernel function type IDs are immutable for this process's boot. Keep only
-// these twelve integers; release the large parsed BTF after resolving them.
+// these integers; release the large parsed BTF after resolving them.
 const std::array<int, links.size()> &hook_types() {
     static const auto ids=[] {
         std::unique_ptr<btf,decltype(&btf__free)> types(btf__load_vmlinux_btf(),btf__free);
         if (!types) fail("kernel BTF unavailable");
         std::array<int, links.size()> result{};
         for (size_t i=0;i<links.size();++i) {
-            auto hook=std::string("bpf_lsm_")+links[i].hook;
+            auto hook=(links[i].kind==LINK_FEXIT ? std::string() : std::string("bpf_lsm_"))+links[i].hook;
             result[i]=btf__find_by_name_kind(types.get(),hook.c_str(),BTF_KIND_FUNC);
             if (result[i]<=0) fail("kernel hook type unavailable");
         }
@@ -246,34 +231,58 @@ const std::array<int, links.size()> &hook_types() {
     }();
     return ids;
 }
-void verify_owner(const fs::path &dir) {
+/* What an interrupted load left pinned: the classifier program IDs it attached
+ * and how many links (a prefix of the pin order) and maps it pinned. */
+struct Generation { std::set<uint32_t> classifiers; size_t links=0; bool maps=false; };
+/* Verify a pin directory against this loader's exact map and link set. A
+ * partial directory is an interrupted load: maps are pinned before links and
+ * both in array order, so it may lack only trailing pins, and its cgroup link
+ * must belong to CGROUP_ID. Anything else is not this loader's and is refused. */
+Generation inspect_generation(const fs::path &dir, bool partial = false, uint64_t cgroup_id = 0) {
     std::set<std::string> expected;
     for (const auto &spec:maps) expected.insert(spec.name);
     for (const auto &spec:links) expected.insert(spec.pin);
     for (const auto &entry:fs::directory_iterator(dir))
         if (!expected.count(entry.path().filename())) fail("unknown pin-directory entry");
-    (void)configuration(dir);
+    if (!partial) (void)configuration(dir);
+    Generation result;
     std::set<uint32_t> owned, used;
+    size_t pinned=0, legacy_maps=0, missing_added=0;
     for (const auto &spec:maps) {
+        if ((partial || spec.added) && !fs::exists(dir/spec.name)) { missing_added+=spec.added; continue; }
         Fd fd(map_fd(dir,spec.name,spec.key,spec.value,spec.type,spec.entries));
         bpf_map_info info{}; uint32_t size=sizeof(info);
         check(bpf_obj_get_info_by_fd(fd.value,&info,&size)==0,"read owned map");
-        owned.insert(info.id);
+        owned.insert(info.id); ++pinned;
+        legacy_maps+=info.max_entries!=spec.entries; // Only the two guard maps may differ.
     }
+    result.maps=pinned==maps.size();
     const auto &targets=hook_types();
+    /* The earlier build is told apart by its 128-entry guard maps, which no
+     * current load creates, never by missing pins: only it may lack the added
+     * links, and then all of them. Every other directory needs every link. */
+    if (legacy_maps && legacy_maps!=2) fail("pinned guard map capacities disagree");
+    bool legacy=!partial && legacy_maps==2 && missing_added;
+    for (const auto &spec:links) if (legacy && spec.added && fs::exists(dir/spec.pin)) legacy=false;
+    if (!partial && missing_added && !legacy) fail("pinned map set is incomplete");
     for (size_t i=0;i<links.size();++i) {
         const auto &spec=links[i];
+        if ((partial || (legacy && spec.added)) && !fs::exists(dir/spec.pin)) continue;
+        if (partial && (result.links!=i || !result.maps)) fail("interrupted pin directory is not a prefix of the pin order");
         Fd link(bpf_obj_get((dir/spec.pin).c_str()));
         bpf_link_info info{}; uint32_t size=sizeof(info);
         check(bpf_obj_get_info_by_fd(link.value,&info,&size)==0,"read owned link");
         int target=targets[i];
-        if (spec.cgroup ? (info.type!=BPF_LINK_TYPE_CGROUP || info.cgroup.attach_type!=BPF_LSM_CGROUP) :
-            (info.type!=BPF_LINK_TYPE_TRACING || info.tracing.attach_type!=BPF_LSM_MAC ||
+        if (spec.kind==LINK_CGROUP ? (info.type!=BPF_LINK_TYPE_CGROUP || info.cgroup.attach_type!=BPF_LSM_CGROUP ||
+                                      (partial && info.cgroup.cgroup_id!=cgroup_id)) :
+            (info.type!=BPF_LINK_TYPE_TRACING ||
+             info.tracing.attach_type!=(spec.kind==LINK_FEXIT ? BPF_TRACE_FEXIT : BPF_LSM_MAC) ||
              info.tracing.target_btf_id!=static_cast<uint32_t>(target))) fail("link attachment identity mismatch");
         Fd prog(bpf_prog_get_fd_by_id(info.prog_id));
         bpf_prog_info program{}; size=sizeof(program);
         check(bpf_obj_get_info_by_fd(prog.value,&program,&size)==0,"read program");
-        if (program.type!=BPF_PROG_TYPE_LSM || std::string(program.name)!=spec.program ||
+        if (program.type!=(spec.kind==LINK_FEXIT ? BPF_PROG_TYPE_TRACING : BPF_PROG_TYPE_LSM) ||
+            std::string(program.name)!=spec.program ||
             program.attach_btf_id!=static_cast<uint32_t>(target)) fail("program hook identity mismatch");
         std::vector<uint32_t> ids(program.nr_map_ids);
         program={}; program.nr_map_ids=ids.size(); program.map_ids=reinterpret_cast<uint64_t>(ids.data());
@@ -282,13 +291,17 @@ void verify_owner(const fs::path &dir) {
             if (!owned.count(id)) fail("linked program references an unowned map");
             used.insert(id);
         }
+        if (spec.kind==LINK_CGROUP) result.classifiers.insert(info.prog_id);
+        ++result.links;
     }
-    if (owned!=used) fail("pinned map is not used by the owned link set");
+    if (!partial && owned!=used) fail("pinned map is not used by the owned link set");
+    return result;
 }
+void verify_owner(const fs::path &dir) { (void)inspect_generation(dir); }
 /* Walk the cgroup tree with plain readdir so that a cgroup removed during the
  * walk (systemd scopes churn constantly, most of all during early boot) is
  * skipped rather than aborting the load. Every other error remains fatal. */
-void reject_competitors(const fs::path &group) {
+void reject_competitors(const fs::path &group, const std::set<uint32_t> &interrupted) {
     int raw = open(group.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (raw < 0 && errno == ENOENT) return;
     Fd fd(raw);
@@ -296,7 +309,17 @@ void reject_competitors(const fs::path &group) {
     int rc = bpf_prog_query(fd.value, BPF_LSM_CGROUP, BPF_F_QUERY_EFFECTIVE,
                             nullptr, nullptr, &count);
     if (rc && errno != ENOSPC) fail("cannot query effective cgroup LSM attachments: " + std::string(strerror(errno)));
-    if (count) fail("competing cgroup LSM attachments can override denial: " + group.string());
+    if (count) {
+        /* Only the verified classifiers of an interrupted load of this pin
+         * directory are tolerated; they stay attached only until replaced. */
+        std::vector<uint32_t> ids(count + 1);
+        uint32_t listed = ids.size();
+        if (interrupted.empty() || bpf_prog_query(fd.value, BPF_LSM_CGROUP, BPF_F_QUERY_EFFECTIVE,
+                                                  nullptr, ids.data(), &listed) || listed > count)
+            fail("competing cgroup LSM attachments can override denial: " + group.string());
+        for (uint32_t i = 0; i < listed; i++)
+            if (!interrupted.count(ids[i])) fail("competing cgroup LSM attachments can override denial: " + group.string());
+    }
     DIR *listing = opendir(group.c_str());
     if (!listing) {
         if (errno == ENOENT) return;
@@ -312,7 +335,7 @@ void reject_competitors(const fs::path &group) {
         children.push_back(name);
     }
     closedir(listing);
-    for (const auto &child : children) reject_competitors(group / child);
+    for (const auto &child : children) reject_competitors(group / child, interrupted);
 }
 /* The kernel compares superblock device numbers (i_sb->s_dev). stat() reports
  * them for most filesystems, but btrfs reports a per-subvolume anonymous device
@@ -517,19 +540,120 @@ void verify_context(const fs::path &dir, const fs::path &group) {
     fail("classification context could not be verified against concurrent socket creation");
 }
 /* Remove a staging pin directory and everything this loader could have pinned
- * there; unpinning the last reference to a link detaches its program. Only a
- * leftover foreign entry keeps the directory, which is then reported. */
+ * there; unpinning the last reference to a link detaches its program. Reverse
+ * pin order keeps an interrupted removal a valid prefix for the next load.
+ * Only a leftover foreign entry keeps the directory, which is then reported. */
 void discard_staging(const fs::path &staging) {
     std::error_code ec;
     if (!fs::exists(staging, ec)) return;
-    for (const auto &spec:links) fs::remove(staging/spec.pin, ec);
-    for (const auto &spec:maps) fs::remove(staging/spec.name, ec);
+    for (auto spec=links.rbegin(); spec!=links.rend(); ++spec) fs::remove(staging/spec->pin, ec);
+    for (auto spec=maps.rbegin(); spec!=maps.rend(); ++spec) fs::remove(staging/spec->name, ec);
     if (!fs::remove(staging, ec)) fail("stale staging pin directory could not be removed: " + staging.string());
 }
+#ifdef WGPS_LOADER_TEST_HOOKS
+/* Test builds only: a deterministic death or failure at a named load step. */
+void interruption_point(const std::string &point) {
+    const char *target = getenv("WGPS_TEST_KILL_AT");
+    if (target && point == target) raise(SIGKILL);
+    target = getenv("WGPS_TEST_FAIL_AT");
+    if (target && point == target) fail("injected failure at " + point);
+}
+void scan_delay() { // A slow task scan: each read of the iterator takes this long.
+    if (const char *delay = getenv("WGPS_TEST_SCAN_DELAY_MS")) usleep(1000 * std::stoul(delay));
+}
+#else
+void interruption_point(const std::string &) {}
+void scan_delay() {}
+#endif
+std::set<std::string> policy_entries(const fs::path &dir);
+struct Interrupted { fs::path path; Generation generation; };
+/* A load killed after pinning into staging leaves that generation attached,
+ * blocking its selected executables. Give it the replacement's blocked
+ * configuration: one killed before a valid configuration was written would
+ * refuse every socket, including this loader's context probe, while a valid
+ * one is already blocked and differs at most in marks that blocked state does
+ * not apply. Its links stay attached until the replacement is published. */
+void hold_interrupted(const Interrupted &stale, const Configuration &cfg) {
+    if (!stale.generation.maps) return; // No links: it attaches nothing.
+    Fd fd(map_fd(stale.path, "policy_cfg", 4, sizeof(Configuration), BPF_MAP_TYPE_ARRAY, 1));
+    uint32_t zero = 0;
+    check(bpf_map_update_elem(fd.value, &zero, &cfg, BPF_ANY) == 0, "hold interrupted generation blocked");
+}
+/* With both staging names held, free the one whose protection the other
+ * already provides: no links at all, or a link prefix and policy that the other
+ * covers. Otherwise both stay attached and the load is refused. */
+size_t covered_generation(const std::vector<Interrupted> &stale) {
+    for (size_t i=0;i<2;++i) {
+        const auto &a=stale[i].generation, &b=stale[1-i].generation;
+        if (!a.links) return i;
+        if (a.links<=b.links && b.maps) {
+            auto mine=policy_entries(stale[i].path), theirs=policy_entries(stale[1-i].path);
+            if (std::includes(theirs.begin(),theirs.end(),mine.begin(),mine.end())) return i;
+        }
+    }
+    fail("two interrupted guard loads with different policies remain attached; reboot or remove them");
+}
+/* Exact map and link identities, in the snapshot's "maps" and "links" form. */
+std::string identities_json(const fs::path &dir) {
+    std::ostringstream out;
+    out<<"\"maps\":{";
+    bool comma=false;
+    for (const auto &spec:maps) {
+        if (!fs::exists(dir/spec.name)) continue; // A verified legacy generation.
+        Fd fd(bpf_obj_get((dir/spec.name).c_str())); bpf_map_info info{}; uint32_t size=sizeof(info);
+        check(bpf_obj_get_info_by_fd(fd.value,&info,&size)==0,"read map identity");
+        if (comma) out<<',';
+        comma=true; out<<json_string(spec.name)<<':'<<info.id;
+    }
+    out<<"},\"links\":{"; comma=false;
+    for (const auto &spec:links) {
+        if (!fs::exists(dir/spec.pin)) continue; // A verified legacy generation.
+        Fd fd(bpf_obj_get((dir/spec.pin).c_str())); bpf_link_info info{}; uint32_t size=sizeof(info);
+        check(bpf_obj_get_info_by_fd(fd.value,&info,&size)==0,"read link identity");
+        if (comma) out<<',';
+        comma=true; out<<json_string(spec.pin)<<":{\"id\":"<<info.id<<",\"program_id\":"<<info.prog_id;
+        if (spec.kind==LINK_CGROUP) out<<",\"cgroup_id\":"<<info.cgroup.cgroup_id;
+        out<<'}';
+    }
+    out<<'}';
+    return out.str();
+}
+/* Before publication, durably record the exact identities being published.
+ * A caller whose load was killed after the rename can then prove the
+ * published directory is this load's and complete it instead of refusing it. */
+void write_birth_record(const fs::path &record, const fs::path &staging) {
+    auto text="{"+identities_json(staging)+"}\n";
+    Fd fd(open(record.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600));
+    check(fchmod(fd.value,0600)==0,"protect birth record");
+    check(write(fd.value,text.data(),text.size())==static_cast<ssize_t>(text.size()) && fsync(fd.value)==0,"write birth record");
+    Fd parent(open(record.parent_path().c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC));
+    check(fsync(parent.value)==0,"persist birth record");
+}
+/* Complete a load killed after publication: the published generation protects,
+ * so verified interrupted generations of the same cgroup are detached. */
+void settle(const fs::path &dir, const fs::path &group) {
+    auto group_id=stat_path(group).st_ino;
+    Fd link(bpf_obj_get((dir/"link").c_str()));
+    bpf_link_info info{}; uint32_t size=sizeof(info);
+    check(bpf_obj_get_info_by_fd(link.value,&info,&size)==0,"read published classifier link");
+    if (info.cgroup.cgroup_id!=group_id) fail("published classifier is attached to another cgroup");
+    size_t removed=0;
+    for (const char *suffix:{"_new","_next"}) {
+        fs::path name=dir; name+=suffix;
+        if (!fs::exists(name)) continue;
+        (void)inspect_generation(name,true,group_id);
+        discard_staging(name); ++removed;
+    }
+    std::cout<<"settled="<<removed<<'\n';
+}
+#include "pin-removal.h"
+#include "drain.h"
 void load(int argc, char **argv) {
     if (argc < 7) fail("load OBJECT PIN_DIR CGROUP MASK MARK [PATH...]");
     bool bulk = std::string(argv[1]) == "load-policy-stdin";
-    if ((bulk && argc != 7) || argc > 7+1024) fail("invalid policy arguments/count");
+    if ((bulk && argc != 7 && argc != 8) || argc > 7+1024) fail("invalid policy arguments/count");
+    /* load-policy-stdin takes an optional birth record path instead of paths. */
+    fs::path record = bulk && argc == 8 ? fs::absolute(argv[7]) : fs::path();
     std::vector<PathKey> keys;
     if (bulk) keys = read_policy_stdin(std::cin);
     else for (int i=7; i<argc; i++) keys.push_back(path_key(argv[i],std::string(argv[1])=="load"));
@@ -539,7 +663,19 @@ void load(int argc, char **argv) {
           "PIN_DIR parent must be bpffs");
     check(statfs(group.c_str(), &cgfs) == 0 && cgfs.f_type == CGROUP2_SUPER_MAGIC,
           "CGROUP must be cgroup v2");
-    reject_competitors(group);
+    /* bpffs reserves names containing a dot, so the staging suffixes have none.
+     * A load killed before publishing leaves its staging directory attached; a
+     * second staging name lets the replacement attach before it is removed. */
+    std::array<fs::path,2> names{dir, dir};
+    names[0] += "_new"; names[1] += "_next";
+    std::vector<Interrupted> stale;
+    std::set<uint32_t> interrupted;
+    for (const auto &name:names) {
+        if (!fs::exists(name)) continue;
+        stale.push_back({name, inspect_generation(name, true, stat_path(group).st_ino)});
+        interrupted.insert(stale.back().generation.classifiers.begin(), stale.back().generation.classifiers.end());
+    }
+    reject_competitors(group, interrupted);
     auto root = stat_path("/");
     Configuration cfg{abi, 0, number(argv[5]), number(argv[6]),
         kernel_device("/", root),
@@ -547,6 +683,13 @@ void load(int argc, char **argv) {
         static_cast<uint32_t>(stat_path("/proc/self/ns/user").st_ino)};
     if (!cfg.mask || !cfg.mark || (cfg.mark & ~cfg.mask)) fail("MARK must be nonzero and contained in MASK");
     if (fs::exists(dir)) fail("pin directory already exists; existing pins are never adopted");
+    for (const auto &item:stale) hold_interrupted(item, cfg);
+    if (stale.size() == names.size()) {
+        auto covered = covered_generation(stale);
+        discard_staging(stale[covered].path);
+        stale.erase(stale.begin() + covered);
+    }
+    fs::path staging = stale.empty() || stale[0].path != names[0] ? names[0] : names[1];
     /* libbpf owns the verifier log buffer: it retries with a larger buffer on
      * ENOSPC and prints the log on failure, so a chattier verifier cannot turn
      * a valid load into a spurious rejection. */
@@ -556,6 +699,7 @@ void load(int argc, char **argv) {
     std::set<std::string> expected_maps, expected_programs, found_maps, found_programs;
     for (const auto &spec:maps) expected_maps.insert(spec.name);
     for (const auto &spec:links) expected_programs.insert(spec.program);
+    expected_programs.insert("drain_tasks"); // Loaded, never linked or pinned.
     bpf_map *map;
     bpf_object__for_each_map(map, object.get()) found_maps.insert(bpf_map__name(map));
     bpf_program *program;
@@ -571,33 +715,41 @@ void load(int argc, char **argv) {
     seed_guards(object.get(),cfg.netns);
     /* Pin into a staging directory and publish it with one rename, so a load
      * killed midway (for example by the caller's timeout) never leaves a
-     * half-populated directory under the owned name. Stale staging from such
-     * a death is replaced here; its links keep protecting until then. */
-    /* bpffs reserves names containing a dot, so the staging suffix has none. */
-    fs::path staging = dir;
-    staging += "_new";
-    discard_staging(staging);
+     * half-populated directory under the owned name. */
     check(mkdir(staging.c_str(), 0700) == 0, "create exclusive staging pin directory");
     try {
         for (const auto &spec:maps)
             check(bpf_map__pin(bpf_object__find_map_by_name(object.get(),spec.name),(staging/spec.name).c_str())==0,"pin map");
+        interruption_point("maps");
         Fd cg(open(group.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC));
         for (const auto &spec:links) {
             auto *target=bpf_object__find_program_by_name(object.get(),spec.program);
             if (!target) fail("program missing from object: "+std::string(spec.program));
             std::unique_ptr<bpf_link,decltype(&bpf_link__destroy)> link(
-                spec.cgroup ? bpf_program__attach_cgroup(target,cg.value) : bpf_program__attach_lsm(target),
+                spec.kind==LINK_CGROUP ? bpf_program__attach_cgroup(target,cg.value) : spec.kind==LINK_FEXIT ?
+                bpf_program__attach_trace(target) : bpf_program__attach_lsm(target),
                 bpf_link__destroy);
             if (!link) fail("attach failed: "+std::string(spec.hook)+": "+strerror(errno));
             check(bpf_link__pin(link.get(),(staging/spec.pin).c_str())==0,"pin link");
+            interruption_point(spec.pin);
         }
         verify_owner(staging);
         verify_context(staging, group);
+        if (auto outcome = drain(object.get(), staging); outcome != Drain::Settled)
+            std::cerr << "guard not settled yet (" << (outcome == Drain::Deadline ? "drain deadline reached" : "a task stays unproven")
+                      << "): a unix_bind or vfs_rename call may predate it; deciding per call\n";
+        interruption_point("verified");
+        if (!record.empty()) write_birth_record(record, staging);
         check(rename(staging.c_str(), dir.c_str()) == 0, "publish pin directory");
     } catch (...) {
+        /* Only this attempt is removed; an interrupted generation keeps
+         * protecting until a later load publishes its replacement. */
         discard_staging(staging);
         throw;
     }
+    interruption_point("published");
+    /* The published generation now protects; detach what it replaced. */
+    for (const auto &item:stale) discard_staging(item.path);
     std::cout << "abi=" << abi << " state=blocked links=pinned resolver_guards=active restart_audit=required\n";
 }
 void status(const fs::path &dir) {
@@ -625,28 +777,6 @@ void status(const fs::path &dir) {
         std::cout<<guard_names[i]<<'='<<sum<<'\n';
     }
     std::cout<<"resolver_guards=active restart_audit=required unknown_pre_guard_streams=labelled_by_peer_on_first_use\n";
-}
-std::string json_string(const std::string &text) {
-    std::string output="\"";
-    for (size_t i=0;i<text.size();i++) {
-        unsigned char ch=text[i];
-        if (ch=='"' || ch=='\\') { output+='\\'; output+=ch; }
-        else if (ch<32) { output+="\\u00"; output+="0123456789abcdef"[ch>>4]; output+="0123456789abcdef"[ch&15]; }
-        else if (ch<128) output+=ch;
-        else {
-            size_t length=ch>=0xc2 && ch<=0xdf ? 2 : ch>=0xe0 && ch<=0xef ? 3 : ch>=0xf0 && ch<=0xf4 ? 4 : 0;
-            bool valid=length && i+length<=text.size();
-            for (size_t n=1;valid && n<length;n++) valid=(static_cast<unsigned char>(text[i+n])&0xc0)==0x80;
-            if (valid) {
-                unsigned char second=text[i+1];
-                valid=!((ch==0xe0 && second<0xa0) || (ch==0xed && second>=0xa0) ||
-                        (ch==0xf0 && second<0x90) || (ch==0xf4 && second>=0x90));
-            }
-            if (valid) { output.append(text,i,length); i+=length-1; }
-            else { output+="\\udc"; output+="0123456789abcdef"[ch>>4]; output+="0123456789abcdef"[ch&15]; }
-        }
-    }
-    return output+'"';
 }
 std::set<std::string> policy_entries(const fs::path &dir) {
     std::set<std::string> entries;
@@ -690,28 +820,23 @@ void policy_json(const fs::path &dir) {
     for (const auto &entry:entries) { if (comma) std::cout<<','; comma=true; std::cout<<json_string(entry); }
     std::cout<<']';
 }
+/* The earlier (128-entry) generation's programs never gate on settling. */
+bool settled(const fs::path &dir) {
+    Fd slots(bpf_obj_get((dir/"guard_slots").c_str()));
+    bpf_map_info info{}; uint32_t size=sizeof(info);
+    check(bpf_obj_get_info_by_fd(slots.value,&info,&size)==0,"read guard slot capacity");
+    Fd config(map_fd(dir,"guard_config",4,8,BPF_MAP_TYPE_ARRAY,1));
+    uint32_t zero=0; uint64_t epoch=0;
+    check(bpf_map_lookup_elem(config.value,&zero,&epoch)==0,"read guard configuration");
+    return info.max_entries==128 || (epoch&GUARD_SETTLED);
+}
 void snapshot_json(const fs::path &dir) {
     auto cfg=configuration(dir);
     std::cout<<"{\"abi\":"<<cfg.version<<",\"ready\":"<<(cfg.ready?"true":"false")
         <<",\"mask\":"<<cfg.mask<<",\"mark\":"<<cfg.mark<<",\"root_dev\":"<<cfg.root_dev
-        <<",\"root_ino\":"<<cfg.root_ino<<",\"netns\":"<<cfg.netns<<",\"userns\":"<<cfg.userns<<",\"maps\":{";
-    bool comma=false;
-    for (const auto &spec:maps) {
-        Fd fd(bpf_obj_get((dir/spec.name).c_str())); bpf_map_info info{}; uint32_t size=sizeof(info);
-        check(bpf_obj_get_info_by_fd(fd.value,&info,&size)==0,"read map identity");
-        if (comma) std::cout<<',';
-        comma=true; std::cout<<json_string(spec.name)<<':'<<info.id;
-    }
-    std::cout<<"},\"links\":{"; comma=false;
-    for (const auto &spec:links) {
-        Fd fd(bpf_obj_get((dir/spec.pin).c_str())); bpf_link_info info{}; uint32_t size=sizeof(info);
-        check(bpf_obj_get_info_by_fd(fd.value,&info,&size)==0,"read link identity");
-        if (comma) std::cout<<',';
-        comma=true; std::cout<<json_string(spec.pin)<<":{\"id\":"<<info.id<<",\"program_id\":"<<info.prog_id;
-        if (spec.cgroup) std::cout<<",\"cgroup_id\":"<<info.cgroup.cgroup_id;
-        std::cout<<'}';
-    }
-    std::cout<<"},\"paths\":";
+        <<",\"root_ino\":"<<cfg.root_ino<<",\"netns\":"<<cfg.netns<<",\"userns\":"<<cfg.userns
+        <<",\"settled\":"<<(settled(dir)?"true":"false")<<','<<identities_json(dir);
+    std::cout<<",\"paths\":";
     policy_json(dir); // Same shared ownership lock as configuration and IDs.
     std::cout<<"}\n";
 }
@@ -788,11 +913,21 @@ int main(int argc, char **argv) {
             else snapshot_json(argv[2]);
             return 0;
         }
-        if (argc < 3) fail("commands: capabilities | load | load-policy | load-policy-stdin | path-add | path-add-policy | path-del | guard-slot | state | status | policy | snapshot | probe-dns | remove");
+        if (argc < 3) fail("commands: capabilities | load | load-policy | load-policy-stdin | settle | path-add | path-add-policy | path-del | guard-slot | state | status | policy | snapshot | probe-dns | remove");
         require_mutation_host();
         std::string command = argv[1];
         if (command == "load" || command == "load-policy" || command == "load-policy-stdin") { load(argc, argv); return 0; }
         fs::path dir = argv[2];
+        if (command=="discard" && argc==3) { discard(dir); return 0; }
+        if (command=="drain-report" && argc==3) { // OBJECT: outermost frames of one scan.
+            std::unique_ptr<bpf_object, decltype(&bpf_object__close)> object(bpf_object__open_file(argv[2], nullptr), bpf_object__close);
+            if (!object) fail("open BPF object failed");
+            bpf_program *program;
+            bpf_object__for_each_program(program, object.get())
+                bpf_program__set_autoload(program, std::string(bpf_program__name(program))=="drain_tasks");
+            check(bpf_object__load(object.get())==0, "load task stack iterator");
+            drain_report(object.get()); return 0;
+        }
         Fd owner_lock(open(dir.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC));
         check(flock(owner_lock.value,LOCK_EX)==0,"lock owned pin directory for mutation");
         verify_owner(dir);
@@ -801,6 +936,16 @@ int main(int argc, char **argv) {
             bool adding = command != "path-del";
             auto key = path_key(argv[3], command == "path-add");
             change_path(dir,key,adding,command);
+        } else if (command=="drain" && argc==4) {
+            /* Retry settling a published guard: only the iterator is loaded. */
+            std::unique_ptr<bpf_object, decltype(&bpf_object__close)> object(
+                bpf_object__open_file(argv[3], nullptr), bpf_object__close);
+            if (!object) fail("open BPF object failed");
+            bpf_program *program;
+            bpf_object__for_each_program(program, object.get())
+                bpf_program__set_autoload(program, std::string(bpf_program__name(program))=="drain_tasks");
+            check(bpf_object__load(object.get())==0, "load task stack iterator");
+            std::cout<<"settled="<<(drain(object.get(),dir)==Drain::Settled)<<'\n';
         } else if (command=="guard-slot" && argc==5) {
             auto cfg=configuration(dir);
             if (cfg.ready) fail("guard configuration changes require blocked state");
@@ -833,10 +978,10 @@ int main(int argc, char **argv) {
             Fd fd(map_fd(dir, "policy_cfg", 4, sizeof(Configuration), BPF_MAP_TYPE_ARRAY, 1));
             uint32_t zero = 0;
             check(bpf_map_update_elem(fd.value, &zero, &cfg, BPF_ANY) == 0, "update state");
+        } else if (command == "settle" && argc == 4) {
+            settle(dir, fs::canonical(argv[3]));
         } else if (command == "remove" && argc == 3) {
-            for (const auto &spec:links) check(unlink((dir/spec.pin).c_str())==0,"remove owned link");
-            for (const auto &spec:maps) check(unlink((dir/spec.name).c_str())==0,"remove owned map");
-            check(rmdir(dir.c_str()) == 0, "remove owned pin directory");
+            remove_pins(dir);
         } else fail("invalid command or argument count");
         return 0;
     } catch (const std::exception &error) {

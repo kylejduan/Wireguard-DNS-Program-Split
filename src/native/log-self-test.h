@@ -44,6 +44,22 @@ inline bool logSelfTest() {
         }
         Sleep(150);
     }
+    {
+        // A descendant holding an inherited write end must not keep shutdown waiting,
+        // and output already written is still drained.
+        BoundedLog log(directory / L"held.log", 512);
+        auto pipe = std::make_unique<LogPipe>(log);
+        HANDLE held{};
+        if (!pipe->writer() || !DuplicateHandle(GetCurrentProcess(), pipe->writer(), GetCurrentProcess(),
+                                                &held, 0, FALSE, DUPLICATE_SAME_ACCESS)) return false;
+        DWORD written{};
+        const bool wrote = WriteFile(held, "held\n", 5, &written, nullptr);
+        const ULONGLONG started = GetTickCount64();
+        pipe.reset();
+        const ULONGLONG elapsed = GetTickCount64() - started;
+        CloseHandle(held);
+        if (!wrote || elapsed > 2000 || std::filesystem::file_size(directory / L"held.log") != 5) return false;
+    }
     for (const auto& file : std::filesystem::directory_iterator(directory)) {
         if (file.file_size() > 512) return false;
     }

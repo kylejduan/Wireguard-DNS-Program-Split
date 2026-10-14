@@ -9,21 +9,34 @@ ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'}
 
 
 def capture(argv, *, input=None, timeout=30, maximum=32 * 1024 * 1024, stderr_maximum=1024 * 1024):
-    """Reject excessive/incomplete output while reading, not after buffering it.
+    """Reject excessive/incomplete output while reading, not after buffering it."""
+    output = bytearray()
+
+    def collect(chunk):
+        if len(output) + len(chunk) > maximum:
+            raise subprocess.SubprocessError('native output exceeded its limit')
+        output.extend(chunk)
+    stream(argv, collect, input=input, timeout=timeout, stderr_maximum=stderr_maximum)
+    return output.decode('utf-8')
+
+
+def stream(argv, consume, *, input=None, timeout=30, stderr_maximum=1024 * 1024):
+    """Pass standard output to consume() chunk by chunk under one overall deadline.
 
     Callers supply fixed tools that do not launch descendants. Multiplex input
     and both outputs so a large policy or error stream cannot deadlock a pipe.
+    On a timeout, limit or consumer error the process is killed and reaped.
     """
     payload = memoryview(input or b'')
     with subprocess.Popen(argv, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, env=ENV) as process:
         try:
             deadline = time.monotonic() + timeout
-            output, error_size, offset = bytearray(), 0, 0
+            error_size, offset = 0, 0
             with selectors.DefaultSelector() as ready:
-                for stream in (process.stdout, process.stderr):
-                    os.set_blocking(stream.fileno(), False)
-                    ready.register(stream, selectors.EVENT_READ)
+                for pipe in (process.stdout, process.stderr):
+                    os.set_blocking(pipe.fileno(), False)
+                    ready.register(pipe, selectors.EVENT_READ)
                 if input is not None:
                     if payload:
                         os.set_blocking(process.stdin.fileno(), False)
@@ -35,23 +48,21 @@ def capture(argv, *, input=None, timeout=30, maximum=32 * 1024 * 1024, stderr_ma
                     if remaining <= 0 or not (events := ready.select(remaining)):
                         raise subprocess.SubprocessError('native command timed out')
                     for key, _ in events:
-                        stream = key.fileobj
-                        if stream is process.stdin:
+                        pipe = key.fileobj
+                        if pipe is process.stdin:
                             try:
-                                offset += os.write(stream.fileno(), payload[offset:offset + 65536])
+                                offset += os.write(pipe.fileno(), payload[offset:offset + 65536])
                             except BrokenPipeError:
                                 offset = len(payload)
                             if offset == len(payload):
-                                ready.unregister(stream)
-                                stream.close()
+                                ready.unregister(pipe)
+                                pipe.close()
                             continue
-                        chunk = os.read(stream.fileno(), 65536)
+                        chunk = os.read(pipe.fileno(), 65536)
                         if not chunk:
-                            ready.unregister(stream)
-                        elif stream is process.stdout:
-                            if len(output) + len(chunk) > maximum:
-                                raise subprocess.SubprocessError('native output exceeded its limit')
-                            output.extend(chunk)
+                            ready.unregister(pipe)
+                        elif pipe is process.stdout:
+                            consume(chunk)
                         else:
                             error_size += len(chunk)
                             if error_size > stderr_maximum:
@@ -59,7 +70,6 @@ def capture(argv, *, input=None, timeout=30, maximum=32 * 1024 * 1024, stderr_ma
             process.wait(timeout=max(0, deadline - time.monotonic()))
             if process.returncode:
                 raise subprocess.SubprocessError('native command failed')
-            return output.decode('utf-8')
         except BaseException:
             if process.poll() is None:
                 process.kill()

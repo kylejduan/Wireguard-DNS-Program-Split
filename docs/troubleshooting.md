@@ -28,15 +28,29 @@ Firefox also has its own proxy control under Settings → Network Settings; use 
 - Confirm its exact executable path appears in the tray list.
 - Add helper or child executables separately.
 - Fully terminate and relaunch the application; existing sockets are not migrated.
-- Check `wfp-filters.log` for its path and `controller.log` for a healthy stack.
+- Run `src\Invoke-WfpFilters.ps1 -Action Validate` from elevated PowerShell; it fails unless the persistent filters match the list and the PIA driver has registered its callouts. Check `controller.log` for a healthy stack.
 - Confirm no other VPN is connected and no foreign catch-all NRPT policy exists.
+
+## Selected applications cannot connect
+
+While the project is enabled, selected applications are blocked whenever the tunnel or the stack is down: the payload filters persist through repairs, crashes and reboots by design. A refused connection reports an access-denied socket error (`WSAEACCES`, 10013). Check `controller.log` and `last-error.txt` for why the stack is not active; the tray's Disable restores direct access.
+
+If the controller is gone or the installation is broken, inspect and remove the filters from elevated PowerShell:
+
+```powershell
+& 'C:\Program Files\WireGuardProgramSplit\bin\wfp-probe.exe' status
+& 'C:\Program Files\WireGuardProgramSplit\bin\wfp-probe.exe' remove
+```
+
+`status` lists the objects the project provider owns, including boot-time copies; `remove` deletes all of them and is safe to repeat. Stop the controller service first: an enabled controller reinstalls missing filters at its next 30-second check. Removal reads neither the settings nor the application list, so it also works when they are missing or damaged. `Uninstall.ps1` does the same as part of its cleanup and keeps the installation in place if it cannot. If the installation directory was deleted by hand, run `remove` with a `wfp-probe.exe` from a fresh build. The Private Internet Access desktop client cannot add its own callout objects while these filters exist.
 
 ## DNS fails
 
 - Disable application-owned Secure DNS/DoH during testing.
 - Confirm the profile had exactly one reachable IPv4 DNS address.
 - Inspect `dns-dispatcher.log` for `TUNNEL`, `DIRECT`, `BLOCKED`, or `FAILED`.
-- `BLOCKED (no process hint)` means the dispatcher deliberately returned `SERVFAIL` because it could not safely attribute the query.
+- `RELOADED generation=N` records an in-place reload, and `RELOAD REJECTED` a rejected one, after which the loaded inputs stay in use. `state\dns-dispatcher-status.txt` names the process and generation that published `state\dns-dispatcher-loaded-*` copies. `controller-service.log` records each dispatcher start and end, and an NRPT suspension or restoration; `state\nrpt-suspended` exists while the rule is suspended.
+- `BLOCKED (no process hint)` means the dispatcher deliberately returned `SERVFAIL` because it could not safely attribute the query. A preceding `BARRIER INCOMPLETE` line means the ordering barrier did not complete within 500 ms, and `ETW FLUSH FAILED` that the session could not be flushed; both refuse rather than guess.
 - `type`, `event-qpc`, `query-qpc`, and `qpc-frequency` fields support ordering diagnostics; do not treat them as a unique transaction ID.
 - Ensure no other service owns `127.0.0.1:53`.
 
@@ -46,7 +60,7 @@ Unlisted payload should not traverse the tunnel. Confirm the physical default ro
 
 To decide whether the stack is involved at all, measure the same workload with it removed. Take a paired sample of new connections to fixed addresses, stop the split, repeat the sample, and start it again:
 
-- Windows: `Stop-Service WireGuardProgramSplitController` removes the NRPT rule, ends `dns-dispatcher.exe`, destroys the dynamic WFP session with all payload filters, and stops the tunnel service; `Start-Service` restores them. Confirm `wfp-probe`, `dns-dispatcher`, the NRPT rule and the tunnel address are absent during the window.
+- Windows: `Stop-Service WireGuardProgramSplitController` removes the persistent payload filters, the NRPT rule and `dns-dispatcher.exe`, and stops the tunnel service; `Start-Service` restores them. Confirm `bin\wfp-probe.exe status` reports `ABSENT` and that `dns-dispatcher`, the NRPT rule and the tunnel address are absent during the window.
 - Linux: `wg-program-split disable` removes `wgps0`, the `wg_program_split` nftables table, the routing rule and the BPF pins; `wg-program-split activate` restores them. Unlisted traffic is untouched either way, so the only cost of the window is that enrolled programs lose the tunnel.
 
 Selected applications leave through the physical path while the split is stopped, so keep the window short and do not use it as a workaround.
