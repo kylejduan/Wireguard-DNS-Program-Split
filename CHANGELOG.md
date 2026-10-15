@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3 - 2026-10-15
+
+- Windows: after a reboot, selected applications reach the tunnel as soon as it is up. A shutdown keeps the persistent filters, NRPT rule and dispatcher, and the controller then starts only the tunnel; that path did not load the PIA callout driver, which nothing else starts after a boot, so the filters blocked selected applications until the first 30-second health check repaired them about 32 seconds later. The driver now loads alongside the tunnel start, and the whole stack is validated on the next two-second pass instead of after the full interval.
+- Windows: adopting the stack at boot is no longer logged as a tunnel failure, and saves no health-failure evidence. One capture per boot had been pushing real failures out of the ten kept. A tunnel that then fails to start is still recorded as an outage.
+- Windows: a physical DNS resolver that does not answer no longer keeps the tunnel from starting. The tunnel-only restart had held on the dispatcher's loopback probe, which needs the physical resolver, so selected applications stayed blocked for the whole resolver outage although an address endpoint needs no physical DNS. The tunnel now starts and the health check holds the stack; changed network inputs still take the full restart.
+
 ## 0.3.2 - 2026-10-15
 
 - Windows: every script reads state files as UTF-8, matching how they are written. Windows PowerShell had read them in the ANSI code page, so a listed executable whose path has non-ASCII characters was corrupted on the next tray edit and lost its filters and DNS attribution.

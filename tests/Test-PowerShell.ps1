@@ -90,6 +90,11 @@ Assert-True ($piaReadySource -match 'ServiceType.*?KernelDriver' -and
     $piaReadySource -match 'PiaWFPCallout\.inf' -and $piaReadySource -match 'PiaWfpCallout\.sys' -and
     $piaReadySource -match 'piawfpcallout\.cat') `
     'PIA fast path requires the kernel driver type and installed package files'
+Assert-True ($controllerSource -match '\$adoptionPending = \$true' -and
+    $controllerSource -match "Restart-Tunnel -Reason 'The tunnel service is not running\.' -Adopt:\`$adoptionPending" -and
+    $controllerSource -match '(?s)-Adopt:\$adoptionPending \}.*?if \(Test-StackActive\) \{ \(Get-ControllerElapsed\) - \[TimeSpan\]::FromSeconds\(31\) \}' -and
+    $controllerSource -match '(?s)\$adoptionPending = \$false\s+if \(\$desired -and \(Get-ControllerElapsed\) -ge \$nextAdapterMaintenance') `
+    'only the first pass adopts a kept stack, and a stack the tunnel-only path completes is checked on the next pass'
 Assert-True ([IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Common.ps1')) -match '(?s)Milliseconds = \[long\]\$fields\[''runtime''\]' -and
     [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\native\bounded-run.h')) -match 'runtime = \(ticks\(exit\) - ticks\(creation\)\)' -and
     $controllerSource -match 'completed in \$\(\$result\.Milliseconds\) ms') `

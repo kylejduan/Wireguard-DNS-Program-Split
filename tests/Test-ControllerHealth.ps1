@@ -618,6 +618,54 @@ try {
         (Test-Path -LiteralPath $activeFile) -and -not (Test-Path -LiteralPath $tunnelRetryFile) -and
         (Get-StackState) -eq 'Active') `
         'once the tunnel answers, the tunnel-only restart reports the stack active without touching DNS'
+    # Boot adoption: a shutdown kept every per-application component and only the tunnel is down. Nothing
+    # else loads the PIA driver after a boot, so the tunnel start loads it, and adoption is not an outage.
+    $script:serviceStatus = 'Stopped'
+    $script:driverReady = $false
+    function Test-PiaDriverReady { $script:driverReady }
+    $script:components.Clear()
+    $script:evidence = 0
+    $script:tunnelOutageLogged = $false
+    $script:nextRepair = [TimeSpan]::Zero
+    Restart-Tunnel -Reason 'The tunnel service is not running.' -Adopt
+    Assert-True (($script:components -join ',') -eq
+        'launch Invoke-PiaDriver.ps1 Install,Invoke-Tunnel.ps1 Start,Invoke-PiaDriver.ps1 Install' -and
+        $script:evidence -eq 0 -and -not $script:tunnelOutageLogged) `
+        'boot adoption loads the PIA driver alongside the tunnel start and saves no outage evidence'
+    $script:driverReady = $true
+    $script:components.Clear()
+    Restart-Tunnel -Reason 'The tunnel service is not running.'
+    Assert-True (($script:components -join ',') -eq 'Invoke-Tunnel.ps1 Start' -and $script:evidence -eq 1) `
+        'a tunnel outage after adoption saves evidence and leaves a running driver alone'
+    # A physical resolver that does not answer fails the dispatcher's final loopback probe, not its inputs.
+    # The tunnel still starts; a changed uplink keeps the full health path.
+    $script:resolverAnswers = $false
+    function Test-PhysicalResolverAnswers { $script:resolverAnswers }
+    function Start-Stack { $script:starts++ }
+    $script:validationFailures['Invoke-DnsDispatcher.ps1'] =
+        'Invoke-DnsDispatcher.ps1 Validate failed: Local split-DNS health probe failed: SERVFAIL'
+    $script:components.Clear()
+    $script:starts = 0
+    $script:nextRepair = [TimeSpan]::Zero
+    Restart-Tunnel -Reason 'The tunnel service is not running.' -Adopt
+    Assert-True (($script:components -join ',') -eq 'Invoke-Tunnel.ps1 Start' -and $script:starts -eq 0) `
+        'a physical resolver outage does not keep the tunnel from starting'
+    $script:resolverAnswers = $true
+    $script:components.Clear()
+    $script:nextRepair = [TimeSpan]::Zero
+    Restart-Tunnel -Reason 'The tunnel service is not running.' -Adopt
+    Assert-True ($script:components -notcontains 'Invoke-Tunnel.ps1 Start' -and $script:starts -eq 1) `
+        'a failing loopback probe with an answering physical resolver gets the full restart'
+    $script:validationFailures['Invoke-DnsDispatcher.ps1'] =
+        'Invoke-DnsDispatcher.ps1 Validate failed: The active physical route, source address, or DNS resolver changed.'
+    $script:resolverAnswers = $false
+    $script:components.Clear()
+    $script:starts = 0
+    $script:nextRepair = [TimeSpan]::Zero
+    Restart-Tunnel -Reason 'The tunnel service is not running.' -Adopt
+    Assert-True ($script:components -notcontains 'Invoke-Tunnel.ps1 Start') `
+        'changed dispatcher inputs never start the tunnel through the tunnel-only path'
+    $script:validationFailures.Clear()
 } finally {
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }

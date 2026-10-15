@@ -410,12 +410,16 @@ function Test-TunnelSettingsUnchanged {
     } catch { return $false }
 }
 
-function Restart-Tunnel([string] $Reason, [switch] $StopFirst) {
+function Restart-Tunnel([string] $Reason, [switch] $StopFirst, [switch] $Adopt) {
     # Fail closed through a VPN-side outage. The payload filters, NRPT rule and dispatcher stay in place,
     # so selected applications bind to the absent tunnel address and fail instead of leaving directly.
-    # Attempts share the repair backoff; the outage is logged and its evidence saved once.
+    # Attempts share the repair backoff; the outage is logged and its evidence saved once. Adopting the
+    # stack a shutdown kept is the normal boot path, not an outage: it saves no evidence, and a start
+    # that fails there is logged as an outage by the retry that follows.
     if ($stopEvent -and $stopEvent.WaitOne(0)) { return }
-    if (-not $script:tunnelOutageLogged) {
+    if ($Adopt) {
+        Write-ControllerLog 'Adopting the per-application components kept across shutdown; starting the tunnel.'
+    } elseif (-not $script:tunnelOutageLogged) {
         Write-ControllerLog ("Tunnel-side failure; keeping the filters, NRPT rule and dispatcher in place " +
             "and restarting only the tunnel: $Reason")
         Save-HealthFailureEvidence -Reason $Reason
@@ -423,16 +427,26 @@ function Restart-Tunnel([string] $Reason, [switch] $StopFirst) {
     }
     if ((Get-ControllerElapsed) -lt $script:nextRepair) { return }
     # The dispatcher keeps the direct inputs it started with. If the uplink changed during the outage,
-    # a hostname endpoint cannot resolve through them, so hand that failure to the full health path.
+    # a hostname endpoint cannot resolve through them, so hand that failure to the full health path. A
+    # physical resolver that does not answer fails only the final loopback probe, after the inputs have
+    # matched; an address endpoint needs no physical DNS, so the tunnel starts instead of waiting out the
+    # resolver outage with selected applications blocked. The health check then holds the stack.
     try { Invoke-DispatcherValidation }
     catch {
-        $script:tunnelOutageLogged = $false
-        Invoke-HealthFailure $_
-        return
+        if (-not ($_.Exception.Data['ProgramSplitStage'] -eq 'Transport' -and
+                $_.Exception.Message -match 'Local split-DNS health probe' -and -not (Test-PhysicalResolverAnswers))) {
+            $script:tunnelOutageLogged = $false
+            Invoke-HealthFailure $_
+            return
+        }
     }
     try {
         if ($StopFirst) { Invoke-Component 'Invoke-Tunnel.ps1' 'Stop' }
-        Invoke-Component 'Invoke-Tunnel.ps1' 'Start'
+        # After a boot nothing else loads the PIA driver, and until it registers its callouts the persistent
+        # filters block selected applications even with the tunnel up. It loads alongside the tunnel start.
+        $driverStart = if (-not (Test-PiaDriverReady)) { Start-Component 'Invoke-PiaDriver.ps1' 'Install' }
+        try { Invoke-Component 'Invoke-Tunnel.ps1' 'Start' }
+        finally { if ($driverStart) { Complete-Component $driverStart } }
         Wait-ProgramSplitProbe -Probe { Test-TunnelDns -TimeoutMilliseconds 750 } `
             -TimeoutMilliseconds 20000 -RetryMilliseconds 250 -StopEvent $stopEvent
         $script:repairDelaySeconds = 2
@@ -725,6 +739,8 @@ $stopCleanupWindow = [TimeSpan]::FromSeconds(150)
 $networkWaitLogged = $false
 $physicalHoldLogged = $false
 $tunnelOutageLogged = $false
+# A tunnel found stopped on this controller's first pass is the stack a shutdown kept for adoption.
+$adoptionPending = $true
 $resolverHoldLogged = $false
 $networkRetryMilliseconds = 250
 $stopEvent = $null
@@ -822,9 +838,15 @@ try {
             if ($stackState -eq 'TunnelDown' -and (Test-TunnelSettingsUnchanged)) {
                 if (Test-Path -LiteralPath $tunnelRetryFile -PathType Leaf) {
                     Restart-Tunnel -Reason 'Tunnel DNS did not answer when the stack started.' -StopFirst
-                } else { Restart-Tunnel -Reason 'The tunnel service is not running.' }
-            } else { Invoke-Repair }
-            $lastHealth = Get-ControllerElapsed
+                } else { Restart-Tunnel -Reason 'The tunnel service is not running.' -Adopt:$adoptionPending }
+                # The tunnel-only path validates nothing else, so a stack it completes is checked on the next
+                # pass, including the driver's callouts, instead of after the full interval.
+                $lastHealth = if (Test-StackActive) { (Get-ControllerElapsed) - [TimeSpan]::FromSeconds(31) }
+                    else { Get-ControllerElapsed }
+            } else {
+                Invoke-Repair
+                $lastHealth = Get-ControllerElapsed
+            }
         } elseif ((Get-ControllerElapsed) - $lastHealth -gt [TimeSpan]::FromSeconds(30)) {
             try {
                 try { Test-StackHealth }
@@ -834,6 +856,7 @@ try {
             } catch { Invoke-HealthFailure $_ }
             $lastHealth = Get-ControllerElapsed
         }
+        $adoptionPending = $false
         if ($desired -and (Get-ControllerElapsed) -ge $nextAdapterMaintenance -and (Test-StackActive)) {
             Invoke-AdapterMaintenance
         }
