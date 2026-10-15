@@ -421,3 +421,32 @@ The preserved inputs, including the private key, were deleted after the
 installation was independently verified.
 
 These are short deployment checks, not a long-term stability or saturation proof.
+
+## October 15, 2026: first workstation reboot and boot adoption release
+
+The Windows workstation was rebooted on 0.3.2, the first reboot observed live
+since the filters became persistent. The stack recovered without intervention.
+
+- The persistent set was present from boot: 20 filters including 8 boot-time.
+  The controller started 26 seconds after boot and the tunnel 4.6 seconds after
+  the controller. The NRPT rule and dispatcher had survived the reboot.
+- A listed browser's connections used only the tunnel address and its DNS took
+  the tunnel lane, while unlisted egress and DNS went direct. Over 60 seconds
+  the stack used 0.94% of one core.
+- The PIA callout driver, which starts on demand, was loaded only by the first
+  30-second health check, 32 seconds after the tunnel was up. Until then the
+  filters blocked the listed applications: fail-closed, but slower than needed.
+  The boot was also logged as a tunnel failure with a health-failure capture.
+
+0.3.3 loads the driver alongside the tunnel start, logs boot adoption as such,
+validates the whole stack on the next pass, and no longer holds the tunnel down
+while the physical resolver does not answer. Only `Controller.ps1` changed, so
+the workstation was updated by replacing that file and killing the controller
+host with the tunnel stopped, which reproduces the boot adoption path.
+
+- The restarted controller logged the adoption, saved no capture, started the
+  tunnel and ran every validation 2.2 seconds after the tunnel answered,
+  instead of after 30 seconds. The dispatcher kept running through the
+  controller host's restart, and the filter set stayed present.
+- The driver was already running, so loading it during adoption is covered by
+  tests rather than this check. A second reboot will show it live.
