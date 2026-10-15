@@ -476,6 +476,57 @@ def main():
                 wait_for(lambda: test.cli('check')['state'] == 'ready', 'underlay recovery')
                 dns(); dns(False); ip_probe()
                 test.passed('underlay loss fails closed, unlisted DNS remains healthy, and recovery restores readiness')
+                # The daemon reuses nf_tables listings while the ruleset generation
+                # is unchanged; a foreign nft or iptables-nft edit must still be
+                # seen by its very next check (one interval), not by a fresh CLI.
+                mangle_existed = execute('nft', 'list', 'table', 'ip', 'mangle', okay=False).returncode == 0
+                test.service('start', UNITS[1])
+                for edit, undo in (
+                        ([['nft', 'add', 'table', 'inet', 'wgps_foreign'],
+                          ['nft', 'add', 'chain', 'inet', 'wgps_foreign', 'out', '{ type filter hook output priority 0 ; }'],
+                          ['nft', 'add', 'rule', 'inet', 'wgps_foreign', 'out', 'meta', 'mark', 'set', '0x1']],
+                         [['nft', 'delete', 'table', 'inet', 'wgps_foreign']]),
+                        ([['iptables-nft', '-t', 'mangle', '-A', 'OUTPUT', '-j', 'MARK', '--set-mark', '0x1']],
+                         [['iptables-nft', '-t', 'mangle', '-D', 'OUTPUT', '-j', 'MARK', '--set-mark', '0x1']] +
+                         ([] if mangle_existed else [['nft', 'delete', 'table', 'ip', 'mangle']]))):
+                    wait_for(lambda: test.ready() and test.native()['ready'], 'ready before a foreign edit')
+                    time.sleep(6)  # At least one cached daemon check.
+                    for command in edit: test.run(*command)
+                    edited = time.monotonic()
+                    # Only the daemon blocks the guard; status alone would inventory afresh.
+                    wait_for(lambda: not test.native()['ready'], 'daemon detects a foreign edit', timeout=12)
+                    test.observations.append({'foreign_edit_detected_seconds': round(time.monotonic() - edited, 2)})
+                    assert json.loads((STATE / 'controller.json').read_text())['state'] == 'degraded'
+                    dns(blocked=True); dns(False)
+                    for command in undo: test.run(*command)
+                    wait_for(lambda: test.native()['ready'] and test.ready(), 'recovery after the foreign edit', timeout=30)
+                # An owner-bound table disappears with its owner's netlink socket and
+                # without a new ruleset generation; the daemon must not keep a stale
+                # listing of it and must recover at its next check.
+                from wg_program_split.inventory import nft_generation
+                wait_for(lambda: test.ready() and test.native()['ready'], 'ready before an owner-bound table')
+                owner = subprocess.Popen(['nft', '-i'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.PIPE, text=True, env=ENV)
+                try:
+                    owner.stdin.write('add table inet wgps_owner { flags owner; }\n'
+                                      'add chain inet wgps_owner out { type filter hook output priority 0; }\n'
+                                      'add rule inet wgps_owner out meta mark set 0x1\n')
+                    owner.stdin.flush()
+                    wait_for(lambda: execute('nft', 'list', 'table', 'inet', 'wgps_owner', okay=False).returncode == 0,
+                             'owner-bound table created')
+                    wait_for(lambda: not test.native()['ready'], 'daemon detects the owner-bound conflict', timeout=12)
+                    time.sleep(6)  # Another check while the owner-bound table exists.
+                    generation = nft_generation()
+                finally:
+                    owner.stdin.close()
+                    owner.wait(timeout=10)
+                assert execute('nft', 'list', 'table', 'inet', 'wgps_owner', okay=False).returncode != 0
+                assert nft_generation() == generation, 'owner-bound table deletion advanced the generation'
+                released = time.monotonic()
+                wait_for(lambda: test.native()['ready'] and test.ready(), 'recovery after the owner-bound table', timeout=12)
+                test.observations.append({'owner_table_recovery_seconds': round(time.monotonic() - released, 2)})
+                dns(); ip_probe()
+                test.passed('the daemon catches foreign nft and iptables-nft mark edits at its next check')
                 test.cli('include', 'remove', evidence / 'selected-dns')
                 test.files[CONFIG / 'settings.json'] = identity(CONFIG / 'settings.json')
                 result = test.run(evidence / 'selected-dns', 'udp', '127.0.0.60', '203.0.113.7', '0', '1')

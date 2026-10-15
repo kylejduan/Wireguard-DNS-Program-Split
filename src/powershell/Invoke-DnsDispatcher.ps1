@@ -136,10 +136,11 @@ function Get-DirectNetwork {
     $source = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $physical.InterfaceIndex |
         Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -notlike '169.254.*' } |
         Select-Object -First 1 -ExpandProperty IPAddress
-    $resolver = (Get-DnsClientServerAddress -AddressFamily IPv4 -InterfaceIndex $physical.InterfaceIndex).ServerAddresses |
-        Where-Object { $_ -notin @('127.0.0.1', $configuration.TunnelDns) } | Select-Object -First 1
-    if (-not $source -or -not $resolver) { throw 'Physical source address or pre-dispatch DNS resolver is unavailable.' }
-    [pscustomobject]@{ InterfaceIndex = $physical.InterfaceIndex; Source = $source; Resolver = $resolver }
+    # Every listed resolver, in order: the dispatcher passes over one that stops answering.
+    $resolvers = @(Get-ProgramSplitPhysicalResolvers -AdapterName $configuration.AdapterName -TunnelDns $configuration.TunnelDns `
+        -InterfaceIndex $physical.InterfaceIndex)
+    if (-not $source -or -not $resolvers.Count) { throw 'Physical source address or pre-dispatch DNS resolver is unavailable.' }
+    [pscustomobject]@{ InterfaceIndex = $physical.InterfaceIndex; Source = $source; Resolver = ($resolvers -join ',') }
 }
 
 if ($Action -eq 'Status') {
@@ -174,24 +175,17 @@ if ($Action -eq 'Validate') {
         if ($inputs['direct-source'] -ne $current.Source -or $inputs['direct-dns'] -ne $current.Resolver) {
             throw 'The active physical route, source address, or DNS resolver changed.'
         }
-        $probe = Join-Path $root 'bin\dns-probe.exe'
-        $health = Start-Process -FilePath $probe -ArgumentList @('--system', 'example.com', 3) `
-            -RedirectStandardOutput $healthOut -RedirectStandardError $healthError -WindowStyle Hidden -PassThru
-        $null = $health.Handle
-        if (-not $health.WaitForExit(8000)) {
-            Stop-Process -Id $health.Id -Force -ErrorAction SilentlyContinue
-            throw 'Local split-DNS health probe timed out.'
-        }
-        $health.WaitForExit()
-        $output = @(Get-Content -LiteralPath $healthOut -ErrorAction SilentlyContinue)
-        $errors = @(Get-Content -LiteralPath $healthError -ErrorAction SilentlyContinue)
-        if ($health.ExitCode -ne 0 -or -not ($output -match '^PASS:')) {
-            throw "Local split-DNS health probe failed: $($output + $errors -join ' ')"
+        # The probe's result comes through pipes; its log files are a best-effort copy, so a reader holding
+        # one open cannot fail validation and turn into a repair.
+        $health = Invoke-ProgramSplitProcess -FilePath (Join-Path $root 'bin\dns-probe.exe') -ArgumentList @('--system', 'example.com', 3) `
+            -TimeoutMilliseconds 8000 -OutputLog $healthOut -ErrorLog $healthError
+        if ($health.TimedOut) { throw 'Local split-DNS health probe timed out.' }
+        if ($health.ExitCode -ne 0 -or -not ($health.Output -match '^PASS:')) {
+            throw "Local split-DNS health probe failed: $($health.Output + $health.Error -join ' ')"
         }
         Write-Output 'PASS: dispatcher ownership, direct-network inputs, ETW attribution, and loopback DNS are healthy.'
         exit 0
     } finally {
-        if ($health) { $health.Dispose() }
         if ($process) { $process.Dispose() }
     }
 }

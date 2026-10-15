@@ -4,6 +4,7 @@
 //   udp-dns <ip> <timeout-ms>      one DNS query to port 53 and its reply
 //   loopback <ip>                  TCP connect to a listener this process opens on a loopback address
 //   udp-listen <ip> <port> <ms>    hold a UDP port, as a stand-in for a ready dispatcher; prints READY
+//   echo-args <values...>          prints each argument as ARG [value], for argument-quoting tests
 //   system-dns <name> [count]      A lookups through the Windows DNS Client, bypassing its cache; prints
 //                                  the first address of the first, which tells the resolver lanes apart
 // Prints PASS or FAIL with the Winsock error and exits 0 or 1.
@@ -192,6 +193,10 @@ int main(int argc, char** argv) {
     else if (argc == 4 && std::strcmp(argv[1], "udp-dns") == 0) result = udpDnsProbe(argv[2], argv[3]);
     else if (argc == 3 && std::strcmp(argv[1], "loopback") == 0) result = loopbackProbe(argv[2]);
     else if (argc == 5 && std::strcmp(argv[1], "udp-listen") == 0) result = udpListen(argv[2], argv[3], argv[4]);
+    else if (argc >= 2 && std::strcmp(argv[1], "echo-args") == 0) {
+        for (int i = 2; i < argc; ++i) std::cout << "ARG [" << argv[i] << "]" << std::endl;
+        result = 0;
+    }
     else if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "system-dns") == 0) {
         result = systemDns(argv[2], argc == 4 ? std::clamp(std::atoi(argv[3]), 1, 50) : 1);
     }

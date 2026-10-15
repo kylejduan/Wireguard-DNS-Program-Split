@@ -89,12 +89,12 @@ sockaddr_in address(const wchar_t* ip, uint16_t port) {
 #include "dns-sockets.h"
 
 std::optional<std::vector<char>> udpExchange(const std::vector<char>& packet, sockaddr_in source,
-                                             sockaddr_in resolver) {
+                                             sockaddr_in resolver, unsigned timeoutMilliseconds = 4000) {
     SOCKET upstream = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (upstream == INVALID_SOCKET) return std::nullopt;
     SocketOwner owned(upstream);
     if (!nonblocking(upstream)) return std::nullopt;
-    const auto deadline = afterMilliseconds(4000);
+    const auto deadline = afterMilliseconds(timeoutMilliseconds);
     source.sin_port = 0;
     std::optional<std::vector<char>> result;
     if (bind(upstream, reinterpret_cast<sockaddr*>(&source), sizeof(source)) == 0 &&
@@ -118,12 +118,12 @@ std::optional<std::vector<char>> udpExchange(const std::vector<char>& packet, so
 }
 
 std::optional<std::vector<char>> tcpExchange(const std::vector<char>& packet, sockaddr_in source,
-                                             sockaddr_in resolver) {
+                                             sockaddr_in resolver, unsigned timeoutMilliseconds = 4000) {
     SOCKET upstream = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (upstream == INVALID_SOCKET) return std::nullopt;
     SocketOwner owned(upstream);
     if (!nonblocking(upstream)) return std::nullopt;
-    const auto deadline = afterMilliseconds(4000);
+    const auto deadline = afterMilliseconds(timeoutMilliseconds);
     source.sin_port = 0;
     std::optional<std::vector<char>> result;
     if (bind(upstream, reinterpret_cast<sockaddr*>(&source), sizeof(source)) == 0 &&

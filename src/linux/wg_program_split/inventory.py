@@ -4,10 +4,13 @@ iptables and WireGuard inventories."""
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
 import shutil
+import socket
+import struct
 import subprocess
 
 from .errors import NetworkError
@@ -19,11 +22,133 @@ _IPTABLES_DUMPS = ('iptables-legacy-save', 'ip6tables-legacy-save', 'iptables-nf
 _OPAQUE_MARK_EXTENSIONS = {'MARK', 'CONNMARK', 'CT', 'mark', 'connmark'}
 
 
+def nft_generation():
+    """This network namespace's nf_tables ruleset generation (NFT_MSG_GETGEN).
+
+    Every committed nf_tables transaction advances it: nft and iptables-nft
+    edits, flushes and deletions, in any table or family. The count restarts
+    only if the nf_tables module is unloaded and loaded again, which gives its
+    sysfs directory a new inode, so that inode is part of the result. Raises
+    OSError or ValueError when it cannot be read.
+    """
+    try:
+        module = os.stat('/sys/module/nf_tables').st_ino
+    except FileNotFoundError:
+        module = None  # Built in: never reloaded.
+    netlink_netfilter, subsystem, getgen, newgen = 12, 10, 16, 15
+    request = struct.pack('=IHHII', 20, subsystem << 8 | getgen, 1, 1, 0) + struct.pack('=BBH', 0, 0, 0)
+    with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW | socket.SOCK_CLOEXEC, netlink_netfilter) as channel:
+        channel.settimeout(2)
+        channel.send(request)
+        reply = channel.recv(65536)
+    length, kind = struct.unpack_from('=IH', reply)
+    if kind != subsystem << 8 | newgen or not 20 <= length <= len(reply):
+        raise ValueError('no nf_tables generation reply')
+    offset = 20
+    while offset + 4 <= length:
+        size, attribute = struct.unpack_from('=HH', reply, offset)
+        if size < 4 or offset + size > length:
+            break
+        if attribute & 0x3fff == 1 and size == 8:  # NFTA_GEN_ID, big endian
+            return module, struct.unpack_from('>I', reply, offset + 4)[0]
+        offset += (size + 3) & ~3
+    raise ValueError('nf_tables generation reply lacks its ID')
+
+
+class RulesetListings:
+    """nf_tables-backed listings reused while the ruleset generation is unchanged.
+
+    A listing is kept only when the generation read before and after it is the
+    same, so it is exactly the ruleset of that generation; a later equal
+    generation means no transaction has committed since, and the identical
+    text is returned without running the tool. Only counters and dynamic set
+    contents change outside transactions, and no inventory decision reads
+    them, with one exception: the kernel deletes an owner-bound table (flag
+    "owner") when the netlink socket that owns it closes, without advancing
+    the generation. So a listing is kept only once an nft listing of the same
+    generation has shown no owner-bound table (one cannot appear without a new
+    generation); while one exists, every listing runs the tool. Without a
+    readable generation every listing runs.
+    """
+    NFT = ('nft', '-j', 'list', 'ruleset')
+    COMMANDS = frozenset({NFT, ('iptables-nft-save',), ('ip6tables-nft-save',)})
+
+    def __init__(self, generation=nft_generation):
+        self.generation = generation
+        self.entries = {}
+        self.owner_free = None  # Generation whose nft listing had no owner-bound table.
+
+    def __call__(self, argv, run):
+        try:
+            before = self.generation()
+        except (OSError, ValueError):
+            self.entries.clear()
+            self.owner_free = None
+            return run()
+        cached = self.entries.get(argv)
+        if cached is not None and cached[0] == before and self.owner_free == before:
+            return cached[1]
+        output = run()
+        try:
+            stable = self.generation() == before
+        except (OSError, ValueError):
+            stable = False
+        if argv == self.NFT:
+            self.owner_free = before if stable and not _owner_bound(output) else None
+        # A listing taken while an owner-bound table may exist could still show
+        # it after its silent deletion, so only owner-free listings are kept.
+        if stable and self.owner_free == before:
+            self.entries[argv] = (before, output)
+        else:
+            self.entries.pop(argv, None)
+        return output
+
+
+def _owner_bound(listing):
+    """True unless LISTING is nft JSON whose tables carry no "owner" flag."""
+    try:
+        entries = json.loads(listing)['nftables']
+        for entry in entries:
+            table = entry.get('table') if isinstance(entry, dict) else None
+            if isinstance(table, dict):
+                flags = table.get('flags', [])
+                if flags == 'owner' or (isinstance(flags, list) and 'owner' in flags):
+                    return True
+        return False
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return True
+
+
+_LISTINGS = RulesetListings()
+# A legacy iptables dump prints exactly the tables named here; no file or no
+# name means no legacy table exists and the dump would be empty.
+_LEGACY_TABLES = {'iptables-legacy-save': '/proc/net/ip_tables_names',
+                  'ip6tables-legacy-save': '/proc/net/ip6_tables_names'}
+
+
+def _legacy_tables_absent(tool):
+    try:
+        with open(_LEGACY_TABLES[tool], 'rb') as names:
+            return not names.read(4096).strip()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _spawn(argv, input):
+    try:
+        return capture(tuple(argv), input=input.encode('utf-8') if input is not None else None, timeout=15)
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        raise NetworkError('network command failed, timed out or exceeded output limits; inspect effective state') from None
+
+
 def run_command(argv, *, input=None):
     """Run fixed argv with a trusted executable search path, no shell, no logs."""
     if not argv or argv[0] not in {'ip', 'wg', 'nft', 'conntrack', 'sysctl', *_IPTABLES_DUMPS}:
         raise NetworkError('unsupported network command')
-    if (len(argv) == 3 and tuple(argv[:2]) == ('sysctl', '-n') and
+    argv = tuple(argv)
+    if (len(argv) == 3 and argv[:2] == ('sysctl', '-n') and
             re.fullmatch(r'[a-z0-9_]+(?:\.[a-z0-9_]+)+', argv[2])):
         # A readback is the procfs file sysctl would print; no process is needed.
         try:
@@ -31,10 +156,11 @@ def run_command(argv, *, input=None):
                 return file.read(4096).decode('utf-8')
         except (OSError, UnicodeError):
             raise NetworkError('network command failed, timed out or exceeded output limits; inspect effective state') from None
-    try:
-        return capture(tuple(argv), input=input.encode('utf-8') if input is not None else None, timeout=15)
-    except (OSError, UnicodeError, subprocess.SubprocessError):
-        raise NetworkError('network command failed, timed out or exceeded output limits; inspect effective state') from None
+    if input is None and argv in RulesetListings.COMMANDS:
+        return _LISTINGS(argv, lambda: _spawn(argv, None))
+    if input is None and argv[0] in _LEGACY_TABLES and len(argv) == 1 and _legacy_tables_absent(argv[0]):
+        return ''
+    return _spawn(argv, input)
 
 
 def _call(runner, *argv, input=None):
@@ -149,15 +275,28 @@ def _named_tables():
     return names
 
 
-def _table(value):
-    if isinstance(value, str) and value in _BUILTIN_TABLES:
-        return _BUILTIN_TABLES[value]
-    if isinstance(value, str) and not re.fullmatch(r'0x[0-9a-fA-F]{1,8}|[0-9]{1,10}', value):
-        named = _named_tables()
-        if value in named:
-            return named[value]
-        raise NetworkError('unknown named routing table')
-    return _u32(value)
+class TableNames:
+    """Routing table resolution for one network observation. The named-table
+    configuration is read at most once, at the first nonbuiltin name, and a
+    later observation starts afresh, so edits apply from the next check."""
+
+    def __init__(self):
+        self._named = None
+
+    def __call__(self, value):
+        if isinstance(value, str) and value in _BUILTIN_TABLES:
+            return _BUILTIN_TABLES[value]
+        if isinstance(value, str) and not re.fullmatch(r'0x[0-9a-fA-F]{1,8}|[0-9]{1,10}', value):
+            if self._named is None:
+                self._named = _named_tables()
+            if value in self._named:
+                return self._named[value]
+            raise NetworkError('unknown named routing table')
+        return _u32(value)
+
+
+def _table(value, tables=None):
+    return (TableNames() if tables is None else tables)(value)
 
 
 def _has_mark(value):

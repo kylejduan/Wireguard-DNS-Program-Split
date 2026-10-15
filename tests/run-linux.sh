@@ -48,6 +48,7 @@ case "${1:-}" in
         python3 tests/linux/test_network_vm.py --vm
         python3 tests/linux/test_packet_paths.py --vm
         python3 tests/linux/test_acceptance.py --vm
+        python3 tests/linux/test_guard_retry.py --vm
         ;;
     --performance)
         python3 tests/linux/test_dns_performance.py --vm

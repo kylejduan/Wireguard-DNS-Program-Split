@@ -527,21 +527,152 @@ function Test-ProgramSplitPhysicalInputs {
         $source = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $physical.InterfaceIndex -ErrorAction Stop |
             Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -notlike '169.254.*' } |
             Select-Object -First 1 -ExpandProperty IPAddress
-        $resolver = Get-ProgramSplitPhysicalResolver -AdapterName $AdapterName -TunnelDns $TunnelDns
-        return [bool] ($source -and $resolver)
+        $resolvers = @(Get-ProgramSplitPhysicalResolvers -AdapterName $AdapterName -TunnelDns $TunnelDns `
+            -InterfaceIndex $physical.InterfaceIndex)
+        return [bool] ($source -and $resolvers.Count)
     } catch { return $false }
 }
 
-function Get-ProgramSplitPhysicalResolver {
-    # The resolver the dispatcher forwards unlisted names to: the first address on the
-    # physical interface that is neither the loopback dispatcher nor the tunnel resolver.
-    # Returns $null when the host has no such address.
-    param([Parameter(Mandatory)] [string] $AdapterName, [string] $TunnelDns)
+function Get-ProgramSplitPhysicalResolvers {
+    # The resolvers the dispatcher forwards unlisted names to, in the order the physical interface lists
+    # them: at most three, each neither the loopback dispatcher nor the tunnel resolver. The dispatcher
+    # passes over one that stops answering, so a dead primary with a live secondary is not an outage. A caller
+    # that has already chosen the physical interface passes its index, so the source address and resolvers
+    # come from one interface even during a handoff, and the routes are not enumerated twice.
+    param([Parameter(Mandatory)] [string] $AdapterName, [string] $TunnelDns, [uint32] $InterfaceIndex)
 
     try {
-        $physical = Get-ProgramSplitPhysicalDefault -AdapterName $AdapterName
-        return (Get-DnsClientServerAddress -AddressFamily IPv4 `
-            -InterfaceIndex $physical.InterfaceIndex -ErrorAction Stop).ServerAddresses |
-            Where-Object { $_ -notin @('127.0.0.1', $TunnelDns) } | Select-Object -First 1
-    } catch { return $null }
+        if (-not $InterfaceIndex) { $InterfaceIndex = (Get-ProgramSplitPhysicalDefault -AdapterName $AdapterName).InterfaceIndex }
+        $parsed = $null
+        return @((Get-DnsClientServerAddress -AddressFamily IPv4 `
+            -InterfaceIndex $InterfaceIndex -ErrorAction Stop).ServerAddresses |
+            Where-Object { $_ -notin @('127.0.0.1', $TunnelDns) -and [Net.IPAddress]::TryParse($_, [ref]$parsed) -and
+                $parsed.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork } |
+            Select-Object -Unique | Select-Object -First 3)
+    } catch { return @() }
+}
+
+function Get-ProgramSplitPhysicalResolver {
+    # The first physical resolver, or $null when the host has none.
+    param([Parameter(Mandatory)] [string] $AdapterName, [string] $TunnelDns)
+
+    @(Get-ProgramSplitPhysicalResolvers -AdapterName $AdapterName -TunnelDns $TunnelDns) | Select-Object -First 1
+}
+
+# The bounded runner: controller-service.exe --run, beside these scripts in an installation. Tests set it first.
+if (-not (Get-Variable -Name ProgramSplitRunner -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:ProgramSplitRunner = Join-Path (Split-Path -Parent $PSScriptRoot) 'bin\controller-service.exe'
+}
+
+function ConvertTo-ProgramSplitArgument([string] $Value) {
+    # One argument quoted for CommandLineToArgvW and the C runtime: quotes around anything empty or holding
+    # whitespace or a quote, embedded quotes escaped, and backslashes doubled only before a quote.
+    if ($Value -and $Value -notmatch '[\s"]') { return $Value }
+    $quoted = [Text.StringBuilder]::new('"')
+    $backslashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') { $backslashes++; continue }
+        if ($character -eq '"') { $null = $quoted.Append([char]'\', 2 * $backslashes + 1).Append('"') }
+        else { $null = $quoted.Append([char]'\', $backslashes).Append($character) }
+        $backslashes = 0
+    }
+    $null = $quoted.Append([char]'\', 2 * $backslashes).Append('"')
+    $quoted.ToString()
+}
+
+function Start-ProgramSplitProcess {
+    # Starts a program through the bounded runner: suspended in its own job, contained before it runs, ended
+    # with its descendants at its deadline counted from now, both pipes drained with bounded retention. Output
+    # comes back through pipes rather than files, so a log another process holds open cannot fail the run.
+    # Encoding states what the program writes: Utf8 for this project's native tools, Oem for Windows
+    # PowerShell and other console programs writing to a redirected stream. Each argument is passed as it
+    # is, quoted here as needed; callers never quote.
+    param(
+        [Parameter(Mandatory)] [string] $FilePath,
+        [string[]] $ArgumentList = @(),
+        [Parameter(Mandatory)] [ValidateRange(1, 600000)] [int] $TimeoutMilliseconds,
+        [ValidateSet('Utf8', 'Oem')] [string] $Encoding = 'Utf8'
+    )
+
+    # The program path is quoted plainly: a path holds no quotes, and argv[0] is not parsed for escapes.
+    $commandLine = (@('"' + $FilePath + '"') + @($ArgumentList | ForEach-Object { ConvertTo-ProgramSplitArgument ([string]$_) })) -join ' '
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($commandLine))
+    $start = [Diagnostics.ProcessStartInfo]::new($script:ProgramSplitRunner, "--run $TimeoutMilliseconds $encoded")
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $runner = [Diagnostics.Process]::Start($start)
+    # The runner's frame is bounded and it always ends by the deadline plus a small margin, so reading each
+    # stream to its end is safe and starts at once, whenever the result is collected.
+    [pscustomobject]@{
+        Runner = $runner; Frame = $runner.StandardOutput.ReadToEndAsync(); RunnerError = $runner.StandardError.ReadToEndAsync()
+        TimeoutMilliseconds = $TimeoutMilliseconds; Encoding = $Encoding
+    }
+}
+
+function Complete-ProgramSplitProcess {
+    # Collects a started program's result. The runner enforced its deadline; the wait here is only a backstop
+    # against a broken runner. Logs are a best-effort copy afterwards.
+    param(
+        [Parameter(Mandatory)] $Started,
+        [string] $OutputLog,
+        [string] $ErrorLog
+    )
+
+    try {
+        if (-not $Started.Runner.WaitForExit($Started.TimeoutMilliseconds + 20000)) {
+            try { $Started.Runner.Kill() } catch { }
+            throw 'The bounded runner did not finish.'
+        }
+        $Started.Runner.WaitForExit()
+        $fields = @{}
+        foreach ($line in ($Started.Frame.Result -split "`r?`n")) {
+            $pair = $line -split '=', 2
+            if ($pair.Count -eq 2) { $fields[$pair[0]] = $pair[1] }
+        }
+        if (-not $Started.Frame.Result.StartsWith('WGPS-RUN 1')) { throw "The bounded runner failed: $($Started.RunnerError.Result)" }
+        if ($fields.ContainsKey('error')) { throw "Could not run the program: $($fields['error'])" }
+        $encoding = if ($Started.Encoding -eq 'Oem') {
+            [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+        } else { [Text.UTF8Encoding]::new($false) }
+        $output = $encoding.GetString([Convert]::FromBase64String($fields['stdout']))
+        $errors = $encoding.GetString([Convert]::FromBase64String($fields['stderr']))
+        foreach ($log in @(@($OutputLog, $output), @($ErrorLog, $errors))) {
+            if ($log[0]) { try { [IO.File]::WriteAllText($log[0], $log[1]) } catch { } }
+        }
+        # The runner writes the exit code as the unsigned value Windows keeps; it is read back as the signed
+        # code a program exits with, so exit -1 and an NTSTATUS crash such as 0xC0000005 keep their value.
+        $exitCode = $null
+        if ($fields['exit']) {
+            $unsigned = [uint32]0
+            if (-not [uint32]::TryParse($fields['exit'], [ref]$unsigned)) { throw "The bounded runner reported a malformed exit code: $($fields['exit'])" }
+            $exitCode = [BitConverter]::ToInt32([BitConverter]::GetBytes($unsigned), 0)
+        }
+        [pscustomobject]@{
+            ExitCode = $exitCode
+            TimedOut = $fields['timedout'] -eq '1'
+            OutputTruncated = $fields['stdout-truncated'] -eq '1'
+            ErrorTruncated = $fields['stderr-truncated'] -eq '1'
+            Output = @($output -split "\r?\n" | Where-Object { $_ })
+            Error = @($errors -split "\r?\n" | Where-Object { $_ })
+            # The program's own runtime: a parallel start completes components in turn, so the time until
+            # this call would include the wait for the others.
+            Milliseconds = [long]$fields['runtime']
+        }
+    } finally { $Started.Runner.Dispose() }
+}
+
+function Invoke-ProgramSplitProcess {
+    param(
+        [Parameter(Mandatory)] [string] $FilePath,
+        [string[]] $ArgumentList = @(),
+        [Parameter(Mandatory)] [int] $TimeoutMilliseconds,
+        [string] $OutputLog,
+        [string] $ErrorLog,
+        [ValidateSet('Utf8', 'Oem')] [string] $Encoding = 'Utf8'
+    )
+
+    Complete-ProgramSplitProcess -Started (Start-ProgramSplitProcess -FilePath $FilePath -ArgumentList $ArgumentList `
+        -TimeoutMilliseconds $TimeoutMilliseconds -Encoding $Encoding) -OutputLog $OutputLog -ErrorLog $ErrorLog
 }

@@ -85,7 +85,10 @@ Requires=wg-program-split-guard.service
 After=wg-program-split-guard.service
 ```
 
-This prevents startup when the early guard fails. The guard can be blocking while
+This prevents startup when the early guard fails. The controller recovers
+from a transient early-guard failure by itself, but systemd does not retry a
+dependent whose dependency failed, so start such a service again once
+`wg-program-split check` reports ready. The guard can be blocking while
 VPN connectivity is established; retain the application's normal connection
 retry behavior. The dependency does not select the executable or prove network
 readiness. Add the path before starting the service.

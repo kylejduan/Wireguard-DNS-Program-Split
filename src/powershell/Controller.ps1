@@ -22,6 +22,11 @@ $includeFile = Join-Path $state 'included-apps.txt'
 $filtersInstalledFile = Join-Path $state 'wfp-filters.installed'
 # The tray's profile import asks to keep the filters through the disable that swaps the profile.
 $keepFiltersFile = Join-Path $state 'keep-filters.request'
+# When this controller, or an earlier one, first saw the current import request, on the monotonic clock.
+$keepFiltersSeenFile = Join-Path $state 'keep-filters.seen.json'
+$keepFiltersSeen = $null
+# Process identity and monotonic first sighting of a pending tunnel host, as the tunnel component reported it.
+$tunnelPendingSeen = $null
 # Every component is up but tunnel DNS did not answer during startup; the tunnel-only restart takes over.
 $tunnelRetryFile = Join-Path $state 'tunnel-retry'
 # While present, controller-service.exe keeps the dispatcher running; see dispatcher-supervisor.h.
@@ -55,46 +60,38 @@ function Start-Component([string] $name, [string] $action, [string[]] $switches 
     $key = [IO.Path]::GetFileNameWithoutExtension($name)
     $stdout = Join-Path $logs "$key-output.log"
     $stderr = Join-Path $logs "$key-error.log"
-    $timer = [Diagnostics.Stopwatch]::StartNew()
-    $process = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-        @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $script), '-Action', $action) + $switches
-    ) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
-    # Materialize the process handle before it can exit. Windows PowerShell 5.1 otherwise
-    # exposes a null ExitCode for short-lived children created with Start-Process.
-    $null = $process.Handle
+    # Output comes back through pipes; the log files are a best-effort copy, so a reader holding one open
+    # cannot fail the component and turn into a repair. The 45-second deadline is the runner's, from now,
+    # so the order in which a parallel start collects results has no effect on any component's timeout.
+    # The tunnel component is told when this controller first saw its current pending host, so its stuck-host
+    # clock survives even when its state file cannot be written.
+    if ($name -eq 'Invoke-Tunnel.ps1' -and $script:tunnelPendingSeen) { $switches = @($switches) + @('-PendingSeen', $script:tunnelPendingSeen) }
+    $started = Start-ProgramSplitProcess -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList (
+        @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script, '-Action', $action) + $switches) `
+        -TimeoutMilliseconds 45000 -Encoding Oem
     [pscustomobject]@{
-        Name = $name; Action = $action; Process = $process
-        Stdout = $stdout; Stderr = $stderr; Timer = $timer
+        Name = $name; Action = $action; Started = $started
+        Stdout = $stdout; Stderr = $stderr
     }
 }
 
 function Complete-Component($component) {
     $name = $component.Name
     $action = $component.Action
-    $process = $component.Process
-    $stdout = $component.Stdout
-    $stderr = $component.Stderr
-    $timer = $component.Timer
-    try {
-        if (-not $process.WaitForExit(45000)) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-            throw "$name $action timed out."
-        }
-        # Finalize redirected streams after the timed overload reports completion.
-        $process.WaitForExit()
-        $output = @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue)
-        $errors = @(Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue)
-        # Log what the component reported before judging its exit: a failed run's output records actions
-        # it already took, such as resetting a stuck tunnel host, and the next run overwrites the file.
-        if ($output) { Write-ControllerLog ($output -join ' ') }
-        if ($process.ExitCode -ne 0) { throw "$name $action exited with code $($process.ExitCode): $($errors -join ' ')" }
-        if ($errors) { throw "$name $action failed: $($errors -join ' ')" }
-        $timer.Stop()
-        try {
-            $elapsedMilliseconds = [long][Math]::Round(($process.ExitTime - $process.StartTime).TotalMilliseconds)
-        } catch { $elapsedMilliseconds = $timer.ElapsedMilliseconds }
-        Write-ControllerLog "$name $action completed in $elapsedMilliseconds ms."
-    } finally { $process.Dispose() }
+    $result = Complete-ProgramSplitProcess -Started $component.Started -OutputLog $component.Stdout -ErrorLog $component.Stderr
+    $output = $result.Output
+    $errors = $result.Error
+    if ($name -eq 'Invoke-Tunnel.ps1') {
+        $pending = @($output | Where-Object { $_ -like 'TUNNEL-PENDING *' }) | Select-Object -Last 1
+        if ($pending) { $script:tunnelPendingSeen = $pending.Substring('TUNNEL-PENDING '.Length) }
+    }
+    # Log what the component reported before judging its exit: a failed run's output records actions it
+    # already took, such as resetting a stuck tunnel host, and the next run overwrites the file.
+    if ($output) { Write-ControllerLog ($output -join ' ') }
+    if ($result.TimedOut) { throw "$name $action timed out." }
+    if ($result.ExitCode -ne 0) { throw "$name $action exited with code $($result.ExitCode): $($errors -join ' ')" }
+    if ($errors) { throw "$name $action failed: $($errors -join ' ')" }
+    Write-ControllerLog "$name $action completed in $($result.Milliseconds) ms."
 }
 
 function Invoke-Component([string] $name, [string] $action, [string[]] $switches = @()) {
@@ -178,10 +175,33 @@ function Test-StackPresent([switch] $Import) {
 
 function Test-FilterHoldRequested {
     # Honored for five minutes, so a tray that exits during an import cannot leave a disabled stack's
-    # filters in place indefinitely; the next disabled pass after that removes them.
-    if (-not (Test-Path -LiteralPath $keepFiltersFile -PathType Leaf)) { return $false }
-    try { return ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc($keepFiltersFile)).TotalMinutes -lt 5 }
-    catch { return $false }
+    # filters in place indefinitely; the next disabled pass after that removes them. The five minutes run
+    # on the monotonic clock from the first sighting of this request (its content, which the tray stamps),
+    # kept in state across controller restarts, so a wall-clock step neither extends nor ends the hold.
+    if (-not (Test-Path -LiteralPath $keepFiltersFile -PathType Leaf)) {
+        $script:keepFiltersSeen = $null
+        if (Test-Path -LiteralPath $keepFiltersSeenFile) { Remove-Item -LiteralPath $keepFiltersSeenFile -Force -ErrorAction SilentlyContinue }
+        return $false
+    }
+    try {
+        $identity = [IO.File]::ReadAllText($keepFiltersFile)
+        $now = (Get-ControllerElapsed).TotalSeconds
+        $seen = $script:keepFiltersSeen
+        if (-not $seen) {
+            try { $seen = Get-Content -LiteralPath $keepFiltersSeenFile -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $seen = $null }
+        }
+        # A record from before a reboot, when the monotonic clock restarted, is a new sighting.
+        if (-not $seen -or [string]$seen.Identity -cne $identity -or [double]$seen.FirstSeen -gt $now) {
+            $seen = [pscustomobject]@{ Identity = $identity; FirstSeen = $now }
+            $temporary = "$keepFiltersSeenFile.$PID.tmp"
+            try {
+                [IO.File]::WriteAllText($temporary, ($seen | ConvertTo-Json -Compress))
+                Move-Item -LiteralPath $temporary -Destination $keepFiltersSeenFile -Force
+            } catch { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+        }
+        $script:keepFiltersSeen = $seen
+        return ($now - [double]$seen.FirstSeen) -lt 300
+    } catch { return $false }
 }
 
 function Stop-Stack([switch] $RestoreCache, [switch] $ThrowOnFailure, [switch] $KeepTunnel, [switch] $RemoveFilters,
@@ -276,18 +296,12 @@ function Test-TunnelDns([int] $TimeoutMilliseconds = 5000, [int] $Attempts = 1) 
     $stderr = Join-Path $logs 'dns-health-error.log'
     # The probe retransmits within one run: a lost datagram is not a dead tunnel, and restarting the
     # stack over it would leave the included applications on the direct route for the whole restart.
-    $process = Start-Process -FilePath $probe -ArgumentList @(
+    $result = Invoke-ProgramSplitProcess -FilePath $probe -ArgumentList @(
         $configuration.TunnelDns, 'example.com', $TimeoutMilliseconds, $Attempts
-    ) `
-        -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
-    $null = $process.Handle
-    if (-not $process.WaitForExit($TimeoutMilliseconds * $Attempts + 3000)) {
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-        throw 'Tunnel DNS health probe timed out.'
-    }
-    $process.WaitForExit()
-    $output = @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue)
-    $errors = @(Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue)
+    ) -TimeoutMilliseconds ($TimeoutMilliseconds * $Attempts + 3000) -OutputLog $stdout -ErrorLog $stderr
+    if ($result.TimedOut) { throw 'Tunnel DNS health probe timed out.' }
+    $output = $result.Output
+    $errors = $result.Error
     if (-not ($output -match '^PASS:')) {
         $output += $errors
         throw "Tunnel DNS health probe failed: $($output -join ' ')"
@@ -296,45 +310,35 @@ function Test-TunnelDns([int] $TimeoutMilliseconds = 5000, [int] $Attempts = 1) 
 }
 
 function Test-PhysicalResolverAnswers {
-    # The dispatcher answers unlisted names by forwarding them to the physical resolver,
-    # so a dead LAN resolver fails the local probe no matter how healthy this stack is.
-    # Restarting cannot fix that, and each restart stops the dispatcher and tunnel, so
-    # the caller holds instead. Returns $false when the resolver is unknown or silent.
-    $resolver = Get-ProgramSplitPhysicalResolver -AdapterName $configuration.AdapterName `
-        -TunnelDns $configuration.TunnelDns
-    if (-not $resolver) { return $false }
+    # The dispatcher answers unlisted names by forwarding them to the physical resolvers, passing over one
+    # that stops answering, so only when none answers does the local probe fail however healthy this
+    # stack is. Restarting cannot fix that, and each restart stops the tunnel, so the caller holds
+    # instead. Returns $false when no resolver is known or none answers.
+    $resolvers = @(Get-ProgramSplitPhysicalResolvers -AdapterName $configuration.AdapterName `
+        -TunnelDns $configuration.TunnelDns)
+    if (-not $resolvers.Count) { return $false }
     $probe = Join-Path $root 'bin\dns-probe.exe'
-    $stdout = Join-Path $logs 'physical-resolver-probe.log'
-    $stderr = Join-Path $logs 'physical-resolver-probe-error.log'
-    try {
-        $process = Start-Process -FilePath $probe -ArgumentList @($resolver, 'example.com', 1000, 2) `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
-        $null = $process.Handle
-        if (-not $process.WaitForExit(5000)) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-            return $false
-        }
-        $process.WaitForExit()
-        return $process.ExitCode -eq 0 -and
-            (@(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue) -match '^PASS:')
-    } catch { return $false }
+    foreach ($resolver in $resolvers) {
+        try {
+            $result = Invoke-ProgramSplitProcess -FilePath $probe -ArgumentList @($resolver, 'example.com', 1000, 2) `
+                -TimeoutMilliseconds 5000 -OutputLog (Join-Path $logs 'physical-resolver-probe.log') `
+                -ErrorLog (Join-Path $logs 'physical-resolver-probe-error.log')
+            if ($result.ExitCode -eq 0 -and ($result.Output -match '^PASS:')) { return $true }
+        } catch { }
+    }
+    return $false
 }
 
 function Test-LocalDns {
     $probe = Join-Path $root 'bin\dns-probe.exe'
     $stdout = Join-Path $logs 'dns-dispatcher-health.log'
     $stderr = Join-Path $logs 'dns-dispatcher-health-error.log'
-    $process = Start-Process -FilePath $probe -ArgumentList @('--system', 'example.com', 3) `
-        -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
-    $null = $process.Handle
-    if (-not $process.WaitForExit(8000)) {
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-        throw 'Local split-DNS health probe timed out.'
-    }
-    $process.WaitForExit()
-    $output = @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue)
-    $errors = @(Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue)
-    if ($process.ExitCode -ne 0 -or -not ($output -match '^PASS:')) {
+    $result = Invoke-ProgramSplitProcess -FilePath $probe -ArgumentList @('--system', 'example.com', 3) `
+        -TimeoutMilliseconds 8000 -OutputLog $stdout -ErrorLog $stderr
+    if ($result.TimedOut) { throw 'Local split-DNS health probe timed out.' }
+    $output = $result.Output
+    $errors = $result.Error
+    if ($result.ExitCode -ne 0 -or -not ($output -match '^PASS:')) {
         $detail = $output + $errors -join ' '
         if (-not (Test-PhysicalResolverAnswers)) {
             # Hold: the dispatcher is forwarding to a resolver that is not answering, so the

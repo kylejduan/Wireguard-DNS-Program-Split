@@ -1,15 +1,22 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [Unit]
 Description=WireGuard executable include-mode controller
-Requires=wg-program-split-guard.service
+# Wants, not Requires: a failed early guard must not keep the controller from
+# starting. Activation itself attaches the blocking guard (loading it if the
+# early unit could not) before any networking, so ordering is enforced there.
+Wants=wg-program-split-guard.service network-online.target
 After=wg-program-split-guard.service network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/wg-program-split daemon
+# A failed startup activation exits nonzero and is retried, backing off from
+# 5 to 60 seconds. Each retry pulls in the early guard again, ordered first;
+# an explicit stop or disable cancels a pending retry.
 Restart=on-failure
 RestartSec=5
+RestartSteps=4
+RestartMaxDelaySec=60
 UMask=0077
 RuntimeDirectory=wg-program-split
 RuntimeDirectoryMode=0700

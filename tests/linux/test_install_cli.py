@@ -105,6 +105,33 @@ class InstallTests(unittest.TestCase):
         with self.assertRaises(InstallError):
             verify_units(root=self.root)
 
+    def test_units_retry_a_failed_startup_without_stalling_boot(self):
+        """A failed early guard must not leave the controller unstarted: the
+        controller only wants and follows it, and a failed startup is retried
+        with backoff. The early guard itself stays a single boot attempt."""
+        units = Path(__file__).resolve().parents[2] / 'src/linux/systemd'
+
+        def directives(name):
+            values = {}
+            for line in (units / name).read_text().splitlines():
+                if '=' in line and not line.startswith(('#', '[')):
+                    key, value = line.split('=', 1)
+                    values.setdefault(key, []).extend(value.split())
+            return values
+        controller, guard = directives('wg-program-split.service'), directives('wg-program-split-guard.service')
+        guard_unit = 'wg-program-split-guard.service'
+        for strict in ('Requires', 'Requisite', 'BindsTo', 'PartOf'):
+            self.assertNotIn(guard_unit, controller.get(strict, []))
+        self.assertIn(guard_unit, controller['Wants'])
+        self.assertIn(guard_unit, controller['After'])
+        self.assertEqual(controller['Restart'], ['on-failure'])
+        self.assertEqual((controller['RestartSec'], controller['RestartMaxDelaySec']), (['5'], ['60']))
+        self.assertGreater(int(controller['RestartSteps'][0]), 0)
+        self.assertNotIn('StartLimitIntervalSec', controller)  # 5 s apart never reaches the default limit.
+        self.assertEqual(guard['Type'], ['oneshot'])
+        self.assertNotIn('Restart', guard)  # A restarting oneshot would hold sysinit.target.
+        self.assertIn('sysinit.target', guard['Before'])
+
     def test_cli_uninstall_retry_remains_callable_after_deferred_removal(self):
         from wg_program_split import cli
         self.deploy()

@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 param(
     [ValidateSet('Validate', 'Start', 'Stop', 'Status')]
-    [string] $Action = 'Status'
+    [string] $Action = 'Status',
+    # From the controller: "<process id>:<creation ticks>|<monotonic seconds>", the first sighting of the
+    # pending host it was last told of.
+    [string] $PendingSeen
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +22,8 @@ $tunnelAddress = $configuration.TunnelAddress
 $tunnelDns = $configuration.TunnelDns
 $tunnelDefaultMetric = $configuration.TunnelDefaultMetric
 $endpointState = Join-Path $root 'state\endpoint-route.txt'
+# When the current pending tunnel host was first seen pending, on the monotonic clock.
+$pendingState = Join-Path $root 'state\tunnel-pending.json'
 # A pending tunnel host older than this has outlived any plausible start, including a first driver install.
 $stuckHostSeconds = 90
 
@@ -89,6 +94,40 @@ function Get-OwnedServiceProcess {
     return $null
 }
 
+function Get-MonotonicSeconds { [Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency }
+
+function Get-PendingHostAge($Process) {
+    # How long this host has been seen pending, measured monotonically (the performance counter is one
+    # clock for the whole system and ignores wall-clock corrections). It is keyed to the verified process:
+    # its ID and creation time, so a new host starts afresh. The first sighting is kept by the long-lived
+    # controller, which passes it back on each run, and in a state file as a fallback for runs it does not
+    # start; failing to write either never resets the clock. A clock step therefore neither shields a stuck
+    # host nor ends a young one early.
+    $identity = "$($Process.Id):$($Process.StartTime.ToUniversalTime().Ticks)"
+    $now = Get-MonotonicSeconds
+    $sightings = [Collections.Generic.List[double]]::new()
+    if ($PendingSeen -match '^(\d+:\d+)\|(\d+(\.\d+)?)$' -and $Matches[1] -ceq $identity) { $sightings.Add([double]$Matches[2]) }
+    try {
+        $saved = Get-Content -LiteralPath $pendingState -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ([string]$saved.Identity -ceq $identity) { $sightings.Add([double]$saved.FirstSeen) }
+    } catch { }
+    $known = @($sightings | Where-Object { $_ -le $now })
+    if ($known.Count) {
+        $firstSeen = ($known | Measure-Object -Minimum).Minimum
+    } else {
+        $firstSeen = $now
+        $temporary = "$pendingState.$PID.tmp"
+        try {
+            [IO.File]::WriteAllText($temporary, ([ordered]@{ Identity = $identity; FirstSeen = $now } | ConvertTo-Json -Compress))
+            Move-Item -LiteralPath $temporary -Destination $pendingState -Force
+        } catch { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
+    # Reported on standard output for the controller, outside this function's return value.
+    $script:pendingReport = "$identity|$($firstSeen.ToString([Globalization.CultureInfo]::InvariantCulture))"
+    [Console]::Out.WriteLine("TUNNEL-PENDING $script:pendingReport")
+    return [int]($now - $firstSeen)
+}
+
 function Reset-PendingService([int] $SettleSeconds) {
     # A tunnel service that stays in StartPending or StopPending cannot accept a stop control, so a
     # stop fails until reboot and every later start waits on the same stuck host. After a bounded
@@ -108,13 +147,14 @@ function Reset-PendingService([int] $SettleSeconds) {
     $process = Get-OwnedServiceProcess
     if (-not $process) { throw "The tunnel service is stuck in $($service.Status) without an owned host process." }
     if ($service.Status -eq 'StartPending') {
-        $hostAge = [int]([DateTime]::Now - $process.StartTime).TotalSeconds
+        $hostAge = Get-PendingHostAge $process
         if ($hostAge -lt $stuckHostSeconds) {
             throw "The tunnel service is still starting (host age $hostAge s); it is left to finish and is reset only after $stuckHostSeconds seconds."
         }
     }
     Write-Output "Tunnel service stuck in $($service.Status); terminating owned host process $($process.Id)."
     $process.Kill()
+    Remove-Item -LiteralPath $pendingState -Force -ErrorAction SilentlyContinue
     $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(10))
     $adapterTimer = [Diagnostics.Stopwatch]::StartNew()
     while ((Get-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue) -and
@@ -141,7 +181,7 @@ function Wait-ServiceRunning([int] $TimeoutSeconds = 20) {
     }
     $status = $service.Status
     $process = Get-OwnedServiceProcess
-    $hostAge = if ($process) { [int]([DateTime]::Now - $process.StartTime).TotalSeconds } else { 0 }
+    $hostAge = if ($process) { Get-PendingHostAge $process } else { 0 }
     if ($process -and $hostAge -ge $stuckHostSeconds) {
         Reset-PendingService -SettleSeconds 0
         throw "The tunnel service stayed $status for $hostAge seconds; its host process was reset so the next attempt starts clean."

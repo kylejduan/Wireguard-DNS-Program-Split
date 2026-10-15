@@ -49,6 +49,7 @@ If the controller is gone or the installation is broken, inspect and remove the 
 - Disable application-owned Secure DNS/DoH during testing.
 - Confirm the profile had exactly one reachable IPv4 DNS address.
 - Inspect `dns-dispatcher.log` for `TUNNEL`, `DIRECT`, `BLOCKED`, or `FAILED`.
+- `(resolver 2)` on a `DIRECT` line means the first physical resolver did not answer and a later one did.
 - `RELOADED generation=N` records an in-place reload, and `RELOAD REJECTED` a rejected one, after which the loaded inputs stay in use. `state\dns-dispatcher-status.txt` names the process and generation that published `state\dns-dispatcher-loaded-*` copies. `controller-service.log` records each dispatcher start and end, and an NRPT suspension or restoration; `state\nrpt-suspended` exists while the rule is suspended.
 - `BLOCKED (no process hint)` means the dispatcher deliberately returned `SERVFAIL` because it could not safely attribute the query. A preceding `BARRIER INCOMPLETE` line means the ordering barrier did not complete within 500 ms, and `ETW FLUSH FAILED` that the session could not be flushed; both refuse rather than guess.
 - `type`, `event-qpc`, `query-qpc`, and `qpc-frequency` fields support ordering diagnostics; do not treat them as a unique transaction ID.

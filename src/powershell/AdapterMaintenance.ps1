@@ -75,17 +75,12 @@ function Remove-ProgramSplitStrayDevice([string] $InstanceId, [string] $LogDirec
     if ($InstanceId -notmatch '^ROOT\\WIREGUARD\\[0-9]{4}$') { throw 'Not a root WireGuard device.' }
     $stdout = Join-Path $LogDirectory 'adapter-removal-output.log'
     $stderr = Join-Path $LogDirectory 'adapter-removal-error.log'
-    $process = Start-Process -FilePath "$env:SystemRoot\System32\pnputil.exe" `
-        -ArgumentList @('/remove-device', $InstanceId) -RedirectStandardOutput $stdout `
-        -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
-    $null = $process.Handle
-    if (-not $process.WaitForExit(10000)) {
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-        throw 'Device removal timed out; inspect the removal log before retrying.'
-    }
-    $process.WaitForExit()
-    if ($process.ExitCode -ne 0) {
-        throw "Device removal returned $($process.ExitCode); no reboot or driver removal was requested."
+    # Judged from its pipes; the log files are a best-effort copy that a reader cannot make fail.
+    $result = Invoke-ProgramSplitProcess -FilePath "$env:SystemRoot\System32\pnputil.exe" `
+        -ArgumentList @('/remove-device', $InstanceId) -TimeoutMilliseconds 10000 -OutputLog $stdout -ErrorLog $stderr -Encoding Oem
+    if ($result.TimedOut) { throw 'Device removal timed out; inspect the removal log before retrying.' }
+    if ($result.ExitCode -ne 0) {
+        throw "Device removal returned $($result.ExitCode); no reboot or driver removal was requested."
     }
     if (@(Get-PnpDevice -Class Net -ErrorAction Stop |
             Where-Object { $_.InstanceId -eq $InstanceId }).Count -ne 0) {

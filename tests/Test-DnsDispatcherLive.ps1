@@ -3,7 +3,7 @@
 param([Parameter(Mandatory)] [string] $RepositoryRoot)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$addresses = @('0.0.0.0', '127.0.0.1', '127.0.0.2', '127.0.0.3')
+$addresses = @('0.0.0.0', '127.0.0.1', '127.0.0.2', '127.0.0.3', '127.0.0.4')
 $existingService = Get-Service -Name WireGuardProgramSplitController -ErrorAction SilentlyContinue
 $udp = @(Get-NetUDPEndpoint -LocalPort 53 -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in $addresses })
 $tcp = @(Get-NetTCPConnection -LocalPort 53 -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in $addresses })
@@ -19,6 +19,7 @@ $zone = "wgps-$id.invalid"
 $trace = "WireGuardProgramSplitDnsEtw-$id"
 $children = [Collections.Generic.List[object]]::new()
 $rule = $null
+$blackHole = $null
 function Read-SharedText([string] $Path) {
     try { $stream = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete') }
     catch [IO.FileNotFoundException] { return '' } # Rotation may be between rename and reopen.
@@ -58,8 +59,11 @@ try {
     [IO.File]::WriteAllText($includes, "$selected`r`n$selectedLane`r`n", [Text.UTF8Encoding]::new($false))
     $resolver = Launch (Join-Path $RepositoryRoot 'build\test-dns-responder.exe') @('--fixture', 300) 'resolver'
     Wait-Ready $resolver 'resolver'
+    # The first physical resolver is a black hole: it takes datagrams and never answers. Unlisted DNS must
+    # still be answered, by the second resolver, without the tunnel lane being affected.
+    $blackHole = [Net.Sockets.UdpClient]::new([Net.IPEndPoint]::new([Net.IPAddress]::Parse('127.0.0.4'), 53))
     $dispatcher = Launch (Join-Path $RepositoryRoot 'build\dns-dispatcher.exe') @(
-        ('"{0}"' -f $includes), '127.0.0.2', '127.0.0.2', '127.0.0.3', '127.0.0.3', $trace,
+        ('"{0}"' -f $includes), '127.0.0.2', '127.0.0.4,127.0.0.2', '127.0.0.3', '127.0.0.3', $trace,
         ('"{0}"' -f (Join-Path $root 'dispatcher.log'))
     ) 'dispatcher'
     Wait-Ready $dispatcher 'dispatcher'
@@ -84,6 +88,11 @@ try {
         }
     }
     if ($observed -match 'DIRECT selected-' -or $observed -match 'TUNNEL direct-') { throw 'DNS crossed resolver lanes.' }
+    $failoverLog = Read-SharedText (Join-Path $root 'dispatcher.log')
+    $viaSecond = [regex]::Matches($failoverLog, '(?m)^DNS direct-\d+\.\S+ type=\d+ -> DIRECT[^\r\n]*\(resolver 2\)').Count
+    $tunnelViaSecond = [regex]::Matches($failoverLog, '(?m)^DNS selected-[^\r\n]*\(resolver').Count
+    Write-Output "OBSERVED: with a black-hole first resolver ($($blackHole.Available) bytes waiting at it), $viaSecond unlisted answers came from the second resolver and every unlisted lookup succeeded."
+    if (-not $viaSecond -or -not $blackHole.Available -or $tunnelViaSecond) { throw 'Unlisted DNS did not fail over from the black-hole resolver, or the tunnel lane used the direct resolvers.' }
 
     # The same name from a selected and an unlisted application at once, in either order. The tunnel lane
     # answers 192.0.2.1 and the direct lane 192.0.2.2, so the answer proves the lane each one took.
@@ -216,6 +225,7 @@ try {
 } finally {
     $failures = [Collections.Generic.List[string]]::new()
     try { if ($rule) { Remove-DnsClientNrptRule -Name $rule.Name -Force } } catch { $failures.Add([string]$_) }
+    if ($blackHole) { $blackHole.Dispose() }
     try { & logman.exe stop $trace -ets 2>$null | Out-Null } catch { $failures.Add([string]$_) }
     foreach ($child in $children) {
         try {

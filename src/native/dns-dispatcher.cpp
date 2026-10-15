@@ -437,6 +437,112 @@ private:
 };
 
 #include "dns-wire.h"
+
+constexpr size_t kMaxDirectResolvers = 3;
+
+// The physical resolvers, comma-separated in the interface's order: one to kMaxDirectResolvers distinct
+// IPv4 addresses, or the input is rejected whole.
+std::vector<sockaddr_in> resolverList(const std::wstring& text) {
+    std::vector<sockaddr_in> result;
+    size_t start = 0;
+    while (true) {
+        const size_t comma = std::min(text.find(L',', start), text.size());
+        const std::wstring item = text.substr(start, comma - start);
+        if (item.empty() || item.size() > 15 || result.size() == kMaxDirectResolvers) {
+            throw std::runtime_error("The physical resolver list is malformed");
+        }
+        const auto resolver = address(item.c_str(), 53);
+        for (const auto& existing : result) {
+            if (existing.sin_addr.s_addr == resolver.sin_addr.s_addr) throw std::runtime_error("The physical resolver list repeats an address");
+        }
+        result.push_back(resolver);
+        if (comma == text.size()) return result;
+        start = comma + 1;
+    }
+}
+
+// Which physical resolver is asked first. One that stops answering is passed over after a short wait, and
+// the one that answered instead is asked first until the primary's re-probe time, which only a failed
+// probe of the primary sets: answers from the stand-in never extend it, so under steady traffic the
+// first-listed resolver is still tried again within a window and a recovered one is used again.
+class DirectResolvers {
+public:
+    explicit DirectResolvers(std::chrono::milliseconds preferFor = std::chrono::seconds(60)) : preferFor_(preferFor) {}
+
+    std::vector<size_t> order(size_t count) {
+        std::lock_guard lock(mutex_);
+        const size_t first = std::chrono::steady_clock::now() < probePrimaryAt_ && preferred_ < count ? preferred_ : 0;
+        std::vector<size_t> result{first};
+        for (size_t index = 0; index < count; ++index) {
+            if (index != first) result.push_back(index);
+        }
+        return result;
+    }
+
+    // index answered; primaryFailed when the first-listed resolver was asked in the same query and did not.
+    void answered(size_t index, bool primaryFailed) {
+        std::lock_guard lock(mutex_);
+        preferred_ = index;
+        if (!index) probePrimaryAt_ = {};
+        else if (primaryFailed) probePrimaryAt_ = std::chrono::steady_clock::now() + preferFor_;
+    }
+
+    void reset() {
+        std::lock_guard lock(mutex_);
+        preferred_ = 0;
+        probePrimaryAt_ = {};
+    }
+
+private:
+    std::mutex mutex_;
+    std::chrono::milliseconds preferFor_;
+    size_t preferred_{};
+    std::chrono::steady_clock::time_point probePrimaryAt_{};
+};
+
+DirectResolvers gDirectResolvers;
+
+// Every upstream attempt for one query, over every resolver and transport, shares one absolute deadline:
+// the usual four seconds. Every resolver but the last gets at most kPerResolverMilliseconds, so a silent
+// one is passed over. Any answer, whatever its code, ends the search. answeredBy reports who answered.
+constexpr unsigned kDirectBudgetMilliseconds = 4000;
+constexpr unsigned kPerResolverMilliseconds = 1200;
+using UpstreamDeadline = std::chrono::steady_clock::time_point;
+
+UpstreamDeadline upstreamDeadline() { return std::chrono::steady_clock::now() + std::chrono::milliseconds(kDirectBudgetMilliseconds); }
+
+unsigned remainingMilliseconds(UpstreamDeadline deadline) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+    return left > 0 ? static_cast<unsigned>(left) : 0;
+}
+
+// With shareRemaining, every resolver still to be asked gets an equal share of the time left instead, so a
+// short reserve, such as the UDP fallback after TCP, is not spent on a dead first resolver alone.
+template <typename Exchange>
+std::optional<std::vector<char>> directExchange(const std::vector<char>& packet, sockaddr_in source,
+                                                const std::vector<sockaddr_in>& resolvers, DirectResolvers& state,
+                                                Exchange exchange, UpstreamDeadline deadline, size_t* answeredBy = nullptr,
+                                                bool shareRemaining = false) {
+    const auto order = state.order(resolvers.size());
+    bool primaryFailed = false;
+    for (size_t position = 0; position < order.size(); ++position) {
+        const unsigned remaining = remainingMilliseconds(deadline);
+        if (!remaining) break;
+        const size_t left = order.size() - position;
+        const unsigned timeout = left == 1        ? remaining
+                                 : shareRemaining ? std::max(1u, remaining / static_cast<unsigned>(left))
+                                                  : std::min(remaining, kPerResolverMilliseconds);
+        auto response = exchange(packet, source, resolvers[order[position]], timeout);
+        if (response) {
+            state.answered(order[position], primaryFailed);
+            if (answeredBy) *answeredBy = order[position];
+            return response;
+        }
+        if (order[position] == 0) primaryFailed = true;
+    }
+    return std::nullopt;
+}
+
 #include "dns-dispatcher-state.h"
 
 // The supervisor's liveness probe, answered by the receive loop itself without attribution or an upstream,
@@ -471,6 +577,53 @@ size_t advertisedUdpSize(const std::vector<char>& query) {
     return 512;
 }
 
+// The upstream exchange of a UDP query on its chosen route. A truncated answer is completed over TCP from the
+// same resolver within the remaining time and returned over UDP when it fits the client's size.
+std::optional<std::vector<char>> exchangeUdpRoute(const std::vector<char>& packet, bool tunnel, const Routes& routes,
+                                                  DirectResolvers& state, bool& completed, size_t& resolverIndex) {
+    const auto deadline = upstreamDeadline();
+    const sockaddr_in source = tunnel ? routes.tunnelSource : routes.directSource;
+    sockaddr_in resolver = routes.tunnelDns;
+    std::optional<std::vector<char>> response;
+    if (tunnel) {
+        response = udpExchange(packet, source, resolver, remainingMilliseconds(deadline));
+    } else {
+        size_t answeredBy = 0;
+        response = directExchange(packet, source, routes.directDns, state,
+                                  [](auto&&... arguments) { return udpExchange(arguments...); }, deadline, &answeredBy);
+        resolver = routes.directDns[answeredBy];
+        resolverIndex = answeredBy;
+    }
+    if (response && response->size() >= 12 && (static_cast<unsigned char>((*response)[2]) & 0x02)) {
+        if (const unsigned remaining = remainingMilliseconds(deadline)) {
+            auto whole = tcpExchange(packet, source, resolver, remaining);
+            if (whole && whole->size() <= advertisedUdpSize(packet)) {
+                response = std::move(whole);
+                completed = true;
+            }
+        }
+    }
+    return response;
+}
+
+// The upstream exchange of a TCP query: over TCP, and for the direct route over UDP if the resolvers refuse
+// TCP, all within one deadline that keeps the last kPerResolverMilliseconds for that UDP fallback.
+std::optional<std::vector<char>> exchangeTcpRoute(const std::vector<char>& packet, bool tunnel, const Routes& routes,
+                                                  DirectResolvers& state) {
+    const auto deadline = upstreamDeadline();
+    if (tunnel) return tcpExchange(packet, routes.tunnelSource, routes.tunnelDns, remainingMilliseconds(deadline));
+    auto response = directExchange(packet, routes.directSource, routes.directDns, state,
+                                   [](auto&&... arguments) { return tcpExchange(arguments...); },
+                                   deadline - std::chrono::milliseconds(kPerResolverMilliseconds));
+    // Some consumer routers refuse upstream TCP/53. Preserve the client's TCP contract while using the same
+    // configured router resolvers over UDP when that happens.
+    if (!response || (response->size() >= 4 && (static_cast<unsigned char>((*response)[3]) & 0x0f) == 5)) {
+        response = directExchange(packet, routes.directSource, routes.directDns, state,
+                                  [](auto&&... arguments) { return udpExchange(arguments...); }, deadline, nullptr, true);
+    }
+    return response;
+}
+
 std::optional<bool> selectRoute(Hints& hints, const Question& question, const wchar_t* transport,
                                 long long queryQpc, long long& waitMicroseconds, bool& reused,
                                 unsigned long long& generation) {
@@ -503,21 +656,10 @@ void handleUdpQuery(Hints& hints, std::vector<char> packet, sockaddr_in client, 
     const auto tunnel = selectRoute(hints, *question, L"UDP", queryQpc, classifyMicroseconds, reused, generation);
     std::optional<std::vector<char>> response;
     bool completed = false;
-    if (tunnel) {
-        const sockaddr_in source = *tunnel ? routes.tunnelSource : routes.directSource;
-        const sockaddr_in resolver = *tunnel ? routes.tunnelDns : routes.directDns;
-        response = udpExchange(packet, source, resolver);
-        // A truncated answer sends the client to TCP, where the Windows DNS Client can hand it another
-        // process's answer for the same name. Fetch the whole answer over TCP on the same route, with no
-        // new classification, and return it over UDP when it fits what the client accepts.
-        if (response && response->size() >= 12 && (static_cast<unsigned char>((*response)[2]) & 0x02)) {
-            auto whole = tcpExchange(packet, source, resolver);
-            if (whole && whole->size() <= advertisedUdpSize(packet)) {
-                response = std::move(whole);
-                completed = true;
-            }
-        }
-    }
+    size_t resolverIndex = 0;
+    // A truncated answer sends the client to TCP, where the Windows DNS Client can hand it another process's
+    // answer for the same name, so exchangeUdpRoute completes it on the same route, with no new classification.
+    if (tunnel) response = exchangeUdpRoute(packet, *tunnel, routes, gDirectResolvers, completed, resolverIndex);
     const bool withheld = response && tunnel && !*tunnel && hints.directAnswerUnsafe(question->name, question->type);
     if (withheld) response.reset();
     const bool answered = response.has_value();
@@ -529,6 +671,7 @@ void handleUdpQuery(Hints& hints, std::vector<char> packet, sockaddr_in client, 
         if (!withheld) hints.complete(question->name, question->type, generation);
         logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
                 (*tunnel ? L"TUNNEL" : L"DIRECT") + (reused ? L" (reused)" : L"") + (completed ? L" (completed over TCP)" : L"") +
+                (resolverIndex ? L" (resolver " + std::to_wstring(resolverIndex + 1) + L")" : L"") +
                 (withheld ? L" WITHHELD (selected lookup of the same name)" : answered ? L"" : L" FAILED") + L" classify=" + std::to_wstring(classifyMicroseconds) + L"us query-qpc=" +
                 std::to_wstring(queryQpc), !answered);
     }
@@ -556,16 +699,7 @@ void handleTcpClient(SOCKET client, Hints& hints) {
         if (question && tunnel) {
             // Each request uses the routes current when it arrives, so a reload takes effect between requests.
             const auto routes = currentRoutes();
-            const auto directSource = routes->directSource;
-            const auto directDns = routes->directDns;
-            response = tcpExchange(packet, *tunnel ? routes->tunnelSource : directSource,
-                                   *tunnel ? routes->tunnelDns : directDns);
-            // Some consumer routers refuse upstream TCP/53. Preserve the client's TCP contract
-            // while using the same configured router resolver over UDP when that happens.
-            if (!*tunnel && (!response || (response->size() >= 4 &&
-                                            (static_cast<unsigned char>((*response)[3]) & 0x0f) == 5))) {
-                response = udpExchange(packet, directSource, directDns);
-            }
+            response = exchangeTcpRoute(packet, *tunnel, *routes, gDirectResolvers);
         }
         const bool withheld = response && question && tunnel && !*tunnel && hints.directAnswerUnsafe(question->name, question->type);
         if (withheld) response.reset();
@@ -619,7 +753,7 @@ int wmain(int argc, wchar_t** argv) {
             traceName = replaceTraceSession(root);
         } else {
             included = loadIncludedPaths(argv[1]);
-            setRoutes({address(argv[2], 0), address(argv[3], 53), address(argv[4], 0), address(argv[5], 53)});
+            setRoutes({address(argv[2], 0), resolverList(argv[3]), address(argv[4], 0), address(argv[5], 53)});
             traceName = argv[6];
         }
         const size_t includedCount = included.size();
@@ -666,6 +800,7 @@ int wmain(int argc, wchar_t** argv) {
                     }
                     const size_t count = next.included.size();
                     setRoutes(next.routes);
+                    gDirectResolvers.reset();
                     hints.setIncluded(next.included);
                     ++generation;
                     // Unpublished, the reload is requested again by Invoke-DnsDispatcher.ps1, which waits for it.

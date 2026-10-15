@@ -50,9 +50,18 @@ Assert-True ($wfpProbeSource -match '(?s)if \(bootTime\) \{.*?kFilterBootTime' -
     $wfpProbeSource -match '(?s)void forEachFilter.*?if \(rule\.callout\) continue;\s*draftFilter\(draft, rule, app, context, tunnelIp, true\);') `
     'every block has a boot-time copy that applies before BFE loads the persistent set'
 
+$runnerSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\native\bounded-run.h'))
+Assert-True ($runnerSource -match 'UpdateProcThreadAttribute\(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST' -and
+    $runnerSource -match 'CREATE_SUSPENDED' -and $runnerSource -match '(?s)IsProcessInJob.*?TerminateProcess\(process\.value.*?cannot contain the program.*?ResumeThread') `
+    'the runner creates the program suspended inside its job and runs it only once containment is confirmed'
+Assert-True ($runnerSource -match '(?s)if \(!stopReaders\(job\.value, threads, 2, kRunDrainMilliseconds\)\) abandonRun' -and
+    $runnerSource -match '(?s)void abandonRun.*?TerminateJobObject.*?TerminateProcess\(GetCurrentProcess\(\)' -and
+    $runnerSource -match '(?s)if \(started\[0\] && !stopReaders') `
+    'reader buffers are read or freed only after both readers have stopped; otherwise the runner ends without unwinding them'
 $controllerSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Controller.ps1'))
-Assert-True ($controllerSource -match '(?s)\.Handle.*?WaitForExit\(45000\).*?WaitForExit\(\).*?\.ExitCode') `
-    'controller retains the child handle and finalizes its wait before reading ExitCode'
+Assert-True ($controllerSource -match '(?s)function Start-Component.*?-TimeoutMilliseconds 45000 -Encoding Oem' -and
+    $controllerSource -match '(?s)function Complete-Component.*?Complete-ProgramSplitProcess -Started \$component\.Started.*?\$result\.TimedOut.*?\$result\.ExitCode') `
+    'controller judges a component by its captured result, with its deadline, before its exit code'
 Assert-True ($controllerSource -match '(?s)function Invoke-Component.*?Start-Component.*?Complete-Component') `
     'ordinary component calls retain the isolated start-and-complete path'
 Assert-True ($controllerSource -notmatch 'Start-Sleep -Seconds 2\s+Test-TunnelDns') `
@@ -81,7 +90,9 @@ Assert-True ($piaReadySource -match 'ServiceType.*?KernelDriver' -and
     $piaReadySource -match 'PiaWFPCallout\.inf' -and $piaReadySource -match 'PiaWfpCallout\.sys' -and
     $piaReadySource -match 'piawfpcallout\.cat') `
     'PIA fast path requires the kernel driver type and installed package files'
-Assert-True ($controllerSource -match '(?s)\.ExitTime.*?\.StartTime.*?completed in \$elapsedMilliseconds ms') `
+Assert-True ([IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Common.ps1')) -match '(?s)Milliseconds = \[long\]\$fields\[''runtime''\]' -and
+    [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\native\bounded-run.h')) -match 'runtime = \(ticks\(exit\) - ticks\(creation\)\)' -and
+    $controllerSource -match 'completed in \$\(\$result\.Milliseconds\) ms') `
     'controller records each parallel child process actual runtime instead of queueing delay'
 Assert-True ($controllerSource -match 'Stack active after tunnel readiness check in \$\(\$stackTimer\.ElapsedMilliseconds\) ms') `
     'controller records total stack startup timing'
@@ -105,8 +116,8 @@ Assert-True ($stackHealthSource -match '(?s)try \{ Invoke-Validation ''Invoke-Wf
 $tunnelProbeSource = $controllerSource.Substring(
     $controllerSource.IndexOf('function Test-TunnelDns'),
     $controllerSource.IndexOf('function Invoke-Repair') - $controllerSource.IndexOf('function Test-TunnelDns'))
-Assert-True ($tunnelProbeSource -match '(?s)\.Handle.*?WaitForExit\(\$TimeoutMilliseconds \* \$Attempts \+ 3000\).*?WaitForExit\(\)') `
-    'tunnel DNS probe drains redirected output before evaluating it'
+Assert-True ($tunnelProbeSource -match '(?s)Invoke-ProgramSplitProcess.*?-TimeoutMilliseconds \(\$TimeoutMilliseconds \* \$Attempts \+ 3000\).*?\$result\.TimedOut.*?\$result\.Output') `
+    'tunnel DNS probe is judged from its captured output, with a deadline covering every retransmission'
 $startStackSource = $controllerSource.Substring(
     $controllerSource.IndexOf('function Start-Stack'),
     $controllerSource.IndexOf('$required = @(') - $controllerSource.IndexOf('function Start-Stack'))
@@ -153,7 +164,7 @@ Assert-True ($controllerSource -match '(?s)if \(\$desired\) \{\s*\$nextCleanup =
     'enabling the stack clears disable-cleanup backoff so a later disable is not deferred'
 $completeComponent = $controllerSource.Substring($controllerSource.IndexOf('function Complete-Component'))
 Assert-True ($completeComponent.IndexOf('Write-ControllerLog ($output') -ge 0 -and
-    $completeComponent.IndexOf('Write-ControllerLog ($output') -lt $completeComponent.IndexOf('$process.ExitCode -ne 0')) `
+    $completeComponent.IndexOf('Write-ControllerLog ($output') -lt $completeComponent.IndexOf('$result.ExitCode -ne 0')) `
     'controller logs a component''s output before judging its exit so a failed run keeps its action record'
 Assert-True ($controllerSource -match '(?s)Write-ControllerLog "Stack health check failed.*?\$reason.*?Stop-Stack\s*Invoke-Repair') `
     'controller logs why a health check failed before restarting the stack'
@@ -486,6 +497,8 @@ try {
     Assert-True ($dispatcherValidateSource -match 'Get-NetUDPEndpoint' -and
         $dispatcherValidateSource -match 'Get-NetTCPConnection') `
         'dispatcher health validation retains independent socket ownership checks'
+    Assert-True ($dispatcherScriptSource -match '(?s)function Get-DirectNetwork.*?Get-ProgramSplitPhysicalDefault.*?Get-ProgramSplitPhysicalResolvers [^\n]*`\s*-InterfaceIndex \$physical\.InterfaceIndex') `
+        'the dispatcher snapshot takes its source address and resolvers from one chosen interface'
     Assert-True ($dispatcherValidateSource -match 'Test-LoadedInputs \$process') `
         'dispatcher health validation requires the running dispatcher to have loaded the current inputs'
     Assert-True ($dispatcherStartSource -notmatch 'Start-Process|Invoke-LocalNrpt') `

@@ -197,6 +197,126 @@ int barrierTest() {
     return 0;
 }
 
+// A UDP endpoint on 127.0.0.1 answering every query while answering is set: as a plain answer, or with
+// the truncation bit. Unset, it takes datagrams and never answers.
+struct TestResolver {
+    SocketOwner udp{socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)};
+    sockaddr_in endpoint{};
+    std::atomic_bool answering;
+    std::atomic_bool truncate{};
+    std::atomic_bool done{};
+    std::thread server;
+    explicit TestResolver(bool answers) : answering(answers) {
+        endpoint = address(L"127.0.0.1", 0);
+        if (bind(udp.value, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint))) return;
+        int size = sizeof(endpoint);
+        getsockname(udp.value, reinterpret_cast<sockaddr*>(&endpoint), &size);
+        nonblocking(udp.value);
+        server = std::thread([this] {
+            while (!done) {
+                if (!answering || !socketReady(udp.value, false, afterMilliseconds(50))) {
+                    if (!answering) Sleep(20);
+                    continue;
+                }
+                std::vector<char> request(512);
+                sockaddr_in peer{};
+                int peerSize = sizeof(peer);
+                const int received = recvfrom(udp.value, request.data(), static_cast<int>(request.size()), 0,
+                                              reinterpret_cast<sockaddr*>(&peer), &peerSize);
+                if (received <= 0) continue;
+                request.resize(received);
+                request[2] = static_cast<char>(static_cast<unsigned char>(request[2]) | 0x80 | (truncate ? 0x02 : 0));
+                sendto(udp.value, request.data(), received, 0, reinterpret_cast<sockaddr*>(&peer), peerSize);
+            }
+        });
+    }
+    ~TestResolver() {
+        done = true;
+        if (server.joinable()) server.join();
+    }
+};
+
+// A TCP listener that takes connections into its backlog and never accepts or answers them.
+struct SilentTcp {
+    SocketOwner listener{socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)};
+    explicit SilentTcp(sockaddr_in endpoint) {
+        bind(listener.value, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint));
+        listen(listener.value, 16);
+    }
+};
+
+long long millisecondsSince(std::chrono::steady_clock::time_point started) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+}
+
+// The direct route passes over a physical resolver that takes datagrams and never answers, prefers the one
+// that answered, and under continuous traffic still re-probes the first-listed one within the window. Every
+// upstream attempt for a query, over every resolver and transport, stays within one deadline.
+int failoverTest(const std::vector<char>& query) {
+    WSADATA winsock{};
+    if (WSAStartup(MAKEWORD(2, 2), &winsock)) return 80;
+    struct Cleanup { ~Cleanup() { WSACleanup(); } } cleanup;
+    TestResolver primary(false);
+    TestResolver secondary(true);
+    if (!primary.endpoint.sin_port || !secondary.endpoint.sin_port) return 81;
+    DirectResolvers state(std::chrono::milliseconds(600));
+    const std::vector<sockaddr_in> resolvers{primary.endpoint, secondary.endpoint};
+    const auto exchange = [&](size_t& answeredBy) {
+        const auto started = std::chrono::steady_clock::now();
+        const auto response = directExchange(query, address(L"127.0.0.1", 0), resolvers, state,
+                                             [](auto&&... arguments) { return udpExchange(arguments...); }, upstreamDeadline(),
+                                             &answeredBy);
+        return response ? millisecondsSince(started) : -1LL;
+    };
+    size_t answeredBy = 9;
+    const long long first = exchange(answeredBy);
+    if (first < 1000 || first > 2500 || answeredBy != 1) return 82;
+    const long long preferred = exchange(answeredBy);
+    if (preferred < 0 || preferred > 500 || answeredBy != 1) return 83;
+    // The primary recovers while queries keep arriving faster than the window: it is used again within it.
+    primary.answering = true;
+    const auto recovering = std::chrono::steady_clock::now();
+    while (millisecondsSince(recovering) < 3000) {
+        if (exchange(answeredBy) < 0) return 84;
+        if (answeredBy == 0) break;
+        Sleep(100);
+    }
+    if (answeredBy != 0 || millisecondsSince(recovering) > 1500) return 85;
+
+    // Two silent resolvers and a third that answers truncated and never over TCP: the TCP completion gets
+    // only what is left of the query's four seconds, not four more.
+    TestResolver silentA(false), silentB(false), truncating(true);
+    truncating.truncate = true;
+    SilentTcp truncatingTcp(truncating.endpoint);
+    Routes routes{};
+    routes.directSource = address(L"127.0.0.1", 0);
+    routes.directDns = {silentA.endpoint, silentB.endpoint, truncating.endpoint};
+    DirectResolvers fresh;
+    bool completed = false;
+    size_t resolverIndex = 0;
+    auto started = std::chrono::steady_clock::now();
+    const auto truncated = exchangeUdpRoute(query, false, routes, fresh, completed, resolverIndex);
+    const long long udpRoute = millisecondsSince(started);
+    if (!truncated || completed || resolverIndex != 2 || udpRoute > kDirectBudgetMilliseconds + 400) return 86;
+    // A TCP query to resolvers that never answer over TCP or UDP: one deadline for both transports.
+    SilentTcp tcpA(silentA.endpoint), tcpB(silentB.endpoint);
+    routes.directDns = {silentA.endpoint, silentB.endpoint};
+    started = std::chrono::steady_clock::now();
+    const auto none = exchangeTcpRoute(query, false, routes, fresh);
+    const long long tcpRoute = millisecondsSince(started);
+    if (none || tcpRoute > kDirectBudgetMilliseconds + 400 || tcpRoute < kDirectBudgetMilliseconds - 400) return 87;
+    // TCP silent on both resolvers, UDP silent on the first and answering on the second: the UDP fallback
+    // shares what is left between them, so the second still answers within the deadline.
+    TestResolver udpOnly(true);
+    SilentTcp udpOnlyTcp(udpOnly.endpoint);
+    routes.directDns = {silentA.endpoint, udpOnly.endpoint};
+    DirectResolvers fallbackState;
+    started = std::chrono::steady_clock::now();
+    const auto fallback = exchangeTcpRoute(query, false, routes, fallbackState);
+    if (!fallback || millisecondsSince(started) > kDirectBudgetMilliseconds + 400) return 89;
+    return 0;
+}
+
 int selfTest() {
     std::vector<char> query(12, 0);
     query[5] = 1;
@@ -397,6 +517,17 @@ int selfTest() {
         gLog.reset();
         if (barrier) return barrier;
     }
+    if (const int failover = failoverTest(query)) return failover;
+    // A resolver list is one to three distinct IPv4 addresses, or the input is rejected whole.
+    if (resolverList(L"192.0.2.1,198.51.100.2").size() != 2 || resolverList(L"192.0.2.1").size() != 1) return 86;
+    for (const wchar_t* malformed : {L"", L"192.0.2.1,", L",192.0.2.1", L"192.0.2.1,192.0.2.1", L"192.0.2.1;192.0.2.2",
+                                     L"192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4", L"999.0.2.1", L"192.0.2.1, 192.0.2.2"}) {
+        try {
+            resolverList(malformed);
+            return 88;
+        } catch (const std::runtime_error&) {
+        }
+    }
     if (!socketDeadlineTest()) return 28;
     if (!exchangeTest(query, false) || !exchangeTest(query, true) || !exchangeTest(query, false, true)) return 29;
     auto largeQuery = query;
@@ -405,7 +536,7 @@ int selfTest() {
     largeQuery.resize(65535, 0);
     if (!exchangeTest(largeQuery, true)) return 31;
     if (gHintWaiters.load()) return 30;
-    std::wcout << L"PASS: DNS parsing, attribution capacity/recovery, the ordering barrier, and real socket deadlines.\n";
+    std::wcout << L"PASS: DNS parsing, attribution capacity/recovery, the ordering barrier, physical resolver failover, and real socket deadlines.\n";
     return 0;
 }
 

@@ -26,7 +26,7 @@ $zone = "wgps-$id.invalid"
 foreach ($directory in @('bin', 'src', 'config', 'state', 'logs')) {
     [IO.Directory]::CreateDirectory((Join-Path $root $directory)) | Out-Null
 }
-foreach ($name in @('dns-dispatcher.exe', 'dns-probe.exe')) {
+foreach ($name in @('dns-dispatcher.exe', 'dns-probe.exe', 'controller-service.exe')) {
     Copy-Item -LiteralPath (Join-Path $RepositoryRoot "build\$name") -Destination (Join-Path $root 'bin')
 }
 foreach ($name in @('Common.ps1', 'Invoke-LocalNrpt.ps1', 'Invoke-DnsDispatcher.ps1')) {

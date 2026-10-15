@@ -26,9 +26,10 @@ $ast = [Management.Automation.Language.Parser]::ParseFile($TunnelScript, [ref] $
 $functions = @($ast.FindAll({
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -in @('Get-OwnedServiceProcess', 'Reset-PendingService', 'Wait-ServiceRunning', 'Start-TunnelAfterPreflight')
+        $node.Name -in @('Get-OwnedServiceProcess', 'Reset-PendingService', 'Wait-ServiceRunning', 'Start-TunnelAfterPreflight',
+            'Get-MonotonicSeconds', 'Get-PendingHostAge')
 }, $true))
-if ($functions.Count -ne 4) { throw 'The tunnel recovery functions were not found.' }
+if ($functions.Count -ne 6) { throw 'The tunnel recovery functions were not found.' }
 foreach ($function in $functions) { . ([scriptblock]::Create($function.Extent.Text)) }
 
 $suffix = [guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -37,6 +38,10 @@ $workDirectory = Join-Path $PSScriptRoot "WgpsRecoveryTest-$suffix"
 $hostExe = Join-Path $workDirectory 'pending-service.exe'
 $adapterName = "WgpsNoAdapter$suffix"
 $stuckHostSeconds = 8
+# Pending time is measured from the first sighting and kept here between calls, as in state\ normally.
+$pendingState = Join-Path $workDirectory 'tunnel-pending.json'
+# No controller here: the sighting lives in the state file alone.
+$PendingSeen = $null
 $preflightFixture = Join-Path $PSScriptRoot 'Invoke-AdapterMaintenance.ps1'
 $preflightFixtureCreated = $false
 # AST-extracted functions have no file-bound PSScriptRoot. Redirect only their helper lookup

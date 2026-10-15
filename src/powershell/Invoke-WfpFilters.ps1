@@ -114,7 +114,8 @@ if ($Action -eq 'Stop') {
         exit 0
     }
     $result = Invoke-Probe @('remove')
-    [IO.File]::WriteAllText($log, (@($result.Output, $result.Error) -join [Environment]::NewLine))
+    # A best-effort copy: a reader holding the log open must not fail the filters.
+    try { [IO.File]::WriteAllText($log, (@($result.Output, $result.Error) -join [Environment]::NewLine)) } catch { }
     if ($result.ExitCode -ne 0) { throw "WFP filter removal failed with code $($result.ExitCode): $($result.Error)" }
     if (Test-Path -LiteralPath $installedFile) { [IO.File]::Delete($installedFile) }
     Write-Output 'Persistent WFP payload filters removed.'
@@ -150,7 +151,7 @@ if ($result.ExitCode -eq 3 -and (Stop-LegacyHosts)) {
         Start-Sleep -Milliseconds 250
     } while ($timer.Elapsed.TotalSeconds -lt 10)
 }
-[IO.File]::WriteAllText($log, (@($result.Output, $result.Error) -join [Environment]::NewLine))
+try { [IO.File]::WriteAllText($log, (@($result.Output, $result.Error) -join [Environment]::NewLine)) } catch { }
 if ($result.ExitCode -ne 0) { throw "WFP filter installation failed with code $($result.ExitCode): $($result.Error)" }
 # Component output is logged as it is; a warning stream would read as a failure there.
 Write-Output $result.Output

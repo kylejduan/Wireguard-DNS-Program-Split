@@ -3,7 +3,8 @@
 // directory and reloaded in place, so repairs and included-app reloads never stop the dispatcher.
 struct Routes {
     sockaddr_in directSource{};
-    sockaddr_in directDns{};
+    // The physical resolvers in the interface's order, at most kMaxDirectResolvers.
+    std::vector<sockaddr_in> directDns;
     sockaddr_in tunnelSource{};
     sockaddr_in tunnelDns{};
 };
@@ -97,7 +98,7 @@ StateInputs readStateInputs(const std::wstring& root) {
         return found->second;
     };
     inputs.routes.directSource = address(field(L"direct-source").c_str(), 0);
-    inputs.routes.directDns = address(field(L"direct-dns").c_str(), 53);
+    inputs.routes.directDns = resolverList(field(L"direct-dns"));
     inputs.routes.tunnelSource = address(field(L"tunnel-source").c_str(), 0);
     inputs.routes.tunnelDns = address(field(L"tunnel-dns").c_str(), 53);
     const std::wstring identities = wideText(inputs.identitiesBytes);

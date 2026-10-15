@@ -14,7 +14,7 @@ $dispatcherSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\power
 
 Assert-True ($controllerSource -match '(?s)function Test-StackHealth.*?Test-TunnelDns -TimeoutMilliseconds 1000 -Attempts 3') `
     'periodic health check retransmits the tunnel DNS probe before declaring the tunnel unhealthy'
-Assert-True ($controllerSource -match '(?s)function Test-TunnelDns\(\[int\] \$TimeoutMilliseconds = 5000, \[int\] \$Attempts = 1\).*?\$TimeoutMilliseconds, \$Attempts.*?WaitForExit\(\$TimeoutMilliseconds \* \$Attempts \+ 3000\)') `
+Assert-True ($controllerSource -match '(?s)function Test-TunnelDns\(\[int\] \$TimeoutMilliseconds = 5000, \[int\] \$Attempts = 1\).*?\$TimeoutMilliseconds, \$Attempts.*?-TimeoutMilliseconds \(\$TimeoutMilliseconds \* \$Attempts \+ 3000\)') `
     'tunnel DNS probe wait covers every retransmission'
 Assert-True ($controllerSource -match "(?s)function Test-LocalDns.*?'--system', 'example\.com', 3") `
     'startup local split-DNS probe retries a transient refusal'
@@ -33,7 +33,7 @@ Assert-True ($controllerSource -match '(?s)function Test-LocalDns.*?\$script:res
     'the resolver hold logs once instead of on every retry'
 Assert-True ($controllerSource -match '(?s)function Test-LocalDns.*?\$script:resolverHoldLogged = \$false\s*Write-ControllerLog ''Local split-DNS health probe passed') `
     'the resolver hold flag resets once the probe passes again'
-Assert-True ($controllerSource -match '(?s)function Test-PhysicalResolverAnswers.*?Get-ProgramSplitPhysicalResolver.*?if \(-not \$resolver\) \{ return \$false \}') `
+Assert-True ($controllerSource -match '(?s)function Test-PhysicalResolverAnswers.*?Get-ProgramSplitPhysicalResolvers.*?if \(-not \$resolvers\.Count\) \{ return \$false \}') `
     'an unknown physical resolver counts as unanswered rather than healthy'
 Assert-True ($controllerSource -match 'Test-ProgramSplitPhysicalInputs -AdapterName \$configuration\.AdapterName `\s*-TunnelDns \$configuration\.TunnelDns\) -or -not \(Test-PhysicalResolverAnswers\)') `
     'the periodic health path holds for a silent physical resolver as well as missing uplink inputs'
@@ -64,10 +64,10 @@ Assert-True ($inputsFunction.Count -eq 1) 'Common defines the physical-input tes
 . ([scriptblock]::Create($inputsFunction[0].Extent.Text))
 $resolverFunction = @($commonAst.FindAll({
     param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ProgramSplitPhysicalResolver'
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Get-ProgramSplitPhysicalResolver', 'Get-ProgramSplitPhysicalResolvers')
 }, $true))
-Assert-True ($resolverFunction.Count -eq 1) 'Common defines the physical-resolver lookup once'
-. ([scriptblock]::Create($resolverFunction[0].Extent.Text))
+Assert-True ($resolverFunction.Count -eq 2) 'Common defines the physical-resolver lookups once'
+foreach ($function in $resolverFunction) { . ([scriptblock]::Create($function.Extent.Text)) }
 $script:physicalRoute = [pscustomobject]@{ InterfaceIndex = 15 }
 $script:addresses = @([pscustomobject]@{ AddressState = 'Preferred'; IPAddress = '192.168.1.100' })
 $script:servers = @([pscustomobject]@{ ServerAddresses = @('192.168.1.1') })
@@ -92,10 +92,46 @@ Assert-True ($null -eq (Get-ProgramSplitPhysicalResolver -AdapterName 'WireGuard
 $script:servers = @([pscustomobject]@{ ServerAddresses = @('127.0.0.1', '192.168.1.1', '10.2.0.1') })
 Assert-True ((Get-ProgramSplitPhysicalResolver -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1') -eq '192.168.1.1') `
     'the forwarding resolver is the first address that is neither loopback nor the tunnel'
+$script:servers = @([pscustomobject]@{ ServerAddresses = @('192.168.1.1', '127.0.0.1', '1.1.1.1', '192.168.1.1', 'fe80::1', '8.8.8.8', '9.9.9.9') })
+Assert-True ((@(Get-ProgramSplitPhysicalResolvers -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1') -join ',') -eq '192.168.1.1,1.1.1.1,8.8.8.8') `
+    'the forwarding resolvers keep the interface order, unique IPv4 addresses only, at most three'
+# With the interface already chosen, resolvers come from that one interface without selecting it again.
+$script:defaultSelections = 0
+$script:askedInterface = $null
+function Get-ProgramSplitPhysicalDefault { param([string] $AdapterName) $script:defaultSelections++; if (-not $script:physicalRoute) { throw 'No physical IPv4 default gateway found.' } $script:physicalRoute }
+function Get-DnsClientServerAddress { param($AddressFamily, $InterfaceIndex, $ErrorAction) $script:askedInterface = $InterfaceIndex; $script:servers }
+$chosen = @(Get-ProgramSplitPhysicalResolvers -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1' -InterfaceIndex 7)
+Assert-True ($chosen.Count -eq 3 -and $script:askedInterface -eq 7 -and $script:defaultSelections -eq 0) `
+    'resolvers come from the interface the caller already chose, without selecting one again'
+$null = Test-ProgramSplitPhysicalInputs -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1'
+Assert-True ($script:defaultSelections -eq 1 -and $script:askedInterface -eq 15) 'the uplink check selects the physical interface once'
 $script:physicalRoute = $null
 Assert-True ($null -eq (Get-ProgramSplitPhysicalResolver -AdapterName 'WireGuardSplit' -TunnelDns '10.2.0.1')) `
     'a missing physical default route yields no forwarding resolver'
 $script:physicalRoute = [pscustomobject]@{ InterfaceIndex = 15 }
+$script:servers = @([pscustomobject]@{ ServerAddresses = @('192.168.1.1') })
+# A dead primary with a live secondary is not a physical-resolver outage: the dispatcher fails over to it.
+$answersFunction = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-PhysicalResolverAnswers'
+}, $true))
+Assert-True ($answersFunction.Count -eq 1) 'controller defines the physical-resolver check once'
+. ([scriptblock]::Create($answersFunction[0].Extent.Text))
+$configuration = [pscustomobject]@{ AdapterName = 'WireGuardSplit'; TunnelDns = '10.2.0.1' }
+$root = 'C:\fixture'
+$logs = 'C:\fixture\logs'
+$script:asked = [Collections.Generic.List[string]]::new()
+$script:liveResolvers = @('1.1.1.1')
+function Invoke-ProgramSplitProcess { param($FilePath, $ArgumentList, $TimeoutMilliseconds, $OutputLog, $ErrorLog)
+    $script:asked.Add($ArgumentList[0])
+    if ($script:liveResolvers -contains $ArgumentList[0]) { [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @('PASS: answered'); Error = @() } }
+    else { [pscustomobject]@{ ExitCode = 1; TimedOut = $false; Output = @(); Error = @('ERROR: No DNS response') } }
+}
+$script:servers = @([pscustomobject]@{ ServerAddresses = @('192.168.1.1', '1.1.1.1') })
+Assert-True ((Test-PhysicalResolverAnswers) -and ($script:asked -join ',') -eq '192.168.1.1,1.1.1.1') `
+    'a dead first resolver with a live second counts as answering'
+$script:liveResolvers = @()
+Assert-True (-not (Test-PhysicalResolverAnswers)) 'no answering resolver is a physical-resolver outage'
 $script:servers = @([pscustomobject]@{ ServerAddresses = @('192.168.1.1') })
 
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("wgps-health-{0}" -f [guid]::NewGuid())
@@ -187,6 +223,8 @@ try {
     $activeFile = Join-Path $state 'active'
     $filtersInstalledFile = Join-Path $state 'wfp-filters.installed'
     $keepFiltersFile = Join-Path $state 'keep-filters.request'
+    $keepFiltersSeenFile = Join-Path $state 'keep-filters.seen.json'
+    $script:keepFiltersSeen = $null
     $tunnelRetryFile = Join-Path $state 'tunnel-retry'
     $dispatcherSupervisedFile = Join-Path $state 'dns-dispatcher.supervised'
     $stackStoppedFile = Join-Path $state 'stack-stopped'
@@ -235,11 +273,25 @@ try {
     Assert-True (-not (Test-StackPresent -Import)) 'a profile import counts only the tunnel, keeping the filters and DNS'
     Remove-Item -LiteralPath $dispatcherSupervisedFile
     Assert-True (-not (Test-FilterHoldRequested)) 'no hold is requested without the tray''s request file'
-    [IO.File]::WriteAllText($keepFiltersFile, 'import')
-    Assert-True (Test-FilterHoldRequested) 'a fresh profile-import request holds the filters'
-    [IO.File]::SetLastWriteTimeUtc($keepFiltersFile, [DateTime]::UtcNow.AddMinutes(-6))
-    Assert-True (-not (Test-FilterHoldRequested)) 'an abandoned profile-import request expires'
+    # The hold runs five minutes on the monotonic clock from its first sighting; wall-clock steps (here the
+    # request file's time moved by hours either way) change nothing.
+    $script:monotonic = 1000.0
+    function Get-ControllerElapsed { [TimeSpan]::FromSeconds($script:monotonic) }
+    [IO.File]::WriteAllText($keepFiltersFile, 'import 1')
+    [IO.File]::SetLastWriteTimeUtc($keepFiltersFile, [DateTime]::UtcNow.AddHours(-3))
+    Assert-True (Test-FilterHoldRequested) 'a fresh profile-import request holds the filters even if its file time is hours old'
+    $script:monotonic += 240
+    Assert-True (Test-FilterHoldRequested) 'the hold lasts five monotonic minutes'
+    [IO.File]::SetLastWriteTimeUtc($keepFiltersFile, [DateTime]::UtcNow.AddHours(3))
+    $script:monotonic += 61
+    Assert-True (-not (Test-FilterHoldRequested)) 'an abandoned profile-import request expires after five monotonic minutes, whatever the file time says'
+    # A restarted controller keeps the first sighting from state.
+    $script:keepFiltersSeen = $null
+    Assert-True (-not (Test-FilterHoldRequested)) 'a restarted controller does not restart an expired hold'
+    [IO.File]::WriteAllText($keepFiltersFile, 'import 2')
+    Assert-True (Test-FilterHoldRequested) 'a new import request starts a new hold'
     Remove-Item -LiteralPath $keepFiltersFile
+    Assert-True (-not (Test-FilterHoldRequested) -and -not (Test-Path -LiteralPath $keepFiltersSeenFile)) 'a withdrawn request ends the hold and its record'
     Remove-Item -LiteralPath $filtersInstalledFile
     Assert-True (-not (Test-StackPresent)) 'a stopped tunnel, no rule and no filters leave nothing present'
     $script:serviceStatus = 'Running'

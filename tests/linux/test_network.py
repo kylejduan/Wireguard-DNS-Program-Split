@@ -623,6 +623,34 @@ class NetworkTests(unittest.TestCase):
             self.net.disable(guard_blocked=True)
         self.assertIn(foreign, self.kernel.routes)
 
+    def test_named_tables_are_read_once_per_observation_and_refreshed_by_the_next(self):
+        named = {'isp': 100}
+        reads = []
+
+        def read():
+            reads.append(dict(named))
+            return {**network._BUILTIN_TABLES, **named}
+        routes = [{'dst': f'198.51.{i // 256}.{i % 256}/32', 'dev': 'eth0', 'table': 'isp'} for i in range(1000)]
+        with patch('wg_program_split.inventory._named_tables', read):
+            kernel = Kernel()
+            kernel.routes += routes
+            kernel.rules.insert(1, {'priority': 100, 'src': 'all', 'table': 'isp'})
+            network.allocate(network.inspect(PROFILE, runner=kernel))
+            self.assertEqual(len(reads), 1)
+            self.net.prepare(guard_blocked=True)
+            self.kernel.routes += routes
+            reads.clear()
+            self.assertTrue(self.net.health().ready)
+            self.assertEqual(len(reads), 1)
+            # An administrator renames the table into the reserved number: the
+            # next observation reads the new mapping and sees a foreign route.
+            named['isp'] = 57000
+            self.assertIn('routing_table:foreign', self.net.health().changed)
+            self.assertEqual(len(reads), 2)
+        with patch('wg_program_split.inventory._named_tables', side_effect=AssertionError('read')):
+            self.kernel.routes = [r for r in self.kernel.routes if r.get('table') != 'isp']
+            self.assertTrue(self.net.health().ready)  # Builtin and numeric tables need no read.
+
     def test_empty_zone_cleanup_error_requires_successful_empty_readback(self):
         self.net.prepare(guard_blocked=True)
         self.kernel.fail_prefix = ('conntrack', '-D')

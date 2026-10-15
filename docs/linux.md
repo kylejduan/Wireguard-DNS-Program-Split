@@ -127,7 +127,19 @@ The optimized controller shares a coherent guard snapshot and reads the owned
 WireGuard interface once per network observation. Ordinary-file and IP resolver
 guard paths reject irrelevant objects with fewer helper calls. Path identity,
 ownership verification, real DNS probes and the five-second health interval are
-retained.
+retained. The nftables, `iptables-nft-save` and `ip6tables-nft-save` listings
+are reused while the kernel's nf_tables ruleset generation (read over netlink,
+read again after each listing so a listing raced by a change is never kept) is
+unchanged. Any nft or iptables-nft edit, flush or deletion advances it, so the
+next check lists again. The kernel removes an owner-bound table (flag `owner`)
+when its owning process closes its netlink socket without advancing the
+generation, so while any such table is listed nothing is reused. The analysis of foreign nftables marks is likewise
+computed once per distinct listing. Legacy `-save` dumps run only when legacy
+tables exist (`/proc/net/ip_tables_names`, `/proc/net/ip6_tables_names`);
+otherwise they would print nothing. Named routing tables are read once per
+observation. On the VM with a ruleset shaped like the reference host's, these
+changes halved the controller's steady-state CPU (11.9 to 5.9 ms per second)
+and cut each check from 24 to 14 spawned commands.
 
 The target is added local p99 overhead below 1 ms where practical, with minimal
 CPU cost. See the [performance comparison](linux-performance.md) for the controlled
@@ -328,8 +340,15 @@ inspection.
 
 The early unit orders guard loading before ordinary system startup. **Ordering
 does not make a failed guard load stop host boot.** Active supported hooks are a
-prerequisite. A deployment bot should additionally require and follow the guard
-unit so a guard startup failure prevents that bot from starting. This service
+prerequisite. The early unit makes one attempt, so a persistent failure never
+stalls boot. The controller unit only wants it: if the early load fails (for
+example `/run` briefly out of space), the controller still starts and its
+activation loads the blocking guard itself before any networking. A failed
+startup exits and systemd retries it, backing off from 5 to 60 seconds; each
+retry runs the early guard unit again first, so it too ends active once the
+fault clears. `disable` stops the retries. A deployment bot should additionally require and follow the guard
+unit so a guard startup failure prevents that bot from starting; after such a
+boot, start the bot once the controller reports ready. This service
 dependency gates startup; it does not perform executable classification. A root
 administrator or another network manager removing/replacing enforcement is
 outside the ordinary tunnel/controller-loss guarantee.

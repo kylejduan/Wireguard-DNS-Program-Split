@@ -32,13 +32,14 @@ $tunnelAst = [Management.Automation.Language.Parser]::ParseFile(
 $resetFunctions = @($tunnelAst.FindAll({
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -in @('Get-OwnedServiceProcess', 'Reset-PendingService', 'Wait-ServiceRunning')
+        $node.Name -in @('Get-OwnedServiceProcess', 'Reset-PendingService', 'Wait-ServiceRunning', 'Get-MonotonicSeconds', 'Get-PendingHostAge')
 }, $true))
-Assert-True ($resetFunctions.Count -eq 3) 'tunnel service-recovery helpers are each defined once'
+Assert-True ($resetFunctions.Count -eq 5) 'tunnel service-recovery helpers are each defined once'
 Add-Type -AssemblyName System.ServiceProcess
 $resetHarness = [scriptblock]::Create((@'
 param([string[]] $Statuses, [string] $ProcessPath, [int] $ServicePid = 4242, [int] $HostAgeSeconds = 5,
-[string] $Call = 'Reset', [int] $Seconds = 0, [switch] $KillFails)
+[string] $Call = 'Reset', [int] $Seconds = 0, [switch] $KillFails, [int] $StartTimeOffsetSeconds = 0, [switch] $NotSeenBefore,
+[string] $PendingSeen, [switch] $LockState, [long] $StartTicks = 0)
 $serviceName = 'WireGuardTunnel$WireGuardSplit'
 $hostExe = 'C:\ProgramData\WireGuardProgramSplit\bin\tunnel-host.exe'
 $adapterName = 'WireGuardSplit'
@@ -54,9 +55,25 @@ param($status, $timeout)
 if ($this.Killed.Count -and -not $this.KillFails) { $this.Status = $status }
 else { throw [System.ServiceProcess.TimeoutException]::new('stub timeout') }
 }
+# HostAgeSeconds is how long the host has been seen pending on the monotonic clock. Its wall-clock start
+# time agrees unless StartTimeOffsetSeconds models a clock step.
 $fakeProcess = [pscustomobject]@{
 Id = 4242; Path = $ProcessPath; Handle = [IntPtr]::Zero
-StartTime = [DateTime]::Now.AddSeconds(-$HostAgeSeconds); Killed = $killed
+StartTime = [DateTime]::Now.AddSeconds(-$HostAgeSeconds + $StartTimeOffsetSeconds); Killed = $killed
+}
+if ($StartTicks) { $fakeProcess.StartTime = [DateTime]::new($StartTicks, [DateTimeKind]::Utc).ToLocalTime() }
+$pendingState = Join-Path ([IO.Path]::GetTempPath()) ("wgps-pending-{0}.json" -f [guid]::NewGuid())
+$script:pendingReport = $null
+$lock = $null
+if ($LockState) {
+# A state file nothing can read or replace: only the controller's sighting can carry the clock.
+[IO.File]::WriteAllText($pendingState, 'held')
+$lock = [IO.FileStream]::new($pendingState, 'Open', 'ReadWrite', 'None')
+} elseif (-not $NotSeenBefore) {
+[IO.File]::WriteAllText($pendingState, ([ordered]@{
+Identity = "4242:$($fakeProcess.StartTime.ToUniversalTime().Ticks)"
+FirstSeen = [Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency - $HostAgeSeconds
+} | ConvertTo-Json -Compress))
 }
 $fakeProcess | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.Killed.Add([int] $this.Id) }
 function Get-Service { $fake }
@@ -73,7 +90,10 @@ try {
 if ($Call -eq 'Wait') { $output = @(Wait-ServiceRunning -TimeoutSeconds $Seconds) }
 else { $output = @(Reset-PendingService -SettleSeconds $Seconds) }
 } catch { $failure = $_.Exception.Message }
-[pscustomobject]@{ Killed = @($killed); Failure = $failure; Output = $output; FinalStatus = $fake.Status }
+if ($lock) { $lock.Dispose() }
+$recorded = Test-Path -LiteralPath $pendingState
+Remove-Item -LiteralPath $pendingState -Force -ErrorAction SilentlyContinue
+[pscustomobject]@{ Killed = @($killed); Failure = $failure; Output = $output; FinalStatus = $fake.Status; Recorded = $recorded; Report = $script:pendingReport }
 '@))
 $ownedHost = 'C:\ProgramData\WireGuardProgramSplit\bin\tunnel-host.exe'
 $stuckStart = & $resetHarness -Statuses @('StartPending') -ProcessPath $ownedHost -HostAgeSeconds 120
@@ -116,6 +136,25 @@ Assert-True (@($slowStart.Killed).Count -eq 0 -and $slowStart.Failure -like '*ne
 $stuckHost = & $resetHarness -Call Wait -Statuses @('StartPending') -ProcessPath $ownedHost -HostAgeSeconds 120
 Assert-True (@($stuckHost.Killed).Count -eq 1 -and $stuckHost.Failure -like '*was reset so the next attempt starts clean*') `
     'a tunnel host pending far longer than any normal start is reset'
+# Pending time is monotonic: a backward clock step that puts the host's start an hour in the future does
+# not shield a stuck host, and a forward step that makes a young host look hours old does not end it.
+foreach ($call in 'Wait', 'Reset') {
+    $stepBack = & $resetHarness -Call $call -Statuses @('StartPending') -ProcessPath $ownedHost -HostAgeSeconds 120 -StartTimeOffsetSeconds 3600
+    Assert-True (@($stepBack.Killed).Count -eq 1) "$call resets a stuck host after a backward clock step"
+    $stepForward = & $resetHarness -Call $call -Statuses @('StartPending') -ProcessPath $ownedHost -HostAgeSeconds 20 -StartTimeOffsetSeconds -7200
+    Assert-True (@($stepForward.Killed).Count -eq 0) "$call keeps a young host after a forward clock step"
+    $firstSight = & $resetHarness -Call $call -Statuses @('StartPending') -ProcessPath $ownedHost -HostAgeSeconds 7200 -NotSeenBefore
+    Assert-True (@($firstSight.Killed).Count -eq 0 -and $firstSight.Recorded) "$call starts measuring a host seen pending for the first time"
+    # The state file can be neither read nor replaced: the sighting the controller passes back still ages,
+    # so the stuck host is reset after the limit.
+    $hostStarted = [DateTime]::UtcNow.AddSeconds(-30).Ticks
+    $unsaved = & $resetHarness -Call $call -Statuses @('StartPending') -ProcessPath $ownedHost -HostAgeSeconds 0 -LockState -StartTicks $hostStarted
+    Assert-True (@($unsaved.Killed).Count -eq 0 -and $unsaved.Report -match '^\d+:\d+\|') "$call reports its first sighting when it cannot save it: $($unsaved.Report)"
+    $identity, $seen = $unsaved.Report -split '\|'
+    $aged = '{0}|{1}' -f $identity, ([double]$seen - 95).ToString([Globalization.CultureInfo]::InvariantCulture)
+    $later = & $resetHarness -Call $call -Statuses @('StartPending') -ProcessPath $ownedHost -HostAgeSeconds 0 -LockState -PendingSeen $aged -StartTicks $hostStarted
+    Assert-True (@($later.Killed).Count -eq 1) "$call resets a stuck host by the controller's sighting while its state file is locked"
+}
 
 # Stop must stay available after the startup inputs become unusable, or a running tunnel can never be
 # released. Run the real script against a root with settings but no runtime DLLs or profile. Unelevated it

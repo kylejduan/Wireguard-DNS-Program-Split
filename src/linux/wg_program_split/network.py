@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Explicit owned Linux networking operations; controller owns BPF readiness."""
 from dataclasses import asdict, dataclass, replace
+import functools
 import hashlib
 import json
 import os
@@ -13,7 +14,7 @@ from .inventory import (  # noqa: F401  (re-exported for callers and tests)
     _BUILTIN_TABLES, _IPTABLES_DUMPS, _OPAQUE_MARK_EXTENSIONS, _TABLE_DIRS, _TABLE_FILES,
     _TOOL_PATH, _call, _has_mark, _iptables_dumps, _json, _legacy_mask, _legacy_zones,
     _named_tables, _nft_usage, _opaque_marks, _require_mark_visibility, _split_mark,
-    _table, _u32, _wireguard_state, conntrack_zones, run_command,
+    TableNames, _table, _u32, _wireguard_state, conntrack_zones, run_command,
 )
 from .firewall import Firewall
 from . import ownership as own
@@ -67,6 +68,7 @@ def inspect(profile: Profile, *, runner=run_command, require_underlay=True) -> I
 def _inspect(profile, *, runner, require_underlay):
     """Read-only preflight; refuse old full tunnels and ambiguous policy state."""
     links = _json(runner, 'ip', '-j', '-d', 'link', 'show')
+    table = TableNames()  # One configuration read for the whole inventory.
     rules = _json(runner, 'ip', '-j', '-4', 'rule', 'show')
     rules6 = _json(runner, 'ip', '-j', '-6', 'rule', 'show')
     routes = _json(runner, 'ip', '-j', '-4', 'route', 'show', 'table', 'all')
@@ -78,7 +80,7 @@ def _inspect(profile, *, runner, require_underlay):
             any(entry.get('table', {}).get('name') == 'wg_program_split' and
                 entry['table'].get('family') == 'inet' for entry in nft['nftables'])):
         raise NetworkError('reserved network name already exists; ownership is not established')
-    if not any(rule.get('priority') == 0 and _table(rule.get('table', 0)) == 255 for rule in rules):
+    if not any(rule.get('priority') == 0 and table(rule.get('table', 0)) == 255 for rule in rules):
         raise NetworkError('required host local routing rule is absent')
     if sum(rule.get('priority') == 0 for rule in rules) != 1:
         raise NetworkError('foreign routing at priority zero prevents an earlier owned policy')
@@ -89,13 +91,13 @@ def _inspect(profile, *, runner, require_underlay):
            for route in routes):
         raise NetworkError('foreign full-tunnel routing must be retired by its owner')
     used, zones = _nft_usage(nft)
-    priorities, tables = set(), {_table(route.get('table', 254)) for route in routes}
+    priorities, tables = set(), {table(route.get('table', 254)) for route in routes}
     for rule in rules + rules6:
         if 'fwmark' in rule:
             _u32(rule['fwmark'])
             used |= _u32(rule.get('fwmask', 0xffffffff))
         if 'table' in rule:
-            tables.add(_table(rule['table']))
+            tables.add(table(rule['table']))
     for rule in rules:
         priorities.add(_u32(rule.get('priority')))
     for line in _call(runner, 'wg', 'show', 'all', 'fwmark').splitlines():
@@ -176,6 +178,24 @@ def _stable_nft(value):
     return value
 
 
+@functools.lru_cache(maxsize=4)
+def _foreign_nft(text, table):
+    """Mark bits, conntrack zones and hidden iptables marks claimed by the nft
+    ruleset outside the owned TABLE. A pure function of the listing text, so an
+    unchanged ruleset is analysed once; any change yields new text. Failures
+    are not cached and recur on every check."""
+    try:
+        entries = json.loads(text)['nftables']
+    except (ValueError, TypeError, KeyError):
+        raise NetworkError('incomplete live network inventory') from None
+    foreign = [entry for entry in entries if not any(
+        isinstance(item, dict) and item.get('family') == 'inet' and
+        ((kind == 'table' and item.get('name') == table) or item.get('table') == table)
+        for kind, item in entry.items())]
+    bits, zones = _nft_usage(foreign)
+    return bits, frozenset(zones), _opaque_marks(foreign)
+
+
 @dataclass(frozen=True)
 class Health:
     matching: tuple[str, ...]
@@ -254,12 +274,15 @@ class Network:
                 'routes': _json(self.runner, 'ip', '-j', '-4', 'route', 'show', 'table', 'all'),
                 'rules': _json(self.runner, 'ip', '-j', '-4', 'rule', 'show'),
                 'rules6': _json(self.runner, 'ip', '-j', '-6', 'rule', 'show'),
-                'nft': _json(self.runner, 'nft', '-j', 'list', 'ruleset')['nftables'],
             }
+            nft_text = _call(self.runner, 'nft', '-j', 'list', 'ruleset')
+            snapshot['nft'] = json.loads(nft_text)['nftables']
             if any(not isinstance(v, list) or any(not isinstance(x, dict) for x in v)
                    for v in snapshot.values()):
                 raise ValueError
             snapshot['owned_nft'] = self._nft_identity(snapshot['nft'])
+            snapshot['table'] = TableNames()  # Shared by every check of this observation.
+            snapshot['nft_text'] = nft_text
             return snapshot
         except (KeyError, TypeError, ValueError):
             raise NetworkError('incomplete live network inventory') from None
@@ -299,7 +322,7 @@ class Network:
         a, kind, name = self.allocation, resource.kind, resource.name
         if kind == 'route':
             metric = 32760 if name == 'fallback' else 10
-            routes = [r for r in snapshot['routes'] if _table(r.get('table', 254)) == a.routing_table
+            routes = [r for r in snapshot['routes'] if snapshot['table'](r.get('table', 254)) == a.routing_table
                       and r.get('metric') == metric and r.get('dst') in ('default', '0.0.0.0/0')]
             if not routes:
                 return None
@@ -378,21 +401,18 @@ class Network:
 
     def _allocation_conflict(self, snapshot):
         a = self.allocation
-        foreign_nft = [entry for entry in snapshot['nft'] if not any(
-            isinstance(item, dict) and item.get('family') == 'inet' and
-            ((kind == 'table' and item.get('name') == a.nft_table) or item.get('table') == a.nft_table)
-            for kind, item in entry.items())]
-        bits, zones = _nft_usage(foreign_nft)
+        bits, zones, opaque = _foreign_nft(snapshot['nft_text'], a.nft_table)
+        zones = set(zones)
         own_rules = {_canonical(r.identity['state']) for r in self.receipt.resources if r.kind == 'rule'}
         for rule in snapshot['rules']:
             if _canonical(rule) in own_rules:
                 continue
             priority = _u32(rule.get('priority'))
-            if 0 < priority <= a.priority or (priority == 0 and _table(rule.get('table', 0)) != 255):
+            if 0 < priority <= a.priority or (priority == 0 and snapshot['table'](rule.get('table', 0)) != 255):
                 return True
             if 'fwmark' in rule:
                 bits |= _u32(rule.get('fwmask', 0xffffffff))
-        if sum(r.get('priority') == 0 and _table(r.get('table', 0)) == 255 for r in snapshot['rules']) != 1:
+        if sum(r.get('priority') == 0 and snapshot['table'](r.get('table', 0)) == 255 for r in snapshot['rules']) != 1:
             return True
         for rule in snapshot['rules6']:
             if 'fwmark' in rule:
@@ -404,7 +424,8 @@ class Network:
             if parts[0] != a.interface and parts[1] != 'off':
                 bits |= _u32(parts[1])
         dumps = _iptables_dumps(self.runner)
-        _require_mark_visibility(foreign_nft, dumps)
+        if opaque and not {'iptables-nft-save', 'ip6tables-nft-save'} <= set(dumps):
+            raise NetworkError('iptables-nft mark or conntrack rules need iptables-nft-save to be inventoried')
         for text in dumps.values():
             bits |= _legacy_mask(text)
             zones |= _legacy_zones(text)
@@ -545,7 +566,7 @@ class Network:
         if self.uncertain:
             changed.append('unrecorded acquisition')
         expected_routes = {_canonical(r.identity['state']) for r in self.receipt.resources if r.kind == 'route'}
-        if any(_table(r.get('table', 254)) == self.allocation.routing_table and
+        if any(snapshot['table'](r.get('table', 254)) == self.allocation.routing_table and
                _canonical(r) not in expected_routes for r in snapshot['routes']):
             changed.append('routing_table:foreign')
         if self._allocation_conflict(snapshot):
@@ -585,7 +606,7 @@ class Network:
         if ((('interface', a.interface) not in recorded and
              any(link.get('ifname') == a.interface for link in snapshot['links'])) or
                 (('nft_table', a.nft_table) not in recorded and snapshot['owned_nft'] is not None) or
-                any(_table(r.get('table', 254)) == a.routing_table and _canonical(r) not in routes
+                any(snapshot['table'](r.get('table', 254)) == a.routing_table and _canonical(r) not in routes
                     for r in snapshot['routes']) or
                 any(r.get('priority') == a.priority and (rule is None or _canonical(r) != _canonical(rule))
                     for r in snapshot['rules'])):

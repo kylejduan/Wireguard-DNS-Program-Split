@@ -27,28 +27,31 @@ $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path $RepositoryRoot 'src\powershell\Controller.ps1'), [ref]$tokens, [ref]$errors)
 $launcher = @($ast.FindAll({ param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Start-Component'
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Start-Component', 'Complete-Component')
 }, $true))
-Assert-True ($launcher.Count -eq 1) 'controller component launcher is available'
+Assert-True ($launcher.Count -eq 2) 'controller component launcher is available'
+$commonAst = [Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $RepositoryRoot 'src\powershell\Common.ps1'), [ref]$tokens, [ref]$errors)
+$capture = @($commonAst.FindAll({ param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('ConvertTo-ProgramSplitArgument', 'Start-ProgramSplitProcess', 'Complete-ProgramSplitProcess')
+}, $true))
+Assert-True ($capture.Count -eq 3) 'process capture helpers are available'
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ('WireGuard path test ' + [guid]::NewGuid())
-$process = $null
 try {
     [IO.Directory]::CreateDirectory($temporary) | Out-Null
     [IO.File]::WriteAllText((Join-Path $temporary 'sample child.ps1'), 'param([string] $Action) Write-Output "child received: $Action"')
-    [IO.File]::WriteAllText((Join-Path $temporary 'launch.ps1'),
-        '$logs = $PSScriptRoot' + "`n" + $launcher[0].Extent.Text + "`n" + 'Start-Component "sample child.ps1" "Validate"')
-    $component = & (Join-Path $temporary 'launch.ps1')
-    $process = $component.Process
-    Assert-True ($process.WaitForExit(10000)) 'component exits within its deadline'
-    $process.WaitForExit()
-    Assert-True ($process.ExitCode -eq 0) 'component path with spaces executes successfully'
-    Assert-True ((Get-Content -LiteralPath $component.Stdout -Raw).Trim() -eq 'child received: Validate') `
-        'child receives the requested action from a path containing spaces'
+    [IO.File]::WriteAllText((Join-Path $temporary 'launch.ps1'), (@(
+        '$logs = $PSScriptRoot', '$script:logged = [Collections.Generic.List[string]]::new()',
+        ("`$script:ProgramSplitRunner = '{0}'" -f (Join-Path $RepositoryRoot 'build\controller-service.exe')),
+        'function Write-ControllerLog([string] $message) { $script:logged.Add($message) }') +
+        @($capture | ForEach-Object { $_.Extent.Text }) + @($launcher | ForEach-Object { $_.Extent.Text }) +
+        @('Complete-Component (Start-Component "sample child.ps1" "Validate")', '$script:logged') -join "`n"))
+    $logged = @(& (Join-Path $temporary 'launch.ps1'))
+    Assert-True (($logged -join ' ') -match 'child received: Validate' -and ($logged -join ' ') -match 'completed in') `
+        "child receives the requested action from a path containing spaces and completes: $($logged -join ' ')"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $temporary 'sample child-output.log') -Raw).Trim() -eq 'child received: Validate') `
+        'component output is also kept in its log'
 } finally {
-    if ($process) {
-        if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
-        $process.Dispose()
-    }
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }
 # Migration swaps three scripts, so it must refuse an installation whose other components are another release's.

@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <cwchar>
 #include <filesystem>
 #include <iostream>
@@ -14,6 +15,7 @@
 #include "log-pipe.h"
 #include "parse-number.h"
 #include "log-self-test.h"
+#include <algorithm>
 
 namespace {
 
@@ -131,6 +133,7 @@ std::wstring powerShellPath() {
 }
 
 #include "dispatcher-supervisor.h"
+#include "bounded-run.h"
 
 bool launchController(HANDLE job, HANDLE& child, HANDLE log) {
     const std::filesystem::path script(gControllerScript);
@@ -363,6 +366,14 @@ int selfTest() {
         statusProcessId("pid=4294967295\n") != 4294967295UL || statusProcessId("pid=4294967296") != 0 ||
         statusProcessId("pid=99999999999999999999999999") != 0 || statusProcessId("pid=12x") != 0 ||
         statusProcessId("pid=-1") != 0 || statusProcessId("pid= 12") != 0) return 17;
+    // The runner's framing: base64 round-trips every byte and rejects malformed input.
+    std::string allBytes;
+    for (int value = 0; value < 256; ++value) allBytes += static_cast<char>(value);
+    for (size_t length : {0u, 1u, 2u, 3u, 256u}) {
+        const std::string encoded = base64Encode(allBytes.substr(0, length));
+        if (length && base64Decode(std::wstring(encoded.begin(), encoded.end())) != allBytes.substr(0, length)) return 18;
+    }
+    if (base64Encode("ab") != "YWI=" || !base64Decode(L"YW=I").empty() || !base64Decode(L"YWI").empty() || !base64Decode(L"YW*=").empty()) return 19;
     std::wcout << L"PASS: bounded logs and controller service command-line setup and exit reporting.\n";
     return 0;
 }
@@ -371,6 +382,7 @@ int selfTest() {
 
 int wmain(int argc, wchar_t** argv) {
     if (argc == 2 && std::wcscmp(argv[1], L"--self-test") == 0) return selfTest();
+    if (argc == 4 && std::wcscmp(argv[1], L"--run") == 0) return boundedRun(argv[2], argv[3]);
     // The supervisor alone, for tests against an installation-shaped directory; ends when the process does.
     if (argc == 3 && std::wcscmp(argv[1], L"--supervise-dispatcher") == 0) {
         HANDLE never = CreateEventW(nullptr, TRUE, FALSE, nullptr);
