@@ -41,6 +41,26 @@ enables `route_localnet` only on its own WireGuard interface and limits incoming
 loopback-addressed replies. Established payload forwarding stays in the kernel;
 there is no userspace packet queue or DNS forwarder service.
 
+Destination NAT is decided once per connection, so an earlier foreign NAT chain
+(for example a priority -110 output chain that sends port 53 to the host's
+loopback stub or another resolver) or a `REDIRECT` could otherwise take an
+included query. (A `NOTRACK` cannot: the owned raw chain gives included DNS a
+conntrack zone template first, which `notrack` leaves alone.) The owned egress chain therefore
+enforces the outcome after all NAT: included traffic to port 53, or originally
+to port 53 per conntrack, leaves only for the profile resolver and is dropped
+otherwise, before the loopback allowance. Included traffic is identified by its
+packet mark, which NAT does not change. The readiness probe itself is an
+included query to `127.0.0.53`, so such a rule makes it fail: the controller
+reports degraded and blocks new included sockets until the rule is removed.
+Unlisted DNS follows the foreign rule unchanged. Only original-direction (or
+untracked) packets are checked, so an enrolled DNS server still answers unlisted
+clients. A foreign stateless header rewrite (an nftables `payload` write of an
+address or port, such as `udp dport set 5353`, or a raw payload write) could move
+a query past these checks before conntrack sees it, so inventory refuses it by
+name at activation and in every health check; iptables has no such target
+outside NAT except xtables-addons `RAWDNAT`/`RAWSNAT`, which the target allowlist
+refuses. Rewrites of other header fields (DSCP, ECN, TTL) are accepted.
+
 Resolver guards prevent included processes from using supported host resolver
 IPC and shared nscd hosts-cache files. These guards also cover inherited/received
 file descriptors, Unix stream `splice`, endpoint aliases and late standard
@@ -120,8 +140,39 @@ blocks new included sockets until the next passing check, at least five seconds
 later; established sockets continue. Foreign nftables mark or conntrack-zone
 expressions the inventory cannot classify block activation and degrade a
 running guard rather than being assumed disjoint. iptables rules of either
-flavour are read through their `-save` dumps, so `MARK` and
-`CONNMARK --restore-mark --nfmask` bits are reserved exactly.
+flavour are read through their `-save` dumps, rule by rule, with quoted values
+(which may span lines) read as the serializer escapes them. Only unquoted
+keywords are structural: a rule's target is its single unquoted `-j` or `-g`,
+chain declarations and comments are skipped, a jump to a declared chain (such
+as kube-proxy's `KUBE-MARK-MASQ`) is not a target, and other targets' arguments
+are not interpreted. Where an unquoted value makes the structure undecidable
+(a second unquoted `-j`, or a mark option away from its module or target), the
+rule is refused. Every packet-mark bit a rule can read or
+change is reserved: the `mark` match's value and mask, the mask and value of
+`MARK` and of `TPROXY --tproxy-mark`, and for `CONNMARK --restore-mark` both
+`--nfmask` and the `--ctmask` the kernel XORs in after any
+`--left-shift-mark`/`--right-shift-mark` (each mask defaults to every bit).
+nftables writes of the current mark with a constant are modelled too: `or` and
+`xor` change the constant's bits, `and` clears its complement, and
+`(mark & mask) | value` or `^ value` changes the complement of the mask and the
+value. Targets are handled by allowlist: besides the modelled `MARK`,
+`CONNMARK` and `TPROXY`, a rule may jump only to a declared chain or to a target
+known never to write the packet mark (verdicts, `REJECT`, logging, NAT, `CT`,
+header, checksum and priority mangling, `SECMARK`/`CONNSECMARK`, `AUDIT`,
+`TRACE`, `SYNPROXY`, `IDLETIMER`, `LED`, `RATEEST`, `NFQUEUE`/`QUEUE`, and `SET`
+without `--map-mark`). Any other target, such as xtables-addons `IPMARK`, `HMARK`,
+`TEE` (which sends a clone of the packet, for included traffic its plaintext, to
+another gateway) or one the controller does not know, is refused by name as a
+conflict. An iptables-nft rule whose target nft shows only as an opaque
+extension is read from `iptables-nft-save` the same way. Foreign nftables `dup`
+and `fwd` statements, which copy a packet elsewhere or send it out another
+device (a netdev egress `fwd` on the tunnel device would emit plaintext), are
+refused by name as well. `socket --restore-skmark`, an option
+outside these forms, and any other nftables mark write (for example
+`meta mark set ct mark` or shifts) are also refused rather than modelled
+approximately. Packet queue verdicts are the
+one mark writer accepted without modelling; see the administrator residuals
+under [Operate](#operate).
 
 The optimized controller shares a coherent guard snapshot and reads the owned
 WireGuard interface once per network observation. Ordinary-file and IP resolver
@@ -346,12 +397,19 @@ example `/run` briefly out of space), the controller still starts and its
 activation loads the blocking guard itself before any networking. A failed
 startup exits and systemd retries it, backing off from 5 to 60 seconds; each
 retry runs the early guard unit again first, so it too ends active once the
-fault clears. `disable` stops the retries. A deployment bot should additionally require and follow the guard
+fault clears. (If the fault clears in the moment between the two units of one
+retry, the controller loads the guard itself and the early unit stays failed
+until the next boot; protection is the same.) `disable` stops the retries. A deployment bot should additionally require and follow the guard
 unit so a guard startup failure prevents that bot from starting; after such a
 boot, start the bot once the controller reports ready. This service
 dependency gates startup; it does not perform executable classification. A root
 administrator or another network manager removing/replacing enforcement is
-outside the ordinary tunnel/controller-loss guarantee.
+outside the ordinary tunnel/controller-loss guarantee. Likewise, a userspace
+program behind an iptables `NFQUEUE` (or `QUEUE`) rule or an nftables `queue`
+statement can set the packet mark in its verdict. The controller does not model
+or refuse such rules: it accepts them and reserves no mark bits for them. Queue
+consumers are root-privileged programs the administrator installs, and the
+administrator must not run one that writes the selected mark bits.
 
 ```sh
 sudo wg-program-split disable

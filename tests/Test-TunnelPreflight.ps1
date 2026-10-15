@@ -60,8 +60,29 @@ try {
     $source=[IO.File]::ReadAllText($path)
     Assert-True ($source -match 'New-Service -Name \$serviceName -BinaryPathName \$expectedCommand -StartupType Manual' -and $source -match 'Set-Service -Name \$serviceName -StartupType Manual' -and
         $source -notmatch "'start=' 'auto'|StartupType Automatic") 'SCM cannot bypass preflight through automatic tunnel startup'
+
+    # Endpoint resolution: Resolve-DnsName returns the CNAME chain first, and a CNAME record has no IPAddress.
+    $resolver = @($ast.FindAll({param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-TunnelEndpoint'
+    },$true))
+    Assert-True ($resolver.Count -eq 1 -and $source -match '\$endpoint = Resolve-TunnelEndpoint \$endpointHost') 'one function resolves a named tunnel endpoint'
+    . ([scriptblock]::Create($resolver[0].Extent.Text))
+    function Resolve-DnsName { param($Name, $Type, $ErrorAction) $global:wgpsTestRecords }
+    $global:wgpsTestRecords = @(
+        [pscustomobject]@{ Name = 'vpn.example.net'; Type = 'CNAME'; NameHost = 'edge.example.net' },
+        [pscustomobject]@{ Name = 'edge.example.net'; Type = 'A'; IPAddress = '198.51.100.7' })
+    Assert-True ((Resolve-TunnelEndpoint 'vpn.example.net') -eq '198.51.100.7') 'a CNAME followed by an A record resolves to the address'
+    $global:wgpsTestRecords = @([pscustomobject]@{ Name = 'vpn.example.net'; Type = 'CNAME'; NameHost = 'edge.example.net' })
+    $message = $null
+    try { Resolve-TunnelEndpoint 'vpn.example.net' } catch { $message = $_.Exception.Message }
+    Assert-True ($message -eq 'The tunnel endpoint vpn.example.net has no IPv4 address (A record).') 'a CNAME without an A record is a clear error'
+    $global:wgpsTestRecords = @([pscustomobject]@{ Name = 'vpn.example.net'; Type = 'A'; IPAddress = 'not-an-address' })
+    $message = $null
+    try { Resolve-TunnelEndpoint 'vpn.example.net' } catch { $message = $_.Exception.Message }
+    Assert-True ($message -like '*has no IPv4 address*') 'an A record must carry a valid IPv4 address'
 } finally {
     Remove-Item -LiteralPath $temporary -Recurse -Force
     Remove-Variable -Scope Global -Name wgpsTestEvents,wgpsTestReject,wgpsTestRace,wgpsTestService
+    Remove-Variable -Scope Global -Name wgpsTestRecords -ErrorAction SilentlyContinue
 }
-Write-Output 'PASS: tunnel creation is serialized, preflight-gated, and idempotent.'
+Write-Output 'PASS: tunnel creation is serialized, preflight-gated, and idempotent; endpoints resolve through CNAME records.'

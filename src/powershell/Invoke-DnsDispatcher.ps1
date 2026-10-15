@@ -232,7 +232,7 @@ foreach ($attempt in 1..20) {
 # A running dispatcher that lost its ETW session or port, or does not answer, cannot recover by reloading;
 # the supervisor starts a fresh one about a second after this one ends.
 $running = Get-ManagedProcess
-$published = $running -and ([string](Get-Content -LiteralPath $statusFile -Raw -ErrorAction SilentlyContinue)) -match "(?m)^pid=$($running.Id)\r?$"
+$published = $running -and $(try { [IO.File]::ReadAllText($statusFile) } catch { '' }) -match "(?m)^pid=$($running.Id)\r?$"
 if ($published -and (@(Get-OwnedTraceNames).Count -ne 1 -or -not (Get-NetUDPEndpoint -LocalAddress '127.0.0.1' -LocalPort 53 `
         -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -eq $running.Id }) -or
         -not (Test-ProgramSplitDispatcherAnswers))) {
@@ -261,4 +261,9 @@ while ($timer.Elapsed.TotalSeconds -lt 20) {
     }
     Start-Sleep -Milliseconds 100
 }
-throw "The DNS dispatcher did not load the current inputs: $([string](Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue))"
+# The dispatcher may still hold its output open for writing; StreamReader decodes UTF-8.
+$output = try {
+    $stream = [IO.File]::Open($stdout, 'Open', 'Read', 'ReadWrite, Delete')
+    try { [IO.StreamReader]::new($stream).ReadToEnd() } finally { $stream.Dispose() }
+} catch { '' }
+throw "The DNS dispatcher did not load the current inputs: $output"

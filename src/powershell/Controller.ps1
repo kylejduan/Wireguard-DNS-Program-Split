@@ -188,7 +188,7 @@ function Test-FilterHoldRequested {
         $now = (Get-ControllerElapsed).TotalSeconds
         $seen = $script:keepFiltersSeen
         if (-not $seen) {
-            try { $seen = Get-Content -LiteralPath $keepFiltersSeenFile -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $seen = $null }
+            try { $seen = [IO.File]::ReadAllText($keepFiltersSeenFile) | ConvertFrom-Json } catch { $seen = $null }
         }
         # A record from before a reboot, when the monotonic clock restarted, is a new sighting.
         if (-not $seen -or [string]$seen.Identity -cne $identity -or [double]$seen.FirstSeen -gt $now) {
@@ -284,8 +284,9 @@ function Save-HealthFailureEvidence([string] $Reason) {
                 } finally { $source.Dispose() }
             } catch { }
         }
-        Get-ChildItem -LiteralPath $evidenceRoot -Directory | Sort-Object Name -Descending |
-            Select-Object -Skip 10 | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        foreach ($old in @(Get-ChildItem -LiteralPath $evidenceRoot -Directory | Sort-Object Name -Descending | Select-Object -Skip 10)) {
+            try { Remove-ProgramSplitTree -Path $old.FullName } catch { }
+        }
         Write-ControllerLog "Health-failure evidence saved to $folder."
     } catch { }
 }
@@ -553,7 +554,7 @@ function Test-DnsCacheRestorePending(
     try {
         $key = Get-Item -LiteralPath $KeyPath
         # Assigned first: Windows PowerShell passes a parsed JSON array down the pipeline as one object.
-        $saved = Get-Content -LiteralPath $RecordPath -Raw | ConvertFrom-Json
+        $saved = [IO.File]::ReadAllText($RecordPath) | ConvertFrom-Json
         foreach ($item in $saved) {
             $actual = $key.GetValue([string]$item.Name, $null)
             if ($item.Exists) {
@@ -696,7 +697,7 @@ $required = @(
 foreach ($path in $required) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing controller input: $path" }
 }
-if (-not @(Get-Content -LiteralPath $includeFile | Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') })) {
+if (-not @([IO.File]::ReadAllLines($includeFile) | Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') })) {
     throw 'The included-app list is empty.'
 }
 if ($SelfTest) { Write-Output 'PASS: controller inputs and include list.'; exit 0 }

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Explicit native admission and identity-bound, persistent fixture ownership."""
+import ast
 import contextlib
 import fcntl
 import hashlib
@@ -13,6 +14,7 @@ import stat
 import subprocess
 import time
 import uuid
+import zipfile
 
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'}
 UNITS = ('wg-program-split-guard.service', 'wg-program-split.service')
@@ -79,6 +81,28 @@ def _staged(path, expected, keep, owner_uid):
 
 
 def staged_file(path, expected, *, owner_uid=0): return _staged(path, expected, False, owner_uid)[0]
+
+
+# Exact launcher bytes each reviewed installer writes to /usr/bin; a benchmark
+# build's installed entrypoint must hash to the one its own installer carries.
+REVIEWED_LAUNCHERS = {
+    '60e2ef6581a3e24c96fb4319763ffedfd192ad9599219d7e566c364f5b643592': 'no license header (b843960 baseline and earlier)',
+    'de8d0943544544cedee3a8a5622529350d27320cd615cc2de163498ed305607d': 'SPDX license header (0.3.0 and later)',
+}
+
+
+def launcher_sha256(package):
+    """SHA-256 of the LAUNCHER constant in PACKAGE's installer, if reviewed."""
+    with zipfile.ZipFile(package) as archive:
+        tree = ast.parse(archive.read('wg_program_split/install.py').decode('utf-8'))
+    values = [node.value for node in tree.body if isinstance(node, ast.Assign) and
+              [getattr(target, 'id', None) for target in node.targets] == ['LAUNCHER']]
+    if len(values) != 1: raise ValueError('build installer launcher not found')
+    launcher = ast.literal_eval(values[0])
+    if type(launcher) is not bytes: raise ValueError('build installer launcher not found')
+    value = hashlib.sha256(launcher).hexdigest()
+    if value not in REVIEWED_LAUNCHERS: raise ValueError('build installer writes an unreviewed launcher')
+    return value
 
 
 def staged_bytes(path, expected, *, owner_uid=0):
@@ -167,6 +191,9 @@ def validate_manifest(manifest):
         required = {'wg-program-split.pyz', 'bpf-loader', 'classifier.bpf.o', *UNITS}
         if set(build['sha256']) != required: raise ValueError('exact build artifact set required')
         for name, expected in build['sha256'].items(): staged_file(directory / name, expected)
+        launcher = launcher_sha256(directory / 'wg-program-split.pyz')
+        if build.setdefault('launcher_sha256', launcher) != launcher:
+            raise ValueError('manifest launcher differs from the build installer launcher')
     staged_file(manifest['probe'], manifest['probe_sha256'])
     if not manifest['management_ips']: raise ValueError('management/LAN/Tailscale route probes required')
     for address in manifest['management_ips']: ipaddress.ip_address(address)

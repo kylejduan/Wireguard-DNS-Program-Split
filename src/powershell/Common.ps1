@@ -346,11 +346,140 @@ function Clear-ProgramSplitStoppedMarker {
     }
 }
 
+# Installer staging holds the prepared profile and its private key. It is created protected (SYSTEM and
+# Administrators, nothing inherited) under %ProgramData%, before any key byte is written into it.
+$script:ProgramSplitStagingPattern = '^WireGuardProgramSplit-install-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
+function Get-ProgramSplitAclShape {
+    # One item's security descriptor, normalized: owner, whether the DACL is protected, and each ACE as
+    # type|SID|rights|inherited|inheritance flags|propagation flags, sorted.
+    param([Parameter(Mandatory)] [string] $Path)
+
+    $acl = Get-Acl -LiteralPath $Path
+    [pscustomobject]@{
+        Owner = ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
+        Protected = $acl.AreAccessRulesProtected
+        Aces = (@($acl.Access | ForEach-Object {
+            '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.AccessControlType, $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value,
+                $_.FileSystemRights, $_.IsInherited, $_.InheritanceFlags, $_.PropagationFlags
+        } | Sort-Object) -join ';')
+    }
+}
+
+function Test-ProgramSplitPrivateAcl {
+    # Exactly the descriptor the installer gives its private directories: a real directory (not a link),
+    # owned by SYSTEM or Administrators, with a protected DACL holding only explicit SYSTEM and Administrators
+    # full control that every file and subdirectory inherits.
+    param([Parameter(Mandatory)] [string] $Path)
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+        $shape = Get-ProgramSplitAclShape -Path $Path
+        $shape.Owner -in @('S-1-5-18', 'S-1-5-32-544') -and $shape.Protected -and $shape.Aces -ceq
+            'Allow|S-1-5-18|FullControl|False|ContainerInherit, ObjectInherit|None;Allow|S-1-5-32-544|FullControl|False|ContainerInherit, ObjectInherit|None'
+    } catch { $false }
+}
+
+function Test-ProgramSplitPrivateTree {
+    # The private directory and every descendant: no link anywhere, each owned by SYSTEM or Administrators,
+    # and each holding only the SYSTEM and Administrators full control inherited from the directory. Since
+    # then only SYSTEM and Administrators can change anything inside, nobody else can swap in a link between
+    # this check and the deletion that follows.
+    param([Parameter(Mandatory)] [string] $Path)
+
+    if (-not (Test-ProgramSplitPrivateAcl -Path $Path)) { return $false }
+    try {
+        $pending = [Collections.Generic.Stack[string]]::new()
+        $pending.Push($Path)
+        while ($pending.Count) {
+            foreach ($child in @([IO.DirectoryInfo]::new($pending.Pop()).EnumerateFileSystemInfos())) {
+                if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+                $directory = [bool]($child.Attributes -band [IO.FileAttributes]::Directory)
+                $flags = if ($directory) { 'ContainerInherit, ObjectInherit' } else { 'None' }
+                $shape = Get-ProgramSplitAclShape -Path $child.FullName
+                if ($shape.Owner -notin @('S-1-5-18', 'S-1-5-32-544') -or $shape.Protected -or $shape.Aces -cne
+                        "Allow|S-1-5-18|FullControl|True|$flags|None;Allow|S-1-5-32-544|FullControl|True|$flags|None") { return $false }
+                if ($directory) { $pending.Push($child.FullName) }
+            }
+        }
+        $true
+    } catch { $false }
+}
+
+function New-ProgramSplitPrivateDirectory {
+    param([Parameter(Mandatory)] [string] $Path)
+
+    # CreateDirectory applies the descriptor only to a directory it creates, so an existing one is refused.
+    if (Test-Path -LiteralPath $Path) { throw "A private directory already exists: $Path" }
+    $security = [Security.AccessControl.DirectorySecurity]::new()
+    $security.SetAccessRuleProtection($true, $false)
+    $security.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+        $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            [Security.Principal.SecurityIdentifier]::new($sid), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+    }
+    [IO.Directory]::CreateDirectory($Path, $security) | Out-Null
+    if (-not (Test-ProgramSplitPrivateAcl -Path $Path)) { throw "The private directory is not protected: $Path" }
+    $Path
+}
+
+function Get-ProgramSplitStagingParents {
+    # Staging now lives under %ProgramData%; releases before 0.3.2 staged under %TEMP%.
+    @($env:ProgramData, [IO.Path]::GetTempPath()) | Where-Object { $_ }
+}
+
+function Remove-ProgramSplitStaleStaging {
+    # Staging left by an interrupted installation. The name alone proves nothing: a directory is removed only
+    # when it and everything in it carry exactly the descriptor the installer sets. Anything else is skipped
+    # and reported, and nothing in it is deleted.
+    param([Parameter(Mandatory)] [string[]] $Parents)
+
+    foreach ($parent in $Parents) {
+        foreach ($directory in @(Get-ChildItem -LiteralPath $parent -Directory -Filter 'WireGuardProgramSplit-install-*' -Force -ErrorAction Stop |
+                Where-Object { $_.Name -match $script:ProgramSplitStagingPattern })) {
+            try { Remove-ProgramSplitStagingDirectory -Path $directory.FullName }
+            catch { Write-Warning $_.Exception.Message }
+        }
+    }
+}
+
+# Files are deleted, never overwritten first. On SSDs and NTFS an overwrite does not reliably remove the old
+# data (wear levelling, the journal), and writing through a name can change a hard-linked file elsewhere, so
+# confidentiality rests on the ACL while the data exists and on deletion afterwards.
+function Remove-ProgramSplitTree {
+    # Removes a file or directory tree without ever following a link: a symbolic link or junction (any
+    # reparse point) is deleted itself, never entered, so its target is untouched. A hard link loses only
+    # this name.
+    param([Parameter(Mandatory)] [string] $Path)
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if ($item.PSIsContainer) { [IO.Directory]::Delete($item.FullName, $false) } else { [IO.File]::Delete($item.FullName) }
+        return
+    }
+    if ($item.PSIsContainer) {
+        foreach ($child in @([IO.DirectoryInfo]::new($item.FullName).EnumerateFileSystemInfos())) {
+            Remove-ProgramSplitTree -Path $child.FullName
+        }
+        [IO.Directory]::Delete($item.FullName, $false)
+        return
+    }
+    if ($item.Attributes -band [IO.FileAttributes]::ReadOnly) { [IO.File]::SetAttributes($item.FullName, 'Normal') }
+    [IO.File]::Delete($item.FullName)
+}
+
 function Remove-ProgramSplitStagingDirectory {
+    # Installer staging is deleted only when it and every descendant carry exactly the installer's
+    # descriptor; otherwise it is left in place, untouched, and reported.
     param([Parameter(Mandatory)] [string] $Path)
 
     if (-not (Test-Path -LiteralPath $Path)) { return }
-    try { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop }
+    if (-not (Test-ProgramSplitPrivateTree -Path $Path)) {
+        throw "Installer staging was left in place: it or something in it is not protected as the installer creates it: $Path"
+    }
+    try { Remove-ProgramSplitTree -Path $Path }
     catch { throw "Sensitive installer staging could not be removed: $Path. $($_.Exception.Message)" }
     if (Test-Path -LiteralPath $Path) {
         throw "Sensitive installer staging could not be removed: $Path."
@@ -470,7 +599,7 @@ function Get-ProgramSplitConfiguration {
     if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
         throw "Missing local settings: $settingsPath"
     }
-    $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+    $settings = [IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
     foreach ($name in @('TunnelAddress', 'TunnelDns')) {
         $value = [string] $settings.$name
         $parsed = $null

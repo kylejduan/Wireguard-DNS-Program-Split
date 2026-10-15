@@ -289,8 +289,16 @@ try {
         Assert-True ($probeAttempts -eq 2) 'an unsignaled stop event leaves readiness retries in place'
     } finally { $stopRequest.Dispose() }
 
-    $lockedStaging = Join-Path $temporary 'locked-install-staging'
-    [IO.Directory]::CreateDirectory($lockedStaging) | Out-Null
+    # Installer staging is a protected directory; only an elevated run (as on CI) can create and use one. An
+    # unprotected directory is never deleted as staging: it is left in place and reported.
+    $stagingElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $newStaging = {
+        param($Name)
+        $path = Join-Path $temporary $Name
+        if ($stagingElevated) { New-ProgramSplitPrivateDirectory -Path $path | Out-Null } else { [IO.Directory]::CreateDirectory($path) | Out-Null }
+        $path
+    }
+    $lockedStaging = & $newStaging 'locked-install-staging'
     $lockedProfile = Join-Path $lockedStaging 'WireGuardSplit.conf'
     [IO.File]::WriteAllText($lockedProfile, 'test profile')
     $profileLock = [IO.File]::Open($lockedProfile, [IO.FileMode]::Open, [IO.FileAccess]::Read,
@@ -299,16 +307,18 @@ try {
     try { Remove-ProgramSplitStagingDirectory -Path $lockedStaging }
     catch { $cleanupFailure = $_.Exception.Message }
     finally { $profileLock.Dispose() }
-    Assert-True ($cleanupFailure -like 'Sensitive installer staging could not be removed:*') `
-        'staging cleanup reports a plaintext-profile deletion failure'
-    Assert-True (Test-Path -LiteralPath $lockedStaging) `
+    $expectedFailure = if ($stagingElevated) { 'Sensitive installer staging could not be removed:*' } else { 'Installer staging was left in place:*' }
+    Assert-True ($cleanupFailure -like $expectedFailure) `
+        'staging cleanup reports a plaintext-profile deletion failure, or refuses an unprotected directory'
+    Assert-True (Test-Path -LiteralPath $lockedProfile) `
         'failed staging cleanup leaves the locked directory visible for recovery'
-    Remove-ProgramSplitStagingDirectory -Path $lockedStaging
-    Assert-True (-not (Test-Path -LiteralPath $lockedStaging)) `
-        'staging cleanup confirms deletion after the lock is released'
+    if ($stagingElevated) {
+        Remove-ProgramSplitStagingDirectory -Path $lockedStaging
+        Assert-True (-not (Test-Path -LiteralPath $lockedStaging)) `
+            'staging cleanup confirms deletion after the lock is released'
+    } else { Remove-ProgramSplitTree -Path $lockedStaging }
 
-    $scopeStaging = Join-Path $temporary 'locked-installer-scope'
-    [IO.Directory]::CreateDirectory($scopeStaging) | Out-Null
+    $scopeStaging = & $newStaging 'locked-installer-scope'
     $scopeProfile = Join-Path $scopeStaging 'WireGuardSplit.conf'
     [IO.File]::WriteAllText($scopeProfile, 'test profile')
     $scopeLock = [IO.File]::Open($scopeProfile, [IO.FileMode]::Open, [IO.FileAccess]::Read,
@@ -334,13 +344,13 @@ try {
     $null = $mutexProbe.Handle
     Assert-True ($mutexProbe.WaitForExit(5000)) 'installer-scope mutex probe completes'
     $mutexProbe.WaitForExit()
-    Assert-True ($scopeFailure -like 'Sensitive installer staging could not be removed:*') `
+    Assert-True ($scopeFailure -like $expectedFailure) `
         'installer scope propagates its staging-cleanup failure'
     Assert-True ($mutexProbe.ExitCode -eq 0) `
         'installer scope releases its machine-wide mutex even when staging cleanup fails'
     try { $scopeMutex.ReleaseMutex() } catch { }
     try { $scopeMutex.Dispose() } catch { }
-    Remove-ProgramSplitStagingDirectory -Path $scopeStaging
+    if ($stagingElevated) { Remove-ProgramSplitStagingDirectory -Path $scopeStaging } else { Remove-ProgramSplitTree -Path $scopeStaging }
 
     $powerShell = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
     $controller = 'C:\ProgramData\WireGuardProgramSplit\src\Controller.ps1'

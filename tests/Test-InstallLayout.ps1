@@ -44,13 +44,18 @@ Endpoint = 198.51.100.10:51820
     [IO.File]::WriteAllText((Join-Path $staleOwnedStaging 'WireGuardSplit.conf'), 'stale test profile')
     [IO.Directory]::CreateDirectory($nearMatchStaging) | Out-Null
 
+    # Planning validates the profile without staging it: no key byte is written anywhere.
+    $stagingBefore = @(foreach ($parent in @($env:ProgramData, [IO.Path]::GetTempPath())) {
+        Get-ChildItem -LiteralPath $parent -Directory -Filter 'WireGuardProgramSplit-install-*' -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName } })
     $plan = & (Join-Path $RepositoryRoot 'Install.ps1') -Profile $profile -Applications $application `
         -WireGuardRuntimeDirectory $runtime -PiaDriverDirectory $driver -BuildDirectory $build `
         -DestinationRoot 'C:\Program Files\WireGuardProgramSplit\' -PlanOnly
-    Assert-True (-not (Test-Path -LiteralPath $staleOwnedStaging)) `
-        'installer removes a stale exact-owned staging directory before processing a new profile'
-    Assert-True (Test-Path -LiteralPath $nearMatchStaging -PathType Container) `
-        'installer preserves a similarly prefixed directory outside its exact GUID namespace'
+    $stagingAfter = @(foreach ($parent in @($env:ProgramData, [IO.Path]::GetTempPath())) {
+        Get-ChildItem -LiteralPath $parent -Directory -Filter 'WireGuardProgramSplit-install-*' -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName } })
+    Assert-True ((($stagingAfter | Sort-Object) -join '|') -eq (($stagingBefore | Sort-Object) -join '|')) `
+        'planning stages no profile copy under %TEMP% or %ProgramData%'
+    Assert-True (Test-Path -LiteralPath (Join-Path $staleOwnedStaging 'WireGuardSplit.conf')) `
+        'planning leaves staging cleanup to the elevated installation, under its lock'
     Assert-True ($plan.DestinationRoot -eq 'C:\Program Files\WireGuardProgramSplit') `
         'installer normalizes the destination root before planning resource ownership'
     Assert-True ($plan.ServiceName -eq 'WireGuardTunnel$WireGuardSplit') 'installer plans the neutral tunnel service'

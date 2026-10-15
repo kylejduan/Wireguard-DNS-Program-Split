@@ -49,6 +49,13 @@ $evidenceFunction = @($ast.FindAll({
 }, $true))
 Assert-True ($evidenceFunction.Count -eq 1) 'controller defines the health-failure evidence snapshot once'
 . ([scriptblock]::Create($evidenceFunction[0].Extent.Text))
+# Pruning removes old snapshots with the link-safe tree removal from Common.ps1.
+$treeFunction = @([Management.Automation.Language.Parser]::ParseFile((Join-Path $RepositoryRoot 'src\powershell\Common.ps1'), [ref] $null, [ref] $null).FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-ProgramSplitTree'
+}, $true))
+Assert-True ($treeFunction.Count -eq 1) 'Common.ps1 defines the link-safe tree removal once'
+. ([scriptblock]::Create($treeFunction[0].Extent.Text))
 $controllerLog = [Collections.Generic.List[string]]::new()
 function Write-ControllerLog([string] $message) { $controllerLog.Add($message) }
 

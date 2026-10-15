@@ -2,7 +2,6 @@
 """Owned local topology and installed singleton lifecycle; no VM orchestration."""
 import contextlib
 import fcntl
-import hashlib
 import ipaddress
 import json
 import os
@@ -20,7 +19,6 @@ CONFIG = Path('/etc/wg-program-split')
 STATE = Path('/run/wg-program-split')
 PINS = Path('/sys/fs/bpf/wg_program_split')
 UNIT_DIR = Path('/usr/lib/systemd/system')
-SHIM = b'#!/bin/sh\nexec /usr/bin/python3 -I /usr/lib/wg-program-split/wg-program-split.pyz "$@"\n'
 
 
 def report(path, value): path.write_text(json.dumps(value, indent=2) + '\n')
@@ -376,7 +374,7 @@ class Product:
             # manifest document rather than to build bytes that could change meanwhile.
             expected = {str(path): own.file_identity(path) for path in paths}
             for path in paths:
-                wanted = hashlib.sha256(SHIM).hexdigest() if path == CLI else build['sha256'][path.name]
+                wanted = build['launcher_sha256'] if path == CLI else build['sha256'][path.name]
                 if expected[str(path)]['sha256'] != wanted: raise ValueError('installed payload differs from manifest sha256; retained')
             package = Path(build['directory']) / 'wg-program-split.pyz'
             package_identity = own.file_identity(package)
@@ -388,12 +386,16 @@ class Product:
                 'config': {str(CONFIG / name): own.file_identity(CONFIG / name) for name in ('profile.conf', 'settings.json')}})
         if result.returncode or not self.receipt: raise RuntimeError('install failed; owned leftovers retained')
         activated = time.time()
-        self.j.begin('product-state', str(STATE))
+        intent = self.j.begin('product-state', str(STATE))
         try: self.cli('activate')
         finally:
             if STATE.exists():
                 self.state_receipt = self.j.acquire('product-state', str(STATE),
                     {'directory': own.directory_identity(STATE), 'lock': own.file_identity(STATE / '.lock')})
+            else:
+                # Activation failed before creating runtime state: nothing was
+                # born, so close() and --recover are not held by this intent.
+                self.j.resolve_intent(intent)
         observations, end = [], time.monotonic() + 30
         self.instance = service_instances()
         time.sleep(6)
@@ -438,7 +440,13 @@ class Product:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             own.same_identity(self.state_receipt['identity']['lock'], own.file_identity(STATE / '.lock'))
-            path = STATE / 'controller.json'; expected = own.file_identity(path); document = json.loads(path.read_text())
+            path = STATE / 'controller.json'
+            if not os.path.lexists(path):
+                # Activation stopped before its first journal (for example an
+                # allocation refusal); disable then reports disabled without one.
+                if {entry.name for entry in STATE.iterdir()} != {'.lock'}: raise ValueError('unexpected runtime state retained')
+                return {str(STATE / '.lock'): own.file_identity(STATE / '.lock')}
+            expected = own.file_identity(path); document = json.loads(path.read_text())
             if (document['state'] != 'disabled' or document['pins'] is not None or document['pending'] is not None or
                     document['boot_id'] != self.m['boot_id'] or
                     document['profile_digest'] != self.receipt['identity']['config'][str(CONFIG / 'profile.conf')]['sha256']):

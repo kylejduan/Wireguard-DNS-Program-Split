@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 param(
     [Parameter(Mandatory)] [string] $InputPath,
-    [Parameter(Mandatory)] [string] $OutputPath,
-    [Parameter(Mandatory)] [string] $SettingsPath,
+    [string] $OutputPath,
+    [string] $SettingsPath,
+    # Validates the profile and returns the derived settings without writing anything.
+    [switch] $ValidateOnly,
+    # The caller writes into a directory it has already protected; files inherit its ACL.
     [switch] $SkipAcl
 )
 
@@ -132,32 +135,43 @@ if (-not ($sawPrivateKey -and $sawAddress -and $sawDns -and $sawPublicKey -and $
     throw 'The WireGuard profile is missing a required field.'
 }
 
+if ($ValidateOnly) {
+    return [pscustomobject]@{ TunnelAddress = $tunnelAddress; TunnelDns = $tunnelDns }
+}
+if (-not $OutputPath -or -not $SettingsPath) { throw 'OutputPath and SettingsPath are required unless -ValidateOnly is used.' }
+
+# Each file is protected when it is created, before any key byte is written: unless the caller has protected
+# the directory itself (-SkipAcl), the file's descriptor grants SYSTEM and Administrators only.
+function Write-PreparedText([string] $Path, [string] $Text) {
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
+    if ($SkipAcl) {
+        [IO.File]::WriteAllBytes($Path, $bytes)
+        return
+    }
+    $security = [Security.AccessControl.FileSecurity]::new()
+    $security.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+        $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            [Security.Principal.SecurityIdentifier]::new($sid), 'FullControl', 'Allow'))
+    }
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write,
+        [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $security)
+    try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+}
+
 $parent = Split-Path -Parent $OutputPath
 if ($parent) { [IO.Directory]::CreateDirectory($parent) | Out-Null }
 $settingsParent = Split-Path -Parent $SettingsPath
 if ($settingsParent) { [IO.Directory]::CreateDirectory($settingsParent) | Out-Null }
 $tempPath = "$OutputPath.tmp"
 $tempSettings = "$SettingsPath.tmp"
-[IO.File]::WriteAllLines($tempPath, $result, [Text.UTF8Encoding]::new($false))
-[IO.File]::WriteAllText($tempSettings, ([ordered]@{
+Write-PreparedText $tempPath ((@($result) -join "`r`n") + "`r`n")
+Write-PreparedText $tempSettings ([ordered]@{
     TunnelAddress = $tunnelAddress
     TunnelDns = $tunnelDns
-} | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+} | ConvertTo-Json)
 Move-Item -LiteralPath $tempPath -Destination $OutputPath -Force
 Move-Item -LiteralPath $tempSettings -Destination $SettingsPath -Force
-
-if (-not $SkipAcl) {
-    $acl = [Security.AccessControl.FileSecurity]::new()
-    $acl.SetAccessRuleProtection($true, $false)
-    $rights = [Security.AccessControl.FileSystemRights]::FullControl
-    $allow = [Security.AccessControl.AccessControlType]::Allow
-    $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
-    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
-    $admins = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
-    foreach ($identity in @($current, $system, $admins)) {
-        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity, $rights, $allow))
-    }
-    foreach ($path in @($OutputPath, $SettingsPath)) { Set-Acl -LiteralPath $path -AclObject $acl }
-}
 
 Write-Output 'Prepared IPv4 WireGuard profile and local routing settings without exposing key material.'

@@ -101,6 +101,13 @@ service names and paths must come from refreshed, sanitized root inventory.
 }
 ```
 
+Each build's installed `/usr/bin/wg-program-split` must match the launcher its
+own installer writes: the runner reads `LAUNCHER` from the staged
+`wg-program-split.pyz` and accepts only reviewed launchers (the b843960 baseline's,
+without a license header, and the SPDX-headed one from 0.3.0). An optional
+per-build `"launcher_sha256"` must equal it. A run that fails after installation
+is removed by the runner's cleanup or by `--recover`.
+
 Evidence must be new, persistent, absolute and resolved, outside `/tmp`; all its
 parents must be root-owned and not group/other writable. Paths below `/home/tv`
 also require `native_account_verified: "tv@TV"` and still face those directory

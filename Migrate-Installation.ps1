@@ -92,7 +92,7 @@ function Start-And-Validate {
 try {
     try { $held = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held = $true }
     if (-not $held) { throw 'Another installation or migration is running.' }
-    $marker = Get-Content -LiteralPath (Join-Path $SourceRoot 'state\installation.json') -Raw | ConvertFrom-Json
+    $marker = [IO.File]::ReadAllText((Join-Path $SourceRoot 'state\installation.json')) | ConvertFrom-Json
     if ($marker.Product -ne 'WireGuardProgramSplit' -or $marker.Schema -ne 1) {
         throw 'Source installation ownership marker is invalid.'
     }

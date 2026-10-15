@@ -25,6 +25,10 @@ def run(*args, okay=True, timeout=90):
     return acc.execute(*args, okay=okay, timeout=timeout, env=acc.ENV)
 
 
+def substate(name):
+    return run('systemctl', 'show', name, '-p', 'SubState', '--value').stdout.strip()
+
+
 def unit(name):
     result = run('systemctl', 'show', name, '-p', 'ActiveState', '-p', 'NRestarts', '-p', 'MainPID')
     return {key: value for key, value in (line.split('=', 1) for line in result.stdout.splitlines())}
@@ -142,6 +146,12 @@ def main():
             samples = []
             observe(15, samples)
             assert restart_times(samples), 'no failed startup was retried'
+            # Free the space while a retry is pending (the restart delay is at
+            # least five seconds), not while its transaction runs: the guard
+            # unit then sees the space too and ends active. If the fault cleared
+            # between the guard and controller of one retry, the controller
+            # would load the guard itself and the unit would stay failed.
+            acc.wait_for(lambda: substate(CONTROLLER) == 'auto-restart', 'a pending controller retry', timeout=60)
             runtime.filler.unlink()
             freed = time.monotonic()
             acc.wait_for(lambda: status() == 'ready', 'automatic recovery to ready', timeout=120)

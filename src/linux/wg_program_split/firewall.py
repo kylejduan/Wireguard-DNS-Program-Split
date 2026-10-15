@@ -29,6 +29,17 @@ class Firewall:
             raise ValueError('conntrack zone must be a nonzero u16')
 
     def render(self):
+        """The owned table. dns_output translates selected DNS to the tunnel
+        resolver, but destination NAT happens once per connection: an earlier
+        foreign NAT chain or REDIRECT can claim it and send the query to a
+        loopback stub or another resolver instead. So egress enforces the
+        outcome after all NAT: selected traffic to port 53, or originally to
+        port 53, leaves only for the tunnel resolver; otherwise it is dropped
+        before the loopback allowance. Only original-direction (or untracked)
+        packets are checked: an enrolled DNS server's replies to an unlisted
+        client carry the selected mark and an original port 53. Selection is the
+        packet mark, which NAT never changes (foreign mark writers are
+        inventoried; foreign stateless address/port rewrites are refused)."""
         selected = f'meta mark & {self.mask:#x} == {self.mark:#x}'
         return f'''table inet {self.table} {{
  chain vpn_zone_output {{ type filter hook output priority raw; policy accept;
@@ -48,6 +59,9 @@ class Firewall:
  }}
  chain egress {{ type filter hook postrouting priority filter; policy accept;
   meta nfproto ipv6 {selected} counter drop
+  meta nfproto ipv4 {selected} meta l4proto {{ tcp, udp }} th dport 53 ct direction original ip daddr != {self.resolver} counter drop
+  meta nfproto ipv4 {selected} meta l4proto {{ tcp, udp }} th dport 53 ct state untracked ip daddr != {self.resolver} counter drop
+  meta nfproto ipv4 {selected} meta l4proto {{ tcp, udp }} ct direction original ct original proto-dst 53 ip daddr != {self.resolver} counter drop
   {selected} oifname "{self.interface}" accept
   {selected} oifname "lo" fib daddr type local accept
   {selected} counter drop

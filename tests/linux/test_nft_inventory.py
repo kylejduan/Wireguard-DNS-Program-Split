@@ -29,6 +29,41 @@ class NftInventoryTests(unittest.TestCase):
                 with self.subTest(entries=entries), self.assertRaises(NetworkError):
                     _nft_usage(entries)
 
+    def test_stateless_address_and_port_rewrites_are_refused_by_name(self):
+        """`udp dport set 5353 notrack` before conntrack moves a query past the
+        owned DNS guards unseen; address, port and raw payload writes are refused."""
+        def write(payload, value=5353):
+            return [{'rule': {'family': 'inet', 'table': 'foreign', 'chain': 'out', 'expr': [
+                {'match': {'op': '==', 'left': {'payload': {'protocol': 'ip', 'field': 'daddr'}}, 'right': '127.0.0.60'}},
+                {'match': {'op': '==', 'left': {'payload': {'protocol': 'udp', 'field': 'dport'}}, 'right': 53}},
+                {'mangle': {'key': {'payload': payload}, 'value': value}}, {'notrack': None}]}}]
+        for payload, name in (({'protocol': 'udp', 'field': 'dport'}, 'udp dport'),  # The review's rule.
+                              ({'protocol': 'th', 'field': 'dport'}, 'th dport'),
+                              ({'protocol': 'tcp', 'field': 'sport'}, 'tcp sport'),
+                              ({'protocol': 'ip', 'field': 'daddr'}, 'ip daddr'),
+                              ({'protocol': 'ip', 'field': 'saddr'}, 'ip saddr'),
+                              ({'base': 'th', 'offset': 16, 'len': 16}, 'raw payload')):
+            with self.subTest(name=name), self.assertRaisesRegex(NetworkError, name):
+                _nft_usage(write(payload))
+        # Fields that cannot redirect a packet stay accepted.
+        for payload in ({'protocol': 'ip', 'field': 'dscp'}, {'protocol': 'ip', 'field': 'ttl'}):
+            self.assertEqual(_nft_usage(write(payload, 1)), (0, set()))
+
+    def test_packet_copies_and_diversions_are_refused_by_name(self):
+        """dup clones a packet elsewhere and fwd sends it out another device (a
+        netdev egress fwd on the tunnel device would emit included plaintext)."""
+        for family, hook, statement in (('ip', 'output', {'dup': {'addr': '192.0.2.9'}}),
+                                        ('inet', 'postrouting', {'dup': {'addr': '192.0.2.9', 'dev': 'eth0'}}),
+                                        ('netdev', 'egress', {'fwd': {'dev': 'eth0'}}),
+                                        ('netdev', 'ingress', {'fwd': {'dev': 'eth0', 'family': 'ip',
+                                                                       'addr': '192.0.2.9'}})):
+            name = next(iter(statement))
+            entries = [{'chain': {'family': family, 'table': 'foreign', 'name': 'c', 'hook': hook}},
+                       {'rule': {'family': family, 'table': 'foreign', 'chain': 'c', 'expr': [
+                           {'match': {'op': '==', 'left': {'meta': {'key': 'l4proto'}}, 'right': 'udp'}}, statement]}}]
+            with self.subTest(statement=statement), self.assertRaisesRegex(NetworkError, name):
+                _nft_usage(entries)
+
     def test_repeated_scan_observes_changed_live_input(self):
         rule = {'match': {'left': {'&': [MARK, 1]}, 'right': 1}}
         self.assertEqual(_nft_usage([rule]), (1, set()))

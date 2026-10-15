@@ -86,7 +86,7 @@ if ($Action -eq 'Enable') {
 if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) {
     throw 'Browser DNS policy recovery state is missing.'
 }
-$original = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+$original = [IO.File]::ReadAllText($stateFile) | ConvertFrom-Json
 foreach ($entry in $original) {
     if ($entry.ValueExisted) {
         if (-not (Test-Path -LiteralPath $entry.Path)) {

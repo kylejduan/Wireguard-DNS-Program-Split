@@ -75,20 +75,8 @@ try {
     catch [Threading.AbandonedMutexException] { $installMutexHeld = $true }
     if (-not $installMutexHeld) { throw 'Another WireGuard Program Split installation is already running.' }
 
-    $stagingNamePattern = '^WireGuardProgramSplit-install-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-    Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Filter 'WireGuardProgramSplit-install-*' `
-        -ErrorAction Stop | Where-Object {
-            $_.Name -match $stagingNamePattern -and
-            -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
-        } | ForEach-Object { Remove-ProgramSplitStagingDirectory -Path $_.FullName }
-
-    $staging = Join-Path ([IO.Path]::GetTempPath()) ("WireGuardProgramSplit-install-{0}" -f [guid]::NewGuid())
-    [IO.Directory]::CreateDirectory($staging) | Out-Null
-    $stagedProfile = Join-Path $staging 'WireGuardSplit.conf'
-    $stagedSettings = Join-Path $staging 'settings.json'
-    & (Join-Path $PSScriptRoot 'src\powershell\Prepare-Profile.ps1') -InputPath $profilePath `
-        -OutputPath $stagedProfile -SettingsPath $stagedSettings | Out-Null
-    $derived = Get-Content -LiteralPath $stagedSettings -Raw | ConvertFrom-Json
+    # Validation writes nothing: planning never stages key material.
+    $derived = & (Join-Path $PSScriptRoot 'src\powershell\Prepare-Profile.ps1') -InputPath $profilePath -ValidateOnly
 
     $plan = [pscustomobject]@{
         DestinationRoot = $DestinationRoot
@@ -121,6 +109,21 @@ try {
     Assert-ValidSignature (Join-Path $WireGuardRuntimeDirectory 'wireguard.dll') 'WireGuard|Proton|Microsoft Windows Hardware Compatibility Publisher'
     Assert-ValidSignature (Join-Path $PiaDriverDirectory 'PiaWfpCallout.sys') 'Private Internet Access|Microsoft Windows Hardware Compatibility Publisher'
     Assert-ValidSignature (Join-Path $PiaDriverDirectory 'piawfpcallout.cat') 'Microsoft Windows Hardware Compatibility Publisher'
+
+    # The prepared profile holds the private key: it is staged only in a directory protected before it is
+    # written, and staging an interrupted run left behind is removed first.
+    Remove-ProgramSplitStaleStaging -Parents (Get-ProgramSplitStagingParents)
+    $staging = New-ProgramSplitPrivateDirectory -Path (Join-Path $env:ProgramData ("WireGuardProgramSplit-install-{0}" -f [guid]::NewGuid()))
+    $stagedProfile = Join-Path $staging 'WireGuardSplit.conf'
+    $stagedSettings = Join-Path $staging 'settings.json'
+    # The files inherit the staging directory's descriptor, so cleanup can verify every descendant.
+    & (Join-Path $PSScriptRoot 'src\powershell\Prepare-Profile.ps1') -InputPath $profilePath `
+        -OutputPath $stagedProfile -SettingsPath $stagedSettings -SkipAcl | Out-Null
+    if (-not (Test-ProgramSplitPrivateTree -Path $staging)) { throw "Installer staging is not protected as created: $staging" }
+    $prepared = [IO.File]::ReadAllText($stagedSettings) | ConvertFrom-Json
+    if ([string]$prepared.TunnelAddress -ne $plan.TunnelAddress -or [string]$prepared.TunnelDns -ne $plan.TunnelDns) {
+        throw 'The profile changed while it was being installed.'
+    }
 
     [IO.Directory]::CreateDirectory($DestinationRoot) | Out-Null
     $destinationCreated = $true
@@ -190,7 +193,7 @@ try {
     while (-not (Test-Path -LiteralPath $activeFile) -and $timer.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Milliseconds 250 }
     if (-not (Test-Path -LiteralPath $activeFile)) {
         $errorPath = Join-Path $DestinationRoot 'state\last-error.txt'
-        $detail = if (Test-Path -LiteralPath $errorPath) { Get-Content -LiteralPath $errorPath -Raw } else { 'No controller error was recorded.' }
+        $detail = if (Test-Path -LiteralPath $errorPath) { [IO.File]::ReadAllText($errorPath) } else { 'No controller error was recorded.' }
         throw "The controller did not activate: $detail"
     }
     Start-ScheduledTask -TaskName $plan.TrayTask

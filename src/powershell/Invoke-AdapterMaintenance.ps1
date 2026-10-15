@@ -23,7 +23,7 @@ try {
         if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
             throw 'Adapter repair requires Administrator rights.'
         }
-        $marker = Get-Content -LiteralPath (Join-Path $root 'state\installation.json') -Raw | ConvertFrom-Json
+        $marker = [IO.File]::ReadAllText((Join-Path $root 'state\installation.json')) | ConvertFrom-Json
         if ($marker.Product -ne 'WireGuardProgramSplit' -or $marker.Schema -ne 1) {
             throw 'Invalid installation ownership marker.'
         }

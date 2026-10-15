@@ -6,6 +6,7 @@ bidirectional host snapshots and narrowly resolved spawn intents.
 Filesystem, journal and child-process behaviour is real. Kernel routing, systemd and
 the production installer are fakes, so no privileged command runs.
 """
+import base64
 import contextlib
 import copy
 import json
@@ -20,6 +21,7 @@ from unittest.mock import patch
 
 import native_overhead_owner as own
 import native_overhead_runtime as runtime
+from wg_program_split.install import LAUNCHER
 
 NAMES = ('wg-program-split.pyz', 'bpf-loader', 'classifier.bpf.o', *own.UNITS)
 FIXTURE = {'underlay': 'nu0123456789', 'remote': 'nr0123456789', 'namespace': 'nn0123456789'}
@@ -145,7 +147,7 @@ class RouteProofTests(unittest.TestCase):
 
 class InstallHarness:
     """Production-installer stand-in that copies whatever the build directory holds when it runs."""
-    def __init__(self, test, *, kernel=None):
+    def __init__(self, test, *, kernel=None, profile='fixture profile\n'):
         self.root = root = temporary(test)
         self.paths = {name: root / name.lower() for name in ('CLI', 'ARTIFACTS', 'CONFIG', 'STATE', 'PINS', 'UNIT_DIR')}
         self.paths['UNIT_DIR'].mkdir()
@@ -154,13 +156,16 @@ class InstallHarness:
         self.sha = {name: own.digest(self.build / name) for name in NAMES}
         self.j = journal(test, root)
         self.directory = root / 'arm'; self.directory.mkdir()
-        fixture = topology(self.j, evidence=str(root), builds={'candidate': {'directory': str(self.build), 'sha256': self.sha}})
-        fixture.profile = lambda: 'fixture profile\n'
+        fixture = topology(self.j, evidence=str(root), builds={'candidate': {
+            'directory': str(self.build), 'sha256': self.sha, 'launcher_sha256': own.hashlib.sha256(LAUNCHER).hexdigest()}})
+        fixture.profile = lambda: profile
+        self.controller = None  # A production Controller to answer activate and disable.
         self.product = runtime.Product(fixture, 'candidate', self.directory)
         self.during = self.after = self.stop = None
-        self.shim = runtime.SHIM
+        self.shim = LAUNCHER  # What the real installer writes.
         self.kernel = kernel or Kernel()
-        self.kernel.other = lambda args: {'mark': 8} if args[0] == str(self.paths['ARTIFACTS'] / 'bpf-loader') else self.fail(args)
+        loader, answer = str(self.paths['ARTIFACTS'] / 'bpf-loader'), type(self.kernel).other
+        self.kernel.other = lambda args: {'mark': 8} if args[0] == loader else answer(self.kernel, args)
         stack = contextlib.ExitStack(); test.addCleanup(stack.close)
         for name, path in self.paths.items(): stack.enter_context(patch.object(runtime, name, path))
         stack.enter_context(patch.object(own, 'inventory', return_value={'paths': [], 'units': [], 'links': [], 'tables': []}))
@@ -179,7 +184,9 @@ class InstallHarness:
         p['CLI'].write_bytes(self.shim); p['ARTIFACTS'].mkdir(); p['CONFIG'].mkdir()
         for name in NAMES[:3]: (p['ARTIFACTS'] / name).write_bytes((self.build / name).read_bytes())
         for name in own.UNITS: (p['UNIT_DIR'] / name).write_bytes((self.build / name).read_bytes())
-        for name in ('profile.conf', 'settings.json'): (p['CONFIG'] / name).write_bytes((self.directory / name).read_bytes())
+        p['CONFIG'].chmod(0o700)
+        for name in ('profile.conf', 'settings.json'):
+            (p['CONFIG'] / name).write_bytes((self.directory / name).read_bytes()); (p['CONFIG'] / name).chmod(0o600)
         (p['CONFIG'] / 'installation.json').write_text('{}')
         if self.after: self.after()
 
@@ -189,6 +196,15 @@ class InstallHarness:
             self.install(); return SimpleNamespace(returncode=0, stdout='', stderr='')
         if args[0] == str(self.paths['CLI']):
             if args[1] == self.stop: raise RuntimeError('stopped at ' + args[1])
+            if self.controller and args[1] in ('activate', 'disable'):
+                try: result = getattr(self.controller, args[1])()
+                except Exception as error: raise RuntimeError(args[1] + ' failed: ' + str(error)) from None
+                return SimpleNamespace(returncode=0, stdout=json.dumps(result))
+            if args[1] == 'disable': return SimpleNamespace(returncode=0, stdout='{"state": "disabled"}')
+            if args[1] == 'uninstall':
+                removed = [str(path) for path in self.installed().values()] + [str(self.paths['CONFIG'] / 'installation.json')]
+                for path in removed: Path(path).unlink()
+                return SimpleNamespace(returncode=0, stdout=json.dumps({'retained': [], 'removed': removed}))
             if args[1] == 'activate':
                 self.paths['STATE'].mkdir()
                 for name in ('.lock', 'controller.json', 'receipt.json'): (self.paths['STATE'] / name).write_text('{}')
@@ -198,6 +214,46 @@ class InstallHarness:
     def installed(self):
         return {str(p): p for p in (self.paths['CLI'], *(self.paths['ARTIFACTS'] / n for n in NAMES[:3]),
                                     *(self.paths['UNIT_DIR'] / n for n in own.UNITS))}
+
+
+# Fixture keys are built at run time so no key-shaped literal enters the tree.
+PROFILE_TEXT = ('[Interface]\nPrivateKey = ' + base64.b64encode(b'a' * 32).decode() +
+                '\nAddress = 10.20.0.2/32\nDNS = 10.20.0.1\n[Peer]\nPublicKey = ' +
+                base64.b64encode(b'b' * 32).decode() + '\nAllowedIPs = 0.0.0.0/0\nEndpoint = 192.0.2.8:51820\n')
+
+
+class RetiredKernel(Kernel):
+    """A host whose product runtime is already retired: no pins, link, table or active unit."""
+    def run(self, *args, **kwargs):
+        if tuple(map(str, args[:2])) == ('systemctl', 'show'):
+            return SimpleNamespace(returncode=0, stdout='ActiveState=inactive\nMainPID=0\nFragmentPath=\nDropInPaths=\n')
+        return super().run(*args, **kwargs)
+
+    def other(self, args):
+        if args[:3] == ('ip', '-j', 'link'): return []
+        if args[:2] == ('nft', '-j'): return {'nftables': []}
+        return super().other(args)
+
+
+class LauncherReviewTests(unittest.TestCase):
+    def package(self, source):
+        path = temporary(self) / 'wg-program-split.pyz'
+        with own.zipfile.ZipFile(path, 'w') as archive: archive.writestr('wg_program_split/install.py', source)
+        return path
+
+    def test_each_build_is_held_to_the_launcher_its_own_installer_writes(self):
+        installer = (Path(__file__).resolve().parents[2] / 'src/linux/wg_program_split/install.py').read_text()
+        current = own.launcher_sha256(self.package(installer))
+        self.assertEqual(current, own.hashlib.sha256(LAUNCHER).hexdigest())
+        self.assertIn(current, own.REVIEWED_LAUNCHERS)
+        baseline = 'LAUNCHER = ' + repr(LAUNCHER.replace(b'# SPDX-License-Identifier: GPL-3.0-or-later\n', b'')) + '\n'
+        self.assertIn(own.launcher_sha256(self.package(baseline)), own.REVIEWED_LAUNCHERS)  # Historical baselines.
+        for source in ('LAUNCHER = ' + repr(LAUNCHER + b'# foreign\n') + '\n', 'COMMAND = 1\n',
+                       'LAUNCHER = "text"\n'):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                own.launcher_sha256(self.package(source))
+        built = Path(__file__).resolve().parents[2] / 'build/linux/wg-program-split.pyz'
+        if built.exists(): self.assertEqual(own.launcher_sha256(built), current)
 
 
 class PayloadBindingTests(unittest.TestCase):
@@ -215,9 +271,56 @@ class PayloadBindingTests(unittest.TestCase):
 
     def test_unexpected_launcher_is_refused(self):
         harness = InstallHarness(self)
-        harness.shim = runtime.SHIM + b'# foreign\n'
+        harness.shim = LAUNCHER + b'# foreign\n'
         with self.assertRaisesRegex(ValueError, 'differs from manifest sha256'): harness.product.enter()
         self.assertIsNone(harness.product.receipt)
+
+    def test_failure_after_installation_is_cleaned_by_close_and_by_recovery(self):
+        """Installation succeeded and activation then failed: the run owns
+        exactly what the real installer wrote, and either the run's own close()
+        or a later --recover (a new Product holding the journalled receipt)
+        removes all of it, with no intent left pending."""
+        for recovered in (False, True):
+            with self.subTest(recovered=recovered):
+                harness = InstallHarness(self, kernel=RetiredKernel())
+                harness.stop = 'activate'
+                with self.assertRaisesRegex(RuntimeError, 'stopped at activate'): harness.product.enter()
+                self.assertIsNotNone(harness.product.receipt)
+                self.assertEqual(harness.j.pending, [])
+                product = harness.product
+                if recovered:
+                    product = runtime.Product(harness.product.t, 'recovery', harness.directory)
+                    product.receipt = harness.product.receipt
+                product.close()
+                self.assertEqual(harness.j.cleanup(), [])  # The run's own private inputs follow.
+                self.assertTrue(all(not os.path.lexists(path) for path in harness.installed().values()))
+                self.assertFalse(any(os.path.lexists(harness.paths[name]) for name in ('CONFIG', 'ARTIFACTS', 'STATE')))
+                self.assertEqual((harness.j.pending, harness.j.records), ([], []))
+
+    def test_controller_preflight_failure_before_its_journal_is_cleaned(self):
+        """A production Controller refuses activation at allocation (a foreign
+        nft rule claims every mark bit) after creating only its lock; its real
+        disable then reports disabled without a journal, and cleanup removes
+        the lock-only runtime directory along with the installation."""
+        from wg_program_split.controller import Controller, Paths
+        from wg_program_split import network
+        from test_network import Kernel as Host
+        host = Host()
+        host.nft['nftables'].append({'rule': {'family': 'ip', 'table': 'foreign', 'expr': [
+            {'mangle': {'key': {'meta': {'key': 'mark'}}, 'value': 1}}]}})
+        harness = InstallHarness(self, kernel=RetiredKernel(), profile=PROFILE_TEXT)
+        p = harness.paths
+        harness.controller = Controller(
+            paths=Paths(config=p['CONFIG'], state=p['STATE'], pins=p['PINS'], artifacts=p['ARTIFACTS']),
+            owner_uid=os.getuid(), kernel=SimpleNamespace(exists=lambda: False), host_check=lambda: None,
+            select_allocation=lambda profile: network.allocate(network.inspect(profile, runner=host, require_underlay=False)))
+        with self.assertRaisesRegex(RuntimeError, 'activate failed'): harness.product.enter()
+        self.assertEqual([entry.name for entry in p['STATE'].iterdir()], ['.lock'])
+        self.assertIsNotNone(harness.product.state_receipt)
+        harness.product.close()
+        self.assertEqual(harness.j.cleanup(), [])
+        self.assertFalse(any(os.path.lexists(p[name]) for name in ('CLI', 'CONFIG', 'ARTIFACTS', 'STATE')))
+        self.assertEqual((harness.j.pending, harness.j.records), ([], []))
 
     def test_package_replaced_after_install_is_not_recorded_for_recovery(self):
         harness = InstallHarness(self)
@@ -290,6 +393,9 @@ class StagingTests(unittest.TestCase):
         for arm in ('baseline', 'candidate'):
             directory = root / arm; directory.mkdir(mode=0o700)
             for name in NAMES: (directory / name).write_bytes(arm.encode() + name.encode()); (directory / name).chmod(0o644)
+            launcher = LAUNCHER if arm == 'candidate' else LAUNCHER.replace(b'# SPDX-License-Identifier: GPL-3.0-or-later\n', b'')
+            with own.zipfile.ZipFile(directory / 'wg-program-split.pyz', 'w') as archive:
+                archive.writestr('wg_program_split/install.py', 'LAUNCHER = ' + repr(launcher) + '\n')
             builds[arm] = {'directory': str(directory), 'revision': 'b843960' if arm == 'baseline' else 'candidate',
                            'sha256': {name: own.digest(directory / name) for name in NAMES}}
         probe = root / 'probe'; probe.write_bytes(b'probe'); probe.chmod(0o755)
@@ -307,6 +413,12 @@ class StagingTests(unittest.TestCase):
         with patch.object(own, 'directory_identity'), patch.object(own, 'staged_file', side_effect=staged):
             own.validate_manifest(manifest)
             self.assertEqual(sorted(seen), sorted([*NAMES, *NAMES, 'probe']))
+            self.assertEqual({arm: build['launcher_sha256'] for arm, build in manifest['builds'].items()},
+                             {'baseline': '60e2ef6581a3e24c96fb4319763ffedfd192ad9599219d7e566c364f5b643592',
+                              'candidate': own.hashlib.sha256(LAUNCHER).hexdigest()})
+            with self.assertRaisesRegex(ValueError, 'launcher differs'):
+                stale = copy.deepcopy(manifest); stale['builds']['candidate']['launcher_sha256'] = '0' * 64
+                own.validate_manifest(stale)
             Path(manifest['builds']['candidate']['directory']).chmod(0o770)
             with self.assertRaisesRegex(ValueError, 'not root-controlled'): own.validate_manifest(manifest)
             Path(manifest['builds']['candidate']['directory']).chmod(0o700)

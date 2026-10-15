@@ -62,7 +62,7 @@ if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) {
     Write-Output 'No DNS cache policy recovery state exists; nothing changed.'
     exit 0
 }
-$saved = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+$saved = [IO.File]::ReadAllText($stateFile) | ConvertFrom-Json
 foreach ($item in $saved) {
     if ($item.Name -notin $names) { throw 'Unexpected DNS cache policy recovery entry.' }
     if ($item.Exists) {

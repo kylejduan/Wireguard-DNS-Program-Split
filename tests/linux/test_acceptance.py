@@ -486,6 +486,21 @@ def main():
                           ['nft', 'add', 'chain', 'inet', 'wgps_foreign', 'out', '{ type filter hook output priority 0 ; }'],
                           ['nft', 'add', 'rule', 'inet', 'wgps_foreign', 'out', 'meta', 'mark', 'set', '0x1']],
                          [['nft', 'delete', 'table', 'inet', 'wgps_foreign']]),
+                        # An earlier NAT of port 53 to the loopback stub: the owned egress
+                        # guard drops included DNS, so the readiness probe fails closed.
+                        ([['nft', 'add', 'table', 'inet', 'wgps_foreign_nat'],
+                          ['nft', 'add', 'chain', 'inet', 'wgps_foreign_nat', 'out',
+                           '{ type nat hook output priority -110 ; }'],
+                          ['nft', 'add', 'rule', 'inet', 'wgps_foreign_nat', 'out', 'meta', 'l4proto', '{ tcp, udp }',
+                           'th', 'dport', '53', 'dnat', 'ip', 'to', '127.0.0.60:53']],
+                         [['nft', 'delete', 'table', 'inet', 'wgps_foreign_nat']]),
+                        # A stateless port rewrite before conntrack: refused by inventory.
+                        ([['nft', 'add', 'table', 'inet', 'wgps_rewrite'],
+                          ['nft', 'add', 'chain', 'inet', 'wgps_rewrite', 'out',
+                           '{ type filter hook output priority -310 ; }'],
+                          ['nft', 'add', 'rule', 'inet', 'wgps_rewrite', 'out', 'ip', 'daddr', '127.0.0.60', 'udp',
+                           'dport', '53', 'udp', 'dport', 'set', '5353', 'notrack']],
+                         [['nft', 'delete', 'table', 'inet', 'wgps_rewrite']]),
                         ([['iptables-nft', '-t', 'mangle', '-A', 'OUTPUT', '-j', 'MARK', '--set-mark', '0x1']],
                          [['iptables-nft', '-t', 'mangle', '-D', 'OUTPUT', '-j', 'MARK', '--set-mark', '0x1']] +
                          ([] if mangle_existed else [['nft', 'delete', 'table', 'ip', 'mangle']]))):
@@ -497,7 +512,9 @@ def main():
                     wait_for(lambda: not test.native()['ready'], 'daemon detects a foreign edit', timeout=12)
                     test.observations.append({'foreign_edit_detected_seconds': round(time.monotonic() - edited, 2)})
                     assert json.loads((STATE / 'controller.json').read_text())['state'] == 'degraded'
-                    dns(blocked=True); dns(False)
+                    dns(blocked=True)
+                    if 'wgps_rewrite' not in edit[0]:  # That foreign rule moves unlisted DNS too.
+                        dns(False)
                     for command in undo: test.run(*command)
                     wait_for(lambda: test.native()['ready'] and test.ready(), 'recovery after the foreign edit', timeout=30)
                 # An owner-bound table disappears with its owner's netlink socket and
@@ -526,7 +543,7 @@ def main():
                 wait_for(lambda: test.native()['ready'] and test.ready(), 'recovery after the owner-bound table', timeout=12)
                 test.observations.append({'owner_table_recovery_seconds': round(time.monotonic() - released, 2)})
                 dns(); ip_probe()
-                test.passed('the daemon catches foreign nft and iptables-nft mark edits at its next check')
+                test.passed('the daemon catches foreign nft and iptables-nft mark edits, an earlier DNS NAT and a stateless port rewrite at its next check')
                 test.cli('include', 'remove', evidence / 'selected-dns')
                 test.files[CONFIG / 'settings.json'] = identity(CONFIG / 'settings.json')
                 result = test.run(evidence / 'selected-dns', 'udp', '127.0.0.60', '203.0.113.7', '0', '1')

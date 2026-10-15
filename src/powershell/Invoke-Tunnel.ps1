@@ -108,7 +108,7 @@ function Get-PendingHostAge($Process) {
     $sightings = [Collections.Generic.List[double]]::new()
     if ($PendingSeen -match '^(\d+:\d+)\|(\d+(\.\d+)?)$' -and $Matches[1] -ceq $identity) { $sightings.Add([double]$Matches[2]) }
     try {
-        $saved = Get-Content -LiteralPath $pendingState -Raw -ErrorAction Stop | ConvertFrom-Json
+        $saved = [IO.File]::ReadAllText($pendingState) | ConvertFrom-Json
         if ([string]$saved.Identity -ceq $identity) { $sightings.Add([double]$saved.FirstSeen) }
     } catch { }
     $known = @($sightings | Where-Object { $_ -le $now })
@@ -199,10 +199,22 @@ function Add-ActiveRoute([string] $prefix, [uint32] $index, [string] $nextHop, [
     }
 }
 
+# Resolve-DnsName lists a CNAME chain ahead of the addresses it leads to, so only A records are used.
+function Resolve-TunnelEndpoint([string] $HostName) {
+    foreach ($record in @(Resolve-DnsName -Name $HostName -Type A -ErrorAction Stop | Where-Object { [string]$_.Type -eq 'A' })) {
+        $address = $null
+        if ([Net.IPAddress]::TryParse([string]$record.IPAddress, [ref]$address) -and
+                $address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+            return $address.IPAddressToString
+        }
+    }
+    throw "The tunnel endpoint $HostName has no IPv4 address (A record)."
+}
+
 function Read-OwnedEndpointRouteState {
     if (-not (Test-Path -LiteralPath $endpointState -PathType Leaf)) { return $null }
     try {
-        $saved = Get-Content -LiteralPath $endpointState -Raw | ConvertFrom-Json
+        $saved = [IO.File]::ReadAllText($endpointState) | ConvertFrom-Json
         $address = ([string] $saved.DestinationPrefix) -replace '/32$', ''
         $parsedAddress = $null
         $parsedNextHop = $null
@@ -308,7 +320,7 @@ $endpointIp = $null
 if ([Net.IPAddress]::TryParse($endpointHost, [ref]$endpointIp) -and $endpointIp.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
     $endpoint = $endpointIp.IPAddressToString
 } else {
-    $endpoint = (Resolve-DnsName -Name $endpointHost -Type A -ErrorAction Stop | Select-Object -First 1 -ExpandProperty IPAddress)
+    $endpoint = Resolve-TunnelEndpoint $endpointHost
 }
 
 $routeState = [ordered]@{

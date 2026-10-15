@@ -21,7 +21,7 @@ $activeSettings = $configuration.SettingsPath
 
 function Get-IncludedApps {
     if (-not (Test-Path -LiteralPath $includeFile -PathType Leaf)) { return @() }
-    return @(Get-Content -LiteralPath $includeFile | ForEach-Object { $_.Trim() } |
+    return @([IO.File]::ReadAllLines($includeFile) | ForEach-Object { $_.Trim() } |
         Where-Object { $_ -and -not $_.StartsWith('#') })
 }
 
@@ -227,7 +227,7 @@ $importItem.add_Click({
 
 $logsItem.add_Click({ Start-Process explorer.exe $logs })
 $errorItem.add_Click({
-    $message = if (Test-Path -LiteralPath $errorFile) { Get-Content -LiteralPath $errorFile -Raw } else { 'No controller error is recorded.' }
+    $message = if (Test-Path -LiteralPath $errorFile) { [IO.File]::ReadAllText($errorFile) } else { 'No controller error is recorded.' }
     [Windows.Forms.MessageBox]::Show($message, 'WireGuard Program Split', 'OK', 'Information') | Out-Null
 })
 $exitItem.add_Click({ [Windows.Forms.Application]::Exit() })

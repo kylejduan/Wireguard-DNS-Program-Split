@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import socket
 import struct
@@ -19,7 +18,21 @@ from .command import capture, stream
 
 _TOOL_PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
 _IPTABLES_DUMPS = ('iptables-legacy-save', 'ip6tables-legacy-save', 'iptables-nft-save', 'ip6tables-nft-save')
-_OPAQUE_MARK_EXTENSIONS = {'MARK', 'CONNMARK', 'CT', 'mark', 'connmark'}
+_OPAQUE_MARK_EXTENSIONS = {'MARK', 'CONNMARK', 'CT', 'TPROXY', 'HMARK', 'IPMARK', 'SET', 'socket', 'mark', 'connmark'}
+# Target extensions that never write the packet mark (skb->mark), checked
+# against their kernel modules: verdicts, logging, NAT, conntrack templates,
+# header and checksum mangling, priority (CLASSIFY), security marks (SECMARK,
+# CONNSECMARK are skb->secmark), tracing and timers, and NFQUEUE/QUEUE, whose
+# userspace verdict can set a mark: an administrator residual, see
+# docs/linux.md. SET is listed but refused with --map-mark. MARK, CONNMARK and
+# TPROXY are modelled separately; every other target is refused: IPMARK and
+# HMARK write the mark, and TEE sends a clone of the packet (for included
+# traffic, its plaintext) to another gateway.
+_NON_MARK_TARGETS = frozenset({
+    'ACCEPT', 'DROP', 'RETURN', 'QUEUE', 'REJECT', 'LOG', 'NFLOG', 'ULOG', 'MASQUERADE', 'SNAT', 'DNAT',
+    'REDIRECT', 'NETMAP', 'DNPT', 'SNPT', 'CT', 'NOTRACK', 'TCPMSS', 'TCPOPTSTRIP', 'DSCP', 'TOS', 'ECN', 'TTL',
+    'HL', 'CLASSIFY', 'CHECKSUM', 'SECMARK', 'CONNSECMARK', 'AUDIT', 'TRACE', 'SYNPROXY', 'IDLETIMER', 'LED',
+    'RATEEST', 'NFQUEUE', 'SET'})
 
 
 def nft_generation():
@@ -306,6 +319,32 @@ def _has_mark(value):
     return isinstance(value, list) and any(_has_mark(v) for v in value)
 
 
+def _mark_write(output, mark):
+    """Bits a `meta mark set` of the current mark and constants can change.
+
+    mark | C sets C; mark ^ C flips C; mark & C clears the complement of C;
+    (mark & M) | C and (mark & M) ^ C change the complement of M and C. Any
+    other operand (another key, a map, a shift, a nested expression) raises.
+    """
+    if not isinstance(output, dict) or len(output) != 1:
+        raise ValueError
+    (operator, operands), = output.items()
+    if operator not in ('|', '^', '&') or not isinstance(operands, list) or len(operands) != 2:
+        raise ValueError
+    left, constant = operands
+    if type(constant) is not int:
+        raise ValueError
+    constant = _u32(constant)
+    if left == mark:
+        return (~constant) & 0xffffffff if operator == '&' else constant
+    if operator == '&' or not isinstance(left, dict) or list(left) != ['&']:
+        raise ValueError
+    inner = left['&']
+    if not isinstance(inner, list) or len(inner) != 2 or inner[0] != mark or type(inner[1]) is not int:
+        raise ValueError
+    return ((~_u32(inner[1])) | constant) & 0xffffffff
+
+
 def _nft_usage(value):
     """Recognize constant masks/preserving writes; reject dynamic mark semantics.
 
@@ -333,12 +372,8 @@ def _nft_usage(value):
                 used |= 0xffffffff
                 continue
             try:
-                preserved, added = output['|']
-                original, mask = preserved['&']
-                if original != mark:
-                    raise ValueError
-                used |= ((~_u32(mask)) | _u32(added)) & 0xffffffff
-            except (KeyError, TypeError, ValueError):
+                used |= _mark_write(output, mark)
+            except (KeyError, TypeError, ValueError, AttributeError, NetworkError):
                 raise NetworkError('unsupported nftables mark assignment') from None
             continue
         if 'match' in value and _has_mark(value['match']):
@@ -353,6 +388,23 @@ def _nft_usage(value):
             else:
                 raise NetworkError('unsupported nftables mark comparison')
             continue
+        if 'mangle' in value and isinstance(value['mangle'], dict) and isinstance(value['mangle'].get('key'), dict) \
+                and 'payload' in value['mangle']['key']:
+            payload = value['mangle']['key']['payload']
+            field = payload.get('field') if isinstance(payload, dict) else None
+            if not isinstance(payload, dict) or 'base' in payload or field in ('saddr', 'daddr', 'sport', 'dport'):
+                # A stateless address or port rewrite (or a raw payload write) can
+                # move a packet past the owned DNS and routing guards unseen.
+                what = (f"{payload.get('protocol')} {field}" if field else 'raw payload') if isinstance(payload, dict) else 'payload'
+                raise NetworkError(f'foreign nftables rule rewrites {what} statelessly; refused as a conflict')
+            continue  # Other header fields (DSCP, ECN, TTL) move nothing.
+        for statement in ('dup', 'fwd'):
+            if statement in value:
+                # dup clones a packet to another address or device; fwd sends it
+                # out another device (a netdev egress fwd on the tunnel device
+                # would emit included plaintext). Either can leak included traffic.
+                raise NetworkError(f'foreign nftables {statement} statement can copy or divert packets; '
+                                   'refused as a conflict')
         if 'mangle' in value and value['mangle'].get('key') == zone:
             number = _u32(value['mangle'].get('value'))
             if number > 65535:
@@ -376,8 +428,9 @@ def _opaque_marks(entries):
     if not isinstance(entries, dict):
         return False
     xt = entries.get('xt')
-    if isinstance(xt, dict) and xt.get('name') in _OPAQUE_MARK_EXTENSIONS:
-        return True
+    if isinstance(xt, dict) and (xt.get('name') in _OPAQUE_MARK_EXTENSIONS or (
+            xt.get('type') == 'target' and xt.get('name') not in _NON_MARK_TARGETS)):
+        return True  # Read from the iptables-nft dump, which refuses unknown targets.
     return any(_opaque_marks(item) for item in entries.values())
 
 
@@ -399,80 +452,259 @@ def _split_mark(value):
     return _u32(pieces[0]), _u32(pieces[1]) if len(pieces) == 2 else 0xffffffff
 
 
+# Options each packet-mark-relevant target accepts, as iptables-save prints
+# them; a target line with anything else cannot be modelled and is refused.
+_MARK_TARGETS = {
+    'MARK': {'--set-xmark', '--set-mark', '--and-mark', '--or-mark', '--xor-mark'},
+    'CONNMARK': {'--set-xmark', '--set-mark', '--and-mark', '--or-mark', '--xor-mark', '--save-mark',
+                 '--restore-mark', '--nfmask', '--ctmask', '--mask', '--left-shift-mark', '--right-shift-mark'},
+    'TPROXY': {'--on-port', '--on-ip', '--tproxy-mark'},
+}
+_MARK_FLAGS = {'--save-mark', '--restore-mark'}
+_MARK_OPERATIONS = ('--set-xmark', '--set-mark', '--and-mark', '--or-mark', '--xor-mark', '--save-mark', '--restore-mark')
+
+
+def _target_bits(target, options):
+    """Packet-mark bits one MARK, CONNMARK or TPROXY target can change."""
+    if target == 'TPROXY':
+        # skb->mark = (skb->mark & ~mask) ^ value
+        if '--tproxy-mark' not in options:
+            return 0
+        value, mask = _split_mark(options['--tproxy-mark'])
+        return value | mask
+    operations = [name for name in _MARK_OPERATIONS if name in options]
+    if len(operations) != 1:
+        raise ValueError
+    operation = operations[0]
+    if target == 'MARK':
+        # skb->mark = (skb->mark & ~mask) ^ value, every form included.
+        if set(options) != {operation}:
+            raise ValueError
+        value, mask = _split_mark(options[operation])
+        if operation == '--and-mark':
+            return (~value) & 0xffffffff
+        return value if operation in ('--or-mark', '--xor-mark') else mask | value
+    if operation != '--restore-mark':
+        return 0  # Every other CONNMARK operation writes the conntrack mark only.
+    # skb->mark = (skb->mark & ~nfmask) ^ shift(ct->mark & ctmask): the XOR can
+    # set any bit of the shifted ctmask, inside nfmask or not. Both masks
+    # default to every bit; --mask sets both.
+    if '--mask' in options and ('--nfmask' in options or '--ctmask' in options):
+        raise ValueError
+    default = options.get('--mask', '0xffffffff')
+    nfmask, ctmask = _u32(options.get('--nfmask', default)), _u32(options.get('--ctmask', default))
+    if '--left-shift-mark' in options and '--right-shift-mark' in options:
+        raise ValueError
+    for direction in ('--left-shift-mark', '--right-shift-mark'):
+        if direction in options:
+            bits = int(options[direction], 10)
+            if not 0 <= bits <= 31:
+                raise ValueError
+            ctmask = (ctmask << bits if direction == '--left-shift-mark' else ctmask >> bits) & 0xffffffff
+    return nfmask | ctmask
+
+
+# Built-in verdicts take no options and write no mark.
+_VERDICTS = {'ACCEPT', 'DROP', 'RETURN', 'QUEUE'}
+
+
+def _iptables_records(text):
+    """(token, quoted) lists of each record of an iptables-save dump.
+
+    libxtables prints a value that needs quoting inside double quotes with
+    `"`, `\\` and `'` escaped by a backslash; a quoted value (a comment, for
+    example) may contain a real newline, so records end only at a newline
+    outside quotes. A token with any quoted part is marked quoted: it is a
+    value, never an option, module or jump keyword. Lines beginning with # are
+    skipped whole. An unterminated quote raises ValueError.
+    """
+    record, token, quoted, escaped, started, comment, was_quoted = [], [], False, False, False, False, False
+    for char in text + '\n':
+        if comment:
+            comment = char != '\n'
+            continue
+        if quoted:
+            if escaped:
+                token.append(char)
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                quoted = False
+            else:
+                token.append(char)
+            continue
+        if char == '#' and not record and not started:
+            comment = True
+            continue
+        if char in ' \t\r\n':
+            if started:
+                record.append((''.join(token), was_quoted))
+                token, started, was_quoted = [], False, False
+            if char == '\n' and record:
+                yield record
+                record = []
+            continue
+        started = True
+        if char == '"':
+            quoted = was_quoted = True
+        else:
+            token.append(char)
+    if quoted:
+        raise ValueError('unterminated quoted iptables value')
+
+
+# Built-in verdicts take no options and write no mark.
+_VERDICTS = {'ACCEPT', 'DROP', 'RETURN', 'QUEUE'}
+_JUMPS = ('-j', '--jump', '-g', '--goto')
+
+
+def _rule(record, chains):
+    """Split one rule into (match tokens, target or None, target tokens, quoted flags).
+
+    Only an unquoted keyword is structural. The target is the rule's single
+    unquoted -j or -g; a second one means an unquoted value could be either,
+    so argument boundaries cannot be established and the rule is refused.
+    Returns target None for a jump to a declared chain or a verdict.
+    """
+    tokens = [value for value, _ in record]
+    quoted = [flag for _, flag in record]
+    if tokens[0] not in ('-A', '-I') or len(tokens) < 2 or quoted[0] or quoted[1]:
+        raise ValueError
+    jumps = [index for index in range(2, len(tokens)) if tokens[index] in _JUMPS and not quoted[index]]
+    if len(jumps) > 1:
+        raise ValueError
+    if not jumps:
+        return tokens[2:], quoted[2:], None, []
+    index = jumps[0]
+    if index + 1 >= len(tokens) or quoted[index + 1]:
+        raise ValueError
+    name, rest = tokens[index + 1], list(zip(tokens[index + 2:], quoted[index + 2:]))
+    if tokens[index] in ('-g', '--goto') or name in chains or name in _VERDICTS:
+        if rest:
+            raise ValueError  # A chain jump or verdict takes no options.
+        name = None
+    return tokens[2:index], quoted[2:index], name, rest
+
+
 def _legacy_mask(text):
     """Packet-mark bits an iptables dump can read or write.
 
-    MARK writes the packet mark; CONNMARK --restore-mark copies conntrack-mark
-    bits into the packet mark within --nfmask (all bits by default); every other
-    CONNMARK operation and the connmark match touch the conntrack mark only.
+    Each rule is parsed by structure from unquoted keywords only: chain
+    declarations and comments are skipped, a jump to a declared chain is not a
+    target extension, and only the target extension's own options are read as
+    target options. The mark match (printed as -m mark [!] --mark V/M) reads its
+    value and mask. MARK writes, and TPROXY with --tproxy-mark writes, the bits
+    of their mask and value. CONNMARK --restore-mark writes --nfmask and the
+    (shifted) --ctmask; every other CONNMARK operation and the connmark match
+    touch the conntrack mark only. Any other target must be on the allowlist of
+    targets that never write the mark (_NON_MARK_TARGETS): IPMARK, HMARK and
+    unknown targets are refused by name, as are SET --map-mark (its marks live
+    in mutable ipset entries) and socket --restore-skmark, and so is
+    any rule whose argument boundaries are ambiguous (an unquoted --mark away
+    from its module, or more than one unquoted jump). Other targets' arguments
+    are not interpreted and may repeat values.
     """
     used = 0
-    for line in text.splitlines():
-        if not re.search(r'\b(?:MARK|CONNMARK|mark|connmark)\b', line):
+    chains = set()
+    try:
+        records = list(_iptables_records(text))
+    except ValueError:
+        raise NetworkError('unsupported iptables mark state') from None
+    for record in records:
+        first = record[0][0]
+        if first.startswith('*') and not record[0][1]:
+            chains = set()  # A new table; its chains are declared next.
+            continue
+        if first.startswith(':') and not record[0][1]:
+            chains.add(first[1:])
+            continue
+        if [token for token, _ in record] == ['COMMIT']:
             continue
         try:
-            args = shlex.split(line)
-            module = target = None
-            recognized = False
-            index = 0
-            while index < len(args):
-                token = args[index]
-                if token in ('-m', '--match'):
-                    module = args[index + 1]
-                    index += 2
-                    continue
-                if token in ('-j', '--jump', '-g', '--goto'):
-                    target = args[index + 1]
-                    index += 2
+            matches, quoted, target, rest = _rule(record, chains)
+            for index, token in enumerate(matches):
+                if quoted[index]:
                     continue
                 if token == '--mark':
-                    value, mask = _split_mark(args[index + 1])
-                    if module == 'mark':
+                    # Printed as "-m mark --mark V" or "-m mark ! --mark V".
+                    start = index - 3 if index >= 3 and matches[index - 1] == '!' else index - 2
+                    if (start < 0 or matches[start] not in ('-m', '--match') or quoted[start] or
+                            matches[start + 1] not in ('mark', 'connmark') or index + 1 >= len(matches)):
+                        raise ValueError
+                    value, mask = _split_mark(matches[index + 1])
+                    if matches[start + 1] == 'mark':
                         used |= value | mask
-                    elif module != 'connmark':
+                elif token == '--restore-skmark':
+                    raise ValueError  # socket: the one match that writes the packet mark.
+                elif token in _MARK_OPERATIONS or token in ('--nfmask', '--ctmask', '--tproxy-mark',
+                                                            '--left-shift-mark', '--right-shift-mark'):
+                    raise ValueError  # A mark target option outside its target.
+            if target is not None and target not in _MARK_TARGETS and target not in _NON_MARK_TARGETS:
+                # IPMARK, HMARK and any target not known to leave the mark alone.
+                raise NetworkError(f'iptables target {target} may write the packet mark and is not '
+                                   'modelled; refused as a conflict')
+            if target in _MARK_TARGETS:
+                options = {}
+                index = 0
+                while index < len(rest):
+                    token, is_quoted = rest[index]
+                    if is_quoted or token not in _MARK_TARGETS[target] or token in options:
                         raise ValueError
-                    recognized = True
-                elif token in ('--set-mark', '--set-xmark', '--and-mark', '--or-mark', '--xor-mark'):
-                    value, mask = _split_mark(args[index + 1])
-                    if target == 'MARK':
-                        used |= ((~value) & 0xffffffff if token == '--and-mark' else
-                                 value if token in ('--or-mark', '--xor-mark') else mask | value)
-                    elif target != 'CONNMARK':
-                        raise ValueError
-                    recognized = True
-                elif token == '--restore-mark':
-                    if target != 'CONNMARK':
-                        raise ValueError
-                    used |= _u32(args[args.index('--nfmask') + 1]) if '--nfmask' in args else 0xffffffff
-                    recognized = True
-                elif token == '--save-mark':
-                    if target != 'CONNMARK':
-                        raise ValueError
-                    recognized = True
-                index += 1
-            if not recognized:
-                raise ValueError
+                    if token in _MARK_FLAGS:
+                        options[token] = True
+                        index += 1
+                    else:
+                        value, value_quoted = rest[index + 1]
+                        if value_quoted:
+                            raise ValueError
+                        options[token] = value
+                        index += 2
+                used |= _target_bits(target, options)
+            elif target == 'SET' and ('--map-mark', False) in rest:
+                raise ValueError  # Only SET, of the other targets, writes the packet mark.
         except (ValueError, IndexError):
             raise NetworkError('unsupported iptables mark state') from None
     return used
 
 
 def _legacy_zones(text):
-    zones = set()
-    for line in text.splitlines():
-        if '--zone' not in line:
+    """Conntrack zones the CT target assigns in an iptables dump; only the CT
+    target extension's own unquoted options are read."""
+    zones, chains = set(), set()
+    try:
+        records = list(_iptables_records(text))
+    except ValueError:
+        raise NetworkError('unsupported legacy conntrack zone state') from None
+    for record in records:
+        first = record[0][0]
+        if first.startswith('*') and not record[0][1]:
+            chains = set()
+            continue
+        if first.startswith(':') and not record[0][1]:
+            chains.add(first[1:])
+            continue
+        if [token for token, _ in record] == ['COMMIT']:
             continue
         try:
-            args = shlex.split(line)
-            for index, option in enumerate(args):
-                if option in ('--zone', '--zone-orig', '--zone-reply'):
-                    zone = _u32(args[index + 1])
-                    if zone > 65535:
-                        raise ValueError
+            _, _, target, rest = _rule(record, chains)
+            if target != 'CT':
+                continue
+            index = 0
+            while index < len(rest):
+                option, is_quoted = rest[index]
+                if not is_quoted and option in ('--zone', '--zone-orig', '--zone-reply'):
+                    value, value_quoted = rest[index + 1]
+                    zone = _u32(value)
+                    if value_quoted or zone > 65535:
+                        raise ValueError  # Also "mark": a zone taken from the packet mark.
                     zones.add(zone)
-                elif option.startswith('--zone'):
+                    index += 2
+                    continue
+                if not is_quoted and option.startswith('--zone'):
                     raise ValueError
-        except (ValueError, IndexError):
+                index += 1
+        except (ValueError, IndexError, NetworkError):
             raise NetworkError('unsupported legacy conntrack zone state') from None
     return zones
 

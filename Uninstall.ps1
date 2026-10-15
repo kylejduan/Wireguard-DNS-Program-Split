@@ -33,7 +33,7 @@ $markerPath = Join-Path $fullRoot 'state\installation.json'
 if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
     throw 'Refusing to remove a directory without the WireGuard Program Split ownership marker.'
 }
-$marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+$marker = [IO.File]::ReadAllText($markerPath) | ConvertFrom-Json
 if ($marker.Product -ne 'WireGuardProgramSplit' -or $marker.Schema -ne 1) {
     throw 'The installation ownership marker is invalid.'
 }
@@ -146,6 +146,7 @@ if (-not $errors) {
 }
 
 if ($errors) { throw ($errors -join [Environment]::NewLine) }
-if (Test-Path -LiteralPath $fullRoot) { Remove-Item -LiteralPath $fullRoot -Recurse -Force }
+# Without following any link that may have been left inside the installation.
+if (Test-Path -LiteralPath $fullRoot) { Remove-ProgramSplitTree -Path $fullRoot }
 
 Write-Output 'WireGuard Program Split was removed. The shared PIA WFP driver package was left installed.'

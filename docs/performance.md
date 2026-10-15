@@ -315,7 +315,8 @@ running image under its original path) and rolled itself back, verified, in
   in 10.8 seconds.
 - Configuration, profiles, drivers, the WireGuard runtime and service settings
   were unchanged. BFE restart, reboot and uninstall were not exercised on the
-  live host; CI covers them.
+  live host, and CI does not exercise them end to end either; see
+  [reliability](reliability.md) for what remains to be observed.
 
 On the Linux reference host the CLI, loader and BPF object were replaced with
 the running guard adopted unchanged. A 60-second sample of the controller

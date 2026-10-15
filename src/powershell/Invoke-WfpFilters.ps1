@@ -76,7 +76,7 @@ function Get-IncludedPaths {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing WFP input: $path" }
     }
     # An absent executable is reported by wfp-probe.exe and keeps no filters; the others are unaffected.
-    $includedPaths = @(Get-Content -LiteralPath $IncludedAppsFile |
+    $includedPaths = @([IO.File]::ReadAllLines($IncludedAppsFile) |
         ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
     if (-not $includedPaths) { throw 'The included-app list is empty.' }
     $includedPaths
