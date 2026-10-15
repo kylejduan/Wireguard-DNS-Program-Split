@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 - 2026-10-14
 
 - Windows: a reader holding a component or probe log open no longer fails the check that writes it, which had stopped the tunnel and repaired the stack in a loop. Every program the components wait on now runs through `controller-service.exe --run`: created suspended and already inside its own job without breakaway, run only once containment is confirmed, with each argument quoted for it, ended with its descendants at a deadline counted from its own start however late its result is collected, both pipes drained with bounded retention and cancellable reads, and its output returned framed and base64-encoded so it is decoded by what each program writes. The log files are a best-effort copy.
 - Windows: stuck tunnel-host recovery measures how long the host has been pending on the monotonic clock, keyed to the process ID and creation time, so a backward clock step no longer delays it and a forward one no longer ends a young host. The first sighting is kept by the controller and passed back to the tunnel component, so a state file that cannot be written does not reset it. The profile-import filter hold likewise runs its five minutes on the monotonic clock from the first sighting of the request.

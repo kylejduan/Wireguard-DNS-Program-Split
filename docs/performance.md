@@ -325,3 +325,45 @@ take effect at the host's next boot. A rehearsal of the same swap in the
 disposable VM marked every one of about 8.3 million sockets created during it.
 
 These are short deployment checks, not a long-term stability or saturation proof.
+
+## October 14, 2026: supervision hardening release deployment
+
+A whole-codebase performance and reliability review of 0.3.0 led to the
+changes published as `394a145`.
+[CI for the deployed source](https://github.com/kylejduan/Wireguard-DNS-Program-Split/actions/runs/38679614288)
+passed. Locally, 344 Linux unit tests, the native Linux checks, 118 privileged
+checks in a disposable VM, the Windows native self-tests and the PowerShell
+suites passed.
+
+On the Linux reference host the controller, loader, BPF object and controller
+unit were replaced in place with the running guard kept, and the installation
+record was rewritten to match. A 60-second sample of the controller cgroup
+averaged 0.99% of one core and 16.6 MiB, down from 2.43% and 17.0 MiB for 0.3.0,
+mainly because unchanged ruleset listings are no longer re-read and re-analysed
+on every check.
+
+The Windows workstation was upgraded in place with the persistent filters,
+NRPT rule and tunnel kept. The first attempt stopped on a wrong expectation in
+the deployment script: the supervisor started a fresh dispatcher from the new
+image instead of adopting the renamed running one. The script rolled back, and
+the corrected attempt succeeded. After deployment:
+
+- The supervisor's new dispatcher answered 1.28 seconds after the controller
+  started. All component validations passed, including with the component and
+  probe logs held open for reading only.
+- The fail-closed checks of the 0.3.0 deployment passed again: a listed
+  browser used only the tunnel address, had no external connection while the
+  tunnel was stopped, and kept all 20 filters through a controller kill.
+- Unlisted lookups through the dispatcher took 16.7 ms at the median, against
+  16.6 ms before, and the dispatcher's own classification 0.09 ms against
+  0.07 ms. Only the configured router resolver is present on this host, so the
+  resolver failover was exercised in CI rather than live.
+- Settled over 180 seconds, the controller service, controller, validation
+  worker, dispatcher and tunnel host used 1.28% of one core, against 1.16% for
+  the same processes on 0.3.0, excluding the short-lived bounded runs. The
+  validation worker's handle count cycled between about 760 and 1,020 with
+  garbage collection over five minutes, without growth.
+- Earlier backups inside the installation directory, a migration backup and a
+  42 MB log from before rotation existed were removed.
+
+These are short deployment checks, not a long-term stability or saturation proof.
