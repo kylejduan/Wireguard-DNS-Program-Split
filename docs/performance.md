@@ -368,3 +368,56 @@ the corrected attempt succeeded. After deployment:
   42 MB log from before rotation existed were removed.
 
 These are short deployment checks, not a long-term stability or saturation proof.
+
+## October 15, 2026: final review release, uninstall and fresh install
+
+A final whole-codebase review of 0.3.1 led to the changes published as
+`666cdfc`.
+[CI for the deployed source](https://github.com/kylejduan/Wireguard-DNS-Program-Split/actions/runs/38708068780)
+passed. Locally, 372 Linux unit tests, the native Linux checks, 125 privileged
+checks in a disposable VM, the Windows native self-tests and the PowerShell
+suites passed.
+
+On the Linux reference host only the controller package changed, replaced in
+place with the running guard and network kept. The post-NAT DNS guard and the
+other firewall rule changes take effect when the owned table is next created,
+at the next boot or activation. The host had no foreign NAT, header rewrite,
+packet copy or unmodelled mark target, so its rules are accepted with the same
+reservation as before.
+
+The Windows workstation was taken through a full uninstall and fresh install
+instead of an in-place swap, preserving the profile and inputs in a directory
+restricted to SYSTEM and Administrators. The first attempt stopped on two
+faults in the deployment script itself after a verified clean uninstall, and
+fell back to a fresh 0.3.1 installation, which was verified healthy. A second
+run from the preserved inputs then uninstalled that and installed 0.3.2.
+
+- Uninstall removed both services, the persistent filter set, the NRPT rule,
+  the adapter, the tray task, the ETW sessions, the endpoint route and the
+  installation directory, and restored the DNS cache and browser policy values.
+  System DNS then worked directly and a listed application left from the ISP
+  address. The PIA driver package is kept by design. Two empty browser policy
+  keys present before the original installation were absent afterwards; the
+  product's restore keeps such keys, and they disappeared outside it.
+- The fresh 0.3.2 installation used the same inputs and passed every component
+  validation. A listed browser's connections used only the tunnel address,
+  never the physical address or IPv6, and its DNS took the tunnel lane while an
+  unlisted lookup went direct. Validation passed with the logs held open for
+  reading only.
+- With the tunnel stopped for 45 seconds the listed browser had no external
+  connection while unlisted egress worked; the tunnel recovered in 33.7
+  seconds. A killed dispatcher was replaced in 0.14 seconds. With the
+  controller host killed, the filter set stayed present and the service
+  recovered in 3.2 seconds.
+- Over 180 seconds the stack used 1.52% of one core including its short-lived
+  probes, against 1.51% for 0.3.1, and unlisted lookups took 15.9 ms at the
+  median against 15.5 ms.
+- A BFE restart could not be exercised: this host's service descriptors deny
+  Administrators the right to stop BFE and the firewall service. Enforcement
+  at boot and traffic across a dispatcher or controller kill were not observed
+  live either.
+
+The preserved inputs, including the private key, were deleted after the
+installation was independently verified.
+
+These are short deployment checks, not a long-term stability or saturation proof.
