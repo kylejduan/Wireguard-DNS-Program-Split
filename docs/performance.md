@@ -448,5 +448,14 @@ host with the tunnel stopped, which reproduces the boot adoption path.
   tunnel and ran every validation 2.2 seconds after the tunnel answered,
   instead of after 30 seconds. The dispatcher kept running through the
   controller host's restart, and the filter set stayed present.
-- The driver was already running, so loading it during adoption is covered by
-  tests rather than this check. A second reboot will show it live.
+- The driver was already running, so loading it during adoption was covered by
+  tests rather than this check.
+
+Two further reboots on 0.3.3 showed the whole path live. Each time the
+controller logged the adoption, loaded the PIA driver while the tunnel started,
+and passed every validation two seconds after the tunnel answered, with no
+warning and no capture. The driver and tunnel were both ready 29 seconds after
+boot, against 63 seconds on 0.3.2, and the persistent set was present
+throughout. A listed browser's traffic was not sampled during these boots;
+afterwards the tunnel and direct exits were the VPN and ISP addresses, and the
+stack used 0.73% of one core over 30 seconds.
