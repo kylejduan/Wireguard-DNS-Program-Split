@@ -3,7 +3,10 @@ param([Parameter(Mandatory)] [string] $RepositoryRoot)
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 function Assert-True([bool]$Condition,[string]$Message){if(-not $Condition){throw "ASSERTION FAILED: $Message"}}
-. (Join-Path $RepositoryRoot 'src\powershell\RecoveryStability.ps1')
+# Redirect only the native API type; another CI fixture declares PhysicalNetwork
+# in the same PowerShell process. The production helper bodies stay identical.
+$helpers=[IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\RecoveryStability.ps1'))
+. ([scriptblock]::Create($helpers.Replace('ProgramSplit.PhysicalNetwork','ProgramSplit.StabilityNetwork')))
 # These observations are monotonic seconds, without sleeps or network changes.
 foreach($time in @(0,2,4,19,20,40,59)) {
     Assert-True (-not (Test-ProgramSplitSoftFailureReady 'Tunnel' $time)) 'a burst of failures cannot bypass the full minute'
@@ -16,7 +19,7 @@ Assert-True (-not (Test-ProgramSplitSoftFailureReady 'Transport' 200)) 'a long o
 Assert-True (-not (Test-ProgramSplitSoftFailureReady 'Transport' 100)) 'a backwards clock breaks confirmation'
 Add-Type @'
 namespace ProgramSplit {
- public static class PhysicalNetwork {
+ public static class StabilityNetwork {
   public static object Snapshot;
   public static object Read(System.Guid guid) { return Snapshot; }
  }
@@ -28,10 +31,10 @@ function Get-NetAdapter {param($Name,$ErrorAction)
     if($script:inventoryFails){throw 'Simulated observation error'}
     [pscustomobject]@{InterfaceGuid=$id;Status='Up'}
 }
-[ProgramSplit.PhysicalNetwork]::Snapshot=[pscustomobject]@{Guid=$id;ReceivedBytes=100}
+[ProgramSplit.StabilityNetwork]::Snapshot=[pscustomobject]@{Guid=$id;ReceivedBytes=100}
 Assert-True (Test-ProgramSplitTunnelTrafficProgress 'Fixture') 'a first counter observation defers a destructive action'
 Assert-True (-not (Test-ProgramSplitTunnelTrafficProgress 'Fixture')) 'unchanged receive counters are not traffic progress'
-[ProgramSplit.PhysicalNetwork]::Snapshot.ReceivedBytes=101
+[ProgramSplit.StabilityNetwork]::Snapshot.ReceivedBytes=101
 Assert-True (Test-ProgramSplitTunnelTrafficProgress 'Fixture') 'positive incoming tunnel traffic cancels restart eligibility'
 $script:inventoryFails=$true
 Assert-True (Test-ProgramSplitTunnelTrafficProgress 'Fixture') 'unknown traffic observations defer rather than authorize a restart'
@@ -85,7 +88,7 @@ function Reset-Fixture {
     $script:tunnelOutageLogged=$false;$script:nextRepair=[TimeSpan]::Zero;$script:repairDelaySeconds=2
     $script:components.Clear();$script:messages.Clear();Clear-ProgramSplitSoftFailure
     $script:tunnelTrafficObservation=[pscustomobject]@{Guid=$id;ReceivedBytes=101}
-    [ProgramSplit.PhysicalNetwork]::Snapshot.ReceivedBytes=101
+    [ProgramSplit.StabilityNetwork]::Snapshot.ReceivedBytes=101
     Remove-Item -LiteralPath $activeFile,$tunnelRetryFile -Force -ErrorAction SilentlyContinue
 }
 try {
@@ -104,7 +107,7 @@ try {
     Assert-True (($script:components -join ',') -eq 'Invoke-Tunnel.ps1 Stop,Invoke-Tunnel.ps1 Start' -and $script:charges -eq 1) 'a sustained idle tunnel failure permits one budgeted tunnel-only repair'
     Reset-Fixture
     foreach($time in @(0,30,60,90,120)) {
-        $script:now=$time;[ProgramSplit.PhysicalNetwork]::Snapshot.ReceivedBytes++
+        $script:now=$time;[ProgramSplit.StabilityNetwork]::Snapshot.ReceivedBytes++
         Restart-Tunnel 'Provider DNS outage' -StopFirst
     }
     Assert-True ($script:components.Count -eq 0 -and $script:charges -eq 0) 'a provider DNS outage never restarts a tunnel that keeps receiving traffic'
