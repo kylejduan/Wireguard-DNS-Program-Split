@@ -51,7 +51,6 @@ public:
             // Refuse forwarding during a full attribution lifetime after any dropped event.
             if (name.size() > 253 || (hints_.size() >= kMaxHints && !hints_.contains(key))) {
                 overloadedUntil_ = now + std::chrono::seconds(10);
-                changed_.notify_all();
                 return false;
             }
             auto& pending = hints_[key];
@@ -67,7 +66,6 @@ public:
             if (path.empty()) pending.unknownUntil = now + std::chrono::seconds(10);
             pending.expires = std::max(pending.expires, now + std::chrono::seconds(10));
         }
-        changed_.notify_all();
         return true;
     }
 
@@ -82,7 +80,6 @@ public:
             std::erase_if(hints_, [now](const auto& entry) { return !entry.second.tunnel && now >= entry.second.unknownUntil; });
             directBlockedUntil_ = now + std::chrono::seconds(10);
         }
-        changed_.notify_all();
     }
 
     // The ordering barrier. Microsoft-Windows-DNS-Client logs its query event in the calling process before
@@ -95,6 +92,8 @@ public:
         writer_ = std::move(writer);
     }
 
+    // Hint and loss updates cannot satisfy the barrier predicate; only sentinel/flush
+    // progress wakes its waiters.
     // The consumer processed the sentinel carrying this sequence, and so every event logged before it.
     // Sequences are assigned before their sentinels are written, so a later one covers every earlier one.
     void sentinelProcessed(unsigned long long sequence) {

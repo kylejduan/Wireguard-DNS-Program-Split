@@ -103,7 +103,37 @@ void lateSelectedBarrier(Hints& hints, std::thread& late, const wchar_t* name) {
     });
 }
 
+int hintProgressDoesNotFinishBarrierTest() {
+    Hints hints({L"c:\\apps\\selected.exe"});
+    std::atomic<unsigned long long> sequence{};
+    std::atomic_bool finished{};
+    std::optional<bool> answer;
+    hints.setSentinelWriter([&](unsigned long long value) { sequence = value; return true; });
+    std::thread waiting([&] { answer = hints.take(L"waiting.example", 1); finished = true; });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!sequence && std::chrono::steady_clock::now() < deadline) Sleep(1);
+    bool held = sequence != 0 && !finished;
+    hints.addResolved(L"waiting.example", 1, L"c:\\apps\\direct.exe");
+    Sleep(10);
+    held = held && !finished;
+    hints.lostEvents();
+    Sleep(10);
+    held = held && !finished;
+    hints.addResolved(std::wstring(300, L'x'), 1, L"c:\\apps\\selected.exe");
+    Sleep(10);
+    held = held && !finished;
+    hints.sentinelProcessed(sequence);
+    Sleep(10);
+    held = held && !finished;
+    hints.flushChecked(sequence);
+    waiting.join();
+    // Neither hint updates, loss/overflow nor the sentinel alone can finish the
+    // barrier. Once both progress markers arrive, lost attribution still refuses.
+    return held && finished && !answer.has_value() ? 0 : 72;
+}
+
 int barrierTest() {
+    if (const int progress = hintProgressDoesNotFinishBarrierTest()) return progress;
     // The selected query's event is delivered after its packet, behind an earlier unlisted hint: TUNNEL.
     std::thread late;
     Hints ordered({L"c:\\apps\\selected.exe"});

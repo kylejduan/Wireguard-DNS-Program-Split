@@ -57,7 +57,7 @@ $stopEvent=$null;$driverStart=$null
 $script:components=[Collections.Generic.List[string]]::new()
 $script:messages=[Collections.Generic.List[string]]::new()
 function Write-ControllerLog {param($Message) $script:messages.Add([string]$Message)}
-function Save-HealthFailureEvidence {param($Reason)}
+function Save-HealthFailureEvidence {param($Reason) $script:evidence++}
 function Get-ControllerElapsed {[TimeSpan]::FromSeconds($script:now)}
 function Get-Service {param($Name,$ErrorAction)
     if($script:serviceMissing){throw [Management.Automation.ErrorRecord]::new([Exception]::new('Service missing'),'NoServiceFoundForGivenName',[Management.Automation.ErrorCategory]::ObjectNotFound,$Name)}
@@ -66,7 +66,11 @@ function Get-Service {param($Name,$ErrorAction)
 }
 function Test-OwnedNrptRulePresent {$script:rulePresent}
 function Test-TunnelDns {param($TimeoutMilliseconds,$Attempts) if(-not $script:dnsHealthy){throw 'Tunnel DNS failed'}}
-function Invoke-DispatcherValidation {}
+function Invoke-DispatcherValidation {$script:dispatcherValidations++}
+function Get-ProgramSplitPhysicalDefault {param($AdapterName)
+    if(-not $script:routeAvailable){throw 'No physical IPv4 default gateway found.'}
+    [pscustomobject]@{InterfaceIndex=19}
+}
 function Test-PiaDriverReady {$true}
 function Invoke-Component {param($Name,$Action)
     $script:components.Add("$Name $Action")
@@ -86,6 +90,8 @@ function Stop-Stack {$script:components.Add('full stack teardown');throw 'A fixt
 function Reset-Fixture {
     $script:now=0;$script:dnsHealthy=$false;$script:serviceStatus='Running';$script:serviceUnknown=$false;$script:serviceMissing=$false;$script:rulePresent=$true
     $script:settingsUnchanged=$true;$script:nextNrptRepair=[TimeSpan]::Zero
+    $script:routeAvailable=$true;$script:networkWaitLogged=$false;$script:adoptionPending=$true
+    $script:evidence=0;$script:dispatcherValidations=0
     $script:resolverThrows=$false;$script:healthFails=$false;$script:budgetAvailable=$true;$script:charges=0
     $script:tunnelOutageLogged=$false;$script:nextRepair=[TimeSpan]::Zero;$script:repairDelaySeconds=2
     $script:components.Clear();$script:messages.Clear();Clear-ProgramSplitSoftFailure
@@ -95,6 +101,21 @@ function Reset-Fixture {
 }
 try {
     [IO.Directory]::CreateDirectory($fixture)|Out-Null
+    Reset-Fixture
+    $script:routeAvailable=$false;$script:serviceStatus='Stopped'
+    foreach($time in @(0,2,4)){$script:now=$time;Restart-Tunnel 'Waiting after boot' -Adopt:$script:adoptionPending}
+    Assert-True ($script:components.Count -eq 0 -and $script:evidence -eq 0 -and
+        $script:dispatcherValidations -eq 0 -and $script:messages.Count -eq 1 -and $script:adoptionPending) `
+        'offline boot waits without repeated validation, false restart evidence, or losing adoption intent'
+    $script:routeAvailable=$true;$script:now=6
+    Restart-Tunnel 'Uplink now available' -Adopt:$script:adoptionPending
+    Assert-True (($script:components -join ',') -eq 'Invoke-Tunnel.ps1 Start' -and $script:evidence -eq 0 -and
+        -not $script:adoptionPending) 'the first available uplink completes boot adoption without a needless stop or outage capture'
+    Reset-Fixture
+    foreach($time in @(0,30)){$script:now=$time;Restart-Tunnel 'Transient DNS before route loss' -StopFirst}
+    $script:routeAvailable=$false;$script:now=40;Restart-Tunnel 'Uplink disappeared' -StopFirst
+    $script:routeAvailable=$true;$script:now=60;Restart-Tunnel 'Uplink just returned' -StopFirst
+    Assert-True ($script:components.Count -eq 0 -and $script:charges -eq 0) 'route loss cancels partial failure evidence before a recovered uplink is evaluated'
     Reset-Fixture
     Assert-True (& $realSettingsCheck) 'an unavailable settings file preserves cached settings rather than requesting a full restart'
     $script:messages.Clear()

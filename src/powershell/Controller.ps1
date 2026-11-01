@@ -438,15 +438,16 @@ function Restart-Tunnel([string] $Reason, [switch] $StopFirst, [switch] $Adopt) 
     # stack a shutdown kept is the normal boot path, not an outage: it saves no evidence, and a start
     # that fails there is logged as an outage by the retry that follows.
     if ($stopEvent -and $stopEvent.WaitOne(0)) { return }
-    if ($Adopt) {
-        Write-ControllerLog 'Adopting the per-application components kept across shutdown; starting the tunnel.'
-    } elseif (-not $script:tunnelOutageLogged) {
-        Write-ControllerLog ("Tunnel-side failure; keeping the filters, NRPT rule and dispatcher in place " +
-            "and restarting only the tunnel: $Reason")
-        Save-HealthFailureEvidence -Reason $Reason
-        $script:tunnelOutageLogged = $true
-    }
     if ((Get-ControllerElapsed) -lt $script:nextRepair) { return }
+    # A boot with no usable uplink is waiting, not a failed tunnel restart. Avoid
+    # expensive dispatcher validation and misleading restart evidence until routed.
+    try {Get-ProgramSplitPhysicalDefault -AdapterName $configuration.AdapterName | Out-Null}
+    catch {
+        Clear-ProgramSplitSoftFailure
+        if(-not $script:networkWaitLogged){Write-ControllerLog 'Waiting for a physical IPv4 default route.';$script:networkWaitLogged=$true}
+        return
+    }
+    $script:networkWaitLogged=$false
     # The dispatcher keeps the direct inputs it started with. If the uplink changed during the outage,
     # a hostname endpoint cannot resolve through them, so hand that failure to the full health path. A
     # physical resolver that does not answer fails only the final loopback probe, after the inputs have
@@ -456,7 +457,6 @@ function Restart-Tunnel([string] $Reason, [switch] $StopFirst, [switch] $Adopt) 
     catch {
         if (-not ($_.Exception.Data['ProgramSplitStage'] -eq 'Transport' -and
                 $_.Exception.Message -match 'Local split-DNS health probe' -and -not (Test-PhysicalResolverAnswers))) {
-            $script:tunnelOutageLogged = $false
             Invoke-HealthFailure $_
             return
         }
@@ -471,6 +471,7 @@ function Restart-Tunnel([string] $Reason, [switch] $StopFirst, [switch] $Adopt) 
                 Test-TunnelDns -TimeoutMilliseconds 750
                 Clear-ProgramSplitSoftFailure
                 $script:tunnelOutageLogged=$false
+                $script:adoptionPending=$false
                 if(Test-Path -LiteralPath $tunnelRetryFile -PathType Leaf){
                     [IO.File]::WriteAllText($activeFile,(Get-Date).ToString('o'))
                     Remove-Item -LiteralPath $tunnelRetryFile -Force -ErrorAction SilentlyContinue
@@ -481,6 +482,14 @@ function Restart-Tunnel([string] $Reason, [switch] $StopFirst, [switch] $Adopt) 
             if(-not (Test-ProgramSplitSoftFailureReady 'Tunnel' (Get-ControllerElapsed).TotalSeconds)){return}
             if(-not (Add-ProgramSplitRepairAttempt $root $Reason)){return}
         } else {$StopFirst=$false;Clear-ProgramSplitSoftFailure}
+    }
+    if ($Adopt) {
+        Write-ControllerLog 'Adopting the per-application components kept across shutdown; starting the tunnel.'
+    } elseif (-not $script:tunnelOutageLogged) {
+        Write-ControllerLog ("Tunnel-side failure; keeping the filters, NRPT rule and dispatcher in place " +
+            "and restarting only the tunnel: $Reason")
+        Save-HealthFailureEvidence -Reason $Reason
+        $script:tunnelOutageLogged = $true
     }
     try {
         if ($StopFirst) { Invoke-Component 'Invoke-Tunnel.ps1' 'Stop' }
@@ -494,6 +503,7 @@ function Restart-Tunnel([string] $Reason, [switch] $StopFirst, [switch] $Adopt) 
         $script:repairDelaySeconds = 2
         $script:nextRepair = [TimeSpan]::Zero
         $script:tunnelOutageLogged = $false
+        $script:adoptionPending=$false
         Write-ControllerLog 'Tunnel restarted; the per-application components stayed in place.'
         if (Test-Path -LiteralPath $tunnelRetryFile -PathType Leaf) {
             [IO.File]::WriteAllText($activeFile, (Get-Date).ToString('o'))
@@ -628,6 +638,7 @@ function Invoke-ProgramSplitHealthRound {
         catch { Start-Sleep -Milliseconds 250; Test-StackHealth }
     } catch { Invoke-HealthFailure $_;return }
     $script:physicalHoldLogged = $false;$script:tunnelOutageLogged = $false
+    $script:adoptionPending=$false
     Clear-ProgramSplitSoftFailure
     Clear-ProgramSplitRepairBudgetSafely $root
 }
@@ -753,6 +764,7 @@ function Start-Stack {
         }
         $activeAt = Get-Date
         [IO.File]::WriteAllText($activeFile, $activeAt.ToString('o'))
+        $script:adoptionPending=$false
         Remove-Item -LiteralPath $errorFile -Force -ErrorAction SilentlyContinue
         $stackTimer.Stop()
         Write-ControllerLog "Stack active after tunnel readiness check in $($stackTimer.ElapsedMilliseconds) ms."
@@ -874,6 +886,7 @@ try {
             }
         }
         if (-not $desired) {
+            $adoptionPending=$false
             Clear-ProgramSplitSoftFailure
             Clear-ProgramSplitRepairBudgetSafely $root
             # Check the backoff deadline before probing the stack, and probe it once per pass unless a
@@ -946,7 +959,6 @@ try {
             Invoke-ProgramSplitHealthRound
             $lastHealth = Get-ControllerElapsed
         }
-        $adoptionPending = $false
         if ($desired -and (Get-ControllerElapsed) -ge $nextAdapterMaintenance -and (Test-StackActive)) {
             Invoke-AdapterMaintenance
         }

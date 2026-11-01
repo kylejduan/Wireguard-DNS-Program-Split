@@ -154,11 +154,9 @@ HANDLE startNrptHelper(const std::filesystem::path& root, const wchar_t* action)
 }
 
 // The supervisor holds the verified process; a lost pid record would hide it from readiness checks.
-void republishProcessId(const std::filesystem::path& root, DWORD processId) {
-    const auto path = root / L"state" / L"dns-dispatcher.pid";
+void republishProcessId(const std::filesystem::path& path, const std::filesystem::path& temporary, DWORD processId) {
     const std::string text = std::to_string(processId);
     if (readSmallFile(path) == text) return;
-    const auto temporary = root / L"state" / L"dns-dispatcher.pid.supervisor.tmp";
     HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return;
     DWORD written{};
@@ -226,6 +224,12 @@ void superviseDispatcher(const std::filesystem::path& root, HANDLE stop) {
 }
 
 void superviseLoop(const std::filesystem::path& root, HANDLE stop) {
+    const auto state = root / L"state";
+    const auto supervisedFile = state / L"dns-dispatcher.supervised";
+    const auto statusFile = state / L"dns-dispatcher-status.txt";
+    const auto suspendedFile = state / L"nrpt-suspended";
+    const auto pidFile = state / L"dns-dispatcher.pid";
+    const auto pidTemporary = state / L"dns-dispatcher.pid.supervisor.tmp";
     HANDLE child{};
     DWORD childId{};
     ULONGLONG lastStart{};
@@ -261,45 +265,49 @@ void superviseLoop(const std::filesystem::path& root, HANDLE stop) {
             helper = nullptr;
             helperEnded = now;
         }
-        if (!pathExists(root / L"state" / L"dns-dispatcher.supervised")) {
+        if (!pathExists(supervisedFile)) {
             if (child) CloseHandle(child);
             child = nullptr;
             unreadySince = 0;
             resetLiveness();
             continue;
         }
-        // Invoke-DnsDispatcher.ps1 stops the dispatcher under the same lock, after clearing the flag.
-        HANDLE lock = CreateMutexW(nullptr, FALSE, L"Global\\WireGuardProgramSplitDnsDispatcherComponent");
-        if (lock) {
-            const DWORD acquired = WaitForSingleObject(lock, 0);
-            if (acquired == WAIT_OBJECT_0 || acquired == WAIT_ABANDONED) {
-                if (pathExists(root / L"state" / L"dns-dispatcher.supervised")) {
-                    if (child && WaitForSingleObject(child, 0) != WAIT_TIMEOUT) {
-                        appendHostLog(L"DNS dispatcher " + std::to_wstring(childId) + L" ended.");
-                        CloseHandle(child);
-                        child = nullptr;
-                        resetLiveness();
+        // A held live process needs no adoption/start work. Keep observing it below,
+        // without opening the named mutation lock on every healthy 250 ms pass.
+        // Invoke-DnsDispatcher.ps1 stops it under that lock after clearing the flag.
+        if (!child || WaitForSingleObject(child, 0) != WAIT_TIMEOUT) {
+            HANDLE lock = CreateMutexW(nullptr, FALSE, L"Global\\WireGuardProgramSplitDnsDispatcherComponent");
+            if (lock) {
+                const DWORD acquired = WaitForSingleObject(lock, 0);
+                if (acquired == WAIT_OBJECT_0 || acquired == WAIT_ABANDONED) {
+                    if (pathExists(supervisedFile)) {
+                        if (child && WaitForSingleObject(child, 0) != WAIT_TIMEOUT) {
+                            appendHostLog(L"DNS dispatcher " + std::to_wstring(childId) + L" ended.");
+                            CloseHandle(child);
+                            child = nullptr;
+                            resetLiveness();
+                        }
+                        if (!child && (child = adoptDispatcher(root, childId))) {
+                            childSince = now;
+                            resetLiveness();
+                            appendHostLog(L"Supervising running DNS dispatcher " + std::to_wstring(childId) + L".");
+                        }
+                        if (!child && now - lastStart >= kRestartSpacingMilliseconds) {
+                            lastStart = now;
+                            childSince = now;
+                            child = startDispatcher(root, childId);
+                            resetLiveness();
+                            appendHostLog(child ? L"Started DNS dispatcher " + std::to_wstring(childId) + L"."
+                                                : L"DNS dispatcher start failed: " + std::to_wstring(GetLastError()) + L".");
+                        }
                     }
-                    if (!child && (child = adoptDispatcher(root, childId))) {
-                        childSince = now;
-                        resetLiveness();
-                        appendHostLog(L"Supervising running DNS dispatcher " + std::to_wstring(childId) + L".");
-                    }
-                    if (!child && now - lastStart >= kRestartSpacingMilliseconds) {
-                        lastStart = now;
-                        childSince = now;
-                        child = startDispatcher(root, childId);
-                        resetLiveness();
-                        appendHostLog(child ? L"Started DNS dispatcher " + std::to_wstring(childId) + L"."
-                                            : L"DNS dispatcher start failed: " + std::to_wstring(GetLastError()) + L".");
-                    }
+                    ReleaseMutex(lock);
                 }
-                ReleaseMutex(lock);
+                CloseHandle(lock);
             }
-            CloseHandle(lock);
         }
         const bool alive = child && WaitForSingleObject(child, 0) == WAIT_TIMEOUT;
-        const bool published = alive && statusProcessId(readSmallFile(root / L"state" / L"dns-dispatcher-status.txt")) == childId;
+        const bool published = alive && statusProcessId(readSmallFile(statusFile)) == childId;
         // Allow a short scheduler stall to recover. An exited process still restarts immediately;
         // a live one needs continuous failed local heartbeats before replacement.
         const auto replace = [&](const wchar_t* reason) {
@@ -325,13 +333,13 @@ void superviseLoop(const std::filesystem::path& root, HANDLE stop) {
             }
         }
         const bool ready = published && answered && failures == 0;
-        if (ready) republishProcessId(root, childId);
+        if (ready) republishProcessId(pidFile, pidTemporary, childId);
         if (ready) unreadySince = 0;
         else if (!unreadySince) unreadySince = now;
         // Reconciled on every pass, not latched: the rule must name a ready dispatcher, except for at most
         // about 15 seconds; a suspended rule returns once one is ready. A helper that failed is retried.
         const wchar_t* action = nullptr;
-        if (ready && pathExists(root / L"state" / L"nrpt-suspended")) action = L"Resume";
+        if (ready && pathExists(suspendedFile)) action = L"Resume";
         else if (!ready && now - unreadySince >= kSuspendAfterMilliseconds && ownedRulePresent()) action = L"Suspend";
         if (action && !helper && now - helperEnded >= kHelperRetryMilliseconds) {
             appendHostLog(ready ? L"DNS dispatcher ready; restoring the suspended NRPT rule."

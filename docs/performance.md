@@ -495,3 +495,57 @@ sample above preceded helper reuse and does not establish a whole-stack speedup.
 No new throughput-saturation, gaming-latency or worst-case packet-path A/B test was
 performed. Persistent payload filtering, kernel forwarding and DNS attribution
 behavior are unchanged by this helper-reuse optimization.
+
+## November 1, 2026: native supervision and attribution work
+
+Two changes remove work without changing observation intervals or routing rules:
+
+- The dispatcher supervisor computes its state-file paths once and opens the
+  mutation mutex only when its pinned child is absent or has exited. A healthy
+  child still has its process, state files and readiness observed every 250 ms;
+  local heartbeats remain one second apart. The ten-second failure grace,
+  startup grace and fifteen-second NRPT fallback are unchanged.
+- Hint insertion, overflow and event-loss updates no longer wake every query
+  waiting for an attribution barrier. Those updates cannot satisfy the barrier
+  predicate. Sentinel processing and flush/loss-check progress retain their
+  notifications, and both progress markers are still required before a direct
+  decision. A regression check injects hints, loss and overflow while a barrier
+  is pending, then verifies that a sentinel alone still cannot finish it.
+
+Six alternating baseline/candidate pairs were measured in isolated Windows
+fixtures, using the production code and the same compiler options. These are
+measurements of the specified operations, not whole-program speedups:
+
+| Fixture | Baseline | Candidate |
+| --- | ---: | ---: |
+| Healthy supervision, total CPU for 6 x 2,000 passes | 2,781 ms | 2,031 ms |
+| Healthy supervision, median elapsed per 2,000 passes | 591 ms | 504 ms |
+| Attribution contention, total CPU for 6 x 10,000 events | 1,359 ms | 16 ms |
+| Attribution contention, median elapsed per 10,000 events | 220 ms | 5.75 ms |
+
+The supervisor fixture uses actual loop/file helpers with private temporary
+state and a private mutex. A held live child and successful heartbeat are
+supplied by the fixture, and its normal sleep is replaced with a fixed pass
+count to measure work per pass. No installed service or live network is used.
+The attribution fixture holds eight queries at synthetic barriers while feeding
+hint/loss events, then releases both barrier progress markers. The public
+`tests/native/attribution-benchmark.cpp` harness includes the production
+dispatcher translation unit; it opens no DNS sockets or ETW sessions. Compare
+the same harness against baseline `d9095f9` and the candidate, alternating order.
+Build it with the normal native C++20/static options and `-municode`, linking
+`ws2_32` and `tdh`; `BENCH_SOURCE` can select a different checkout's dispatcher.
+
+For one candidate run after the normal native build creates `build/`:
+
+```sh
+x86_64-w64-mingw32-g++ -std=c++20 -O2 -static -municode \
+  tests/native/attribution-benchmark.cpp -o build/attribution-benchmark.exe \
+  -lws2_32 -ltdh
+./build/attribution-benchmark.exe 10000 8
+```
+
+Process CPU accounting is coarse: the candidate attribution total is one timer
+quantum, and a zero per-round reading does not mean zero cost. The contention
+fixture deliberately exposes needless wakeups; it does not establish a similar
+improvement in DNS latency, game latency, throughput or normal idle CPU. Real
+ETW and service-lifecycle tests remain necessary alongside these fixtures.

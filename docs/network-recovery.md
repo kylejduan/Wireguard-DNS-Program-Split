@@ -115,6 +115,14 @@ Start reloads inputs and cannot kill a worker on a transient inventory error. Af
 worker, the documented NRPT fallback can temporarily use system DNS. This does
 not request a tunnel teardown.
 
+At boot, the controller waits for a physical default route before running the
+dispatcher preflight or recording a tunnel restart. Startup adoption remains
+pending until readiness succeeds. A disappearing route clears accumulated
+failure observations so an uplink that just returned gets a fresh observation
+window. A link-down adapter with a driver-reported hardware failure does not
+meet the linked-and-paused Ethernet recovery criteria; investigate that failure
+instead of repeatedly resetting it.
+
 The native heartbeat checks the UDP receive loop. A partial TCP or ETW fault that
 still answers that heartbeat can require manual component recovery; an input
 reload is not a guarantee that every internal worker fault is repaired. Automatic
