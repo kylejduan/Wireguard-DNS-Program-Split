@@ -67,8 +67,14 @@ gap longer than 45 seconds, including sleep, hibernate and Fast Startup transiti
   ten minutes can qualify for a reset. The latest failure must still be between
   one and two minutes old, and the requested
   network must be visible and connectable with at least 25 percent signal quality,
-  with that adapter already the preferred physical route. Authentication failures, a working
+  with no other preferred physical route. A disconnected Wi-Fi adapter can qualify
+  when the route inventory confirms no physical default route. Authentication failures, a working
   connection, radio-off state and another requested profile are left alone.
+
+A Wi-Fi reconnect also defers while another preferred physical route exists,
+so an automatic retry cannot deliberately displace an existing uplink. Unknown
+route inventory defers every action. The route and enrollment are checked again
+after slow inventory and after an asynchronous Wi-Fi scan.
 
 Every reset requires the split controller to be enabled and running and its
 persistent WFP payload filters to validate. Recovery never removes those filters,
@@ -95,11 +101,17 @@ before a tunnel-only restart, plus a fresh failed DNS probe and no receive-count
 progress. A successful probe, incoming traffic, an unknown traffic observation,
 a long sampling gap, or a missing physical resolver cancels the accumulated
 evidence. A genuinely stopped tunnel service is started promptly. DNS transport
-failures repair DNS inputs in place; a missing NRPT rule repairs only that rule.
+failures repair DNS inputs in place; a missing NRPT rule repairs only that rule. The native supervisor alone restores
+a rule it suspended; the controller does not compete with that fallback.
 Unclassified diagnosis errors and repair-ledger cleanup errors defer and log.
 Tunnel restarts share the existing persistent three-attempt budget per fifteen
-minutes. A live DNS worker gets ten seconds of failed local heartbeats to recover;
-an exited worker still restarts promptly. After fifteen seconds without a ready
+minutes. Unapplied settings wait for an explicit reload; failed settings reads keep the
+last running configuration. A positively missing service is recreated, while an
+uncertain service query defers. A live DNS worker gets ten seconds of failed local heartbeats to recover;
+an exited worker still restarts promptly. A worker that never publishes gets its
+ten-second startup allowance before heartbeat-failure confirmation begins. Failure
+history resets on adoption, replacement and disabling supervision. Dispatcher
+Start reloads inputs and cannot kill a worker on a transient inventory error. After fifteen seconds without a ready
 worker, the documented NRPT fallback can temporarily use system DNS. This does
 not request a tunnel teardown.
 

@@ -60,6 +60,7 @@ function Write-ControllerLog {param($Message) $script:messages.Add([string]$Mess
 function Save-HealthFailureEvidence {param($Reason)}
 function Get-ControllerElapsed {[TimeSpan]::FromSeconds($script:now)}
 function Get-Service {param($Name,$ErrorAction)
+    if($script:serviceMissing){throw [Management.Automation.ErrorRecord]::new([Exception]::new('Service missing'),'NoServiceFoundForGivenName',[Management.Automation.ErrorCategory]::ObjectNotFound,$Name)}
     if($script:serviceUnknown){return $null}
     [pscustomobject]@{Status=$script:serviceStatus}
 }
@@ -75,15 +76,16 @@ function Wait-ProgramSplitProbe {param($Probe,$TimeoutMilliseconds,$RetryMillise
 function Add-ProgramSplitRepairAttempt {param($Root,$Reason) $script:charges++;$script:budgetAvailable}
 function Test-ProgramSplitPhysicalInputs {param($AdapterName,$TunnelDns) if($script:resolverThrows){throw 'Simulated diagnosis failure'};$true}
 function Test-PhysicalResolverAnswers {$true}
-function Test-TunnelSettingsUnchanged {$true}
+function Test-TunnelSettingsUnchanged {$script:settingsUnchanged}
 function Get-ProgramSplitConfiguration {param($Root) throw 'Simulated settings read error'}
 function Invoke-Validation {param($Name)}
 function Clear-ProgramSplitRepairBudget {param($Root) throw 'Simulated ledger cleanup failure'}
 function Start-Sleep {param($Milliseconds)}
 function Test-StackHealth {if($script:healthFails){throw 'Unclassified diagnostic error'}}
-function Stop-Stack {throw 'A fixture must never attempt a full stack teardown'}
+function Stop-Stack {$script:components.Add('full stack teardown');throw 'A fixture must never attempt a full stack teardown'}
 function Reset-Fixture {
-    $script:now=0;$script:dnsHealthy=$false;$script:serviceStatus='Running';$script:serviceUnknown=$false;$script:rulePresent=$true
+    $script:now=0;$script:dnsHealthy=$false;$script:serviceStatus='Running';$script:serviceUnknown=$false;$script:serviceMissing=$false;$script:rulePresent=$true
+    $script:settingsUnchanged=$true;$script:nextNrptRepair=[TimeSpan]::Zero
     $script:resolverThrows=$false;$script:healthFails=$false;$script:budgetAvailable=$true;$script:charges=0
     $script:tunnelOutageLogged=$false;$script:nextRepair=[TimeSpan]::Zero;$script:repairDelaySeconds=2
     $script:components.Clear();$script:messages.Clear();Clear-ProgramSplitSoftFailure
@@ -111,6 +113,15 @@ try {
         Restart-Tunnel 'Provider DNS outage' -StopFirst
     }
     Assert-True ($script:components.Count -eq 0 -and $script:charges -eq 0) 'a provider DNS outage never restarts a tunnel that keeps receiving traffic'
+    Reset-Fixture
+    $script:settingsUnchanged=$false
+    $changed=[Management.Automation.ErrorRecord]::new([Exception]::new('Provider DNS outage'),'fixture',[Management.Automation.ErrorCategory]::NotSpecified,$null)
+    $changed.Exception.Data['ProgramSplitStage']='Tunnel'
+    foreach($time in @(0,30,60,90)){
+        $script:now=$time;[ProgramSplit.StabilityNetwork]::Snapshot.ReceivedBytes++
+        Invoke-HealthFailure $changed
+    }
+    Assert-True ($script:components.Count -eq 0 -and $script:charges -eq 0) 'unapplied settings plus a DNS outage cannot bypass traffic protection or restart a working tunnel'
     Reset-Fixture
     foreach($time in @(0,30)){$script:now=$time;Restart-Tunnel 'Temporary DNS issue' -StopFirst}
     $script:dnsHealthy=$true;$script:now=45;Restart-Tunnel 'Recovered DNS' -StopFirst
@@ -141,6 +152,11 @@ try {
     Assert-True ((Get-StackState) -eq 'Unknown') 'an uncertain SCM observation does not request a stack rebuild'
     $script:serviceUnknown=$false;$script:rulePresent=$false
     Assert-True ((Get-StackState) -eq 'DnsRuleMissing') 'a suspended or missing NRPT rule requests only a DNS rule repair'
+    $script:serviceMissing=$true
+    Assert-True ((Get-StackState) -eq 'TunnelDown') 'a positively missing service requests recreation rather than permanent deferral'
+    Restart-Tunnel 'Missing service after failed start' -StopFirst
+    Assert-True (($script:components -join ',') -eq 'Invoke-Tunnel.ps1 Start') 'the retry path recreates a missing service without a needless stop'
+    Reset-Fixture
     $ruleBranch=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.IfStatementAst]},$true) |
         ForEach-Object {$_.Clauses} | Where-Object {$_.Item1.Extent.Text -eq '$stackState -eq ''DnsRuleMissing'''})
     Assert-True ($ruleBranch.Count -eq 1) 'the controller has one rule-only loop branch'
@@ -149,8 +165,12 @@ try {
         $script:components.Add("$Name $Action")
         throw 'Simulated no ready dispatcher; NRPT stays suspended'
     }
+    $suspended=Join-Path $state 'nrpt-suspended';[IO.File]::WriteAllText($suspended,'supervisor owned')
+    & ([scriptblock]::Create($body.Substring(1,$body.Length-2)))
+    Assert-True ($script:components.Count -eq 0) 'the controller leaves supervisor-suspended NRPT restoration to the supervisor'
+    Remove-Item -LiteralPath $suspended
     & ([scriptblock]::Create($body.Substring(1,$body.Length-2)))
     Assert-True (($script:components -join ',') -eq 'Invoke-LocalNrpt.ps1 Enable' -and
-        $script:nextRepair -eq [TimeSpan]::FromSeconds(10)) 'a suspended rule with failed restoration leaves tunnel and dispatcher alone and backs off'
+        $script:nextNrptRepair -eq [TimeSpan]::FromSeconds(10) -and $script:nextRepair -eq [TimeSpan]::Zero) 'failed rule restoration leaves tunnel and dispatcher alone with its own independent backoff'
     Write-Output 'PASS: recovery waits out transients, cancels on DNS or traffic recovery, respects budgets, and contains diagnostic errors.'
 } finally {Remove-Item -LiteralPath $fixture -Recurse -Force}

@@ -287,6 +287,28 @@ public static int SuspendNew(string name, int exclude, int timeoutMilliseconds) 
     Start-Sleep -Seconds 2
     $dispatcher = Wait-Dispatcher
     Assert-True ($dispatcher.Id -eq $previous) 'a brief dispatcher stall keeps the original process'
+    # A transient status-file lock is not permission to bypass heartbeat persistence.
+    Start-Sleep -Seconds 11
+    $statusLock=[IO.File]::Open((Join-Path $state 'dns-dispatcher-status.txt'),'Open','ReadWrite','None')
+    try {
+        Assert-True ([WgpsTest.Native]::NtSuspendProcess($dispatcher.Handle) -eq 0) 'the worker briefly stalls with its metadata unreadable'
+        Start-Sleep -Seconds 3
+        Assert-True ([WgpsTest.Native]::NtResumeProcess($dispatcher.Handle) -eq 0) 'the metadata-stalled worker recovers'
+    } finally {$statusLock.Dispose()}
+    Start-Sleep -Seconds 2
+    $dispatcher=Wait-Dispatcher
+    Assert-True ($dispatcher.Id -eq $previous) 'unreadable status plus a brief heartbeat stall does not replace a working worker'
+    # Re-adoption starts a fresh failure history, even when the same process was stalled before disable.
+    Assert-True ([WgpsTest.Native]::NtSuspendProcess($dispatcher.Handle) -eq 0) 'the worker stalls before supervision is toggled'
+    Start-Sleep -Seconds 9
+    Remove-Item -LiteralPath (Join-Path $state 'dns-dispatcher.supervised') -Force
+    Start-Sleep -Seconds 1
+    [IO.File]::WriteAllText((Join-Path $state 'dns-dispatcher.supervised'),'test')
+    Start-Sleep -Seconds 3
+    Assert-True ([WgpsTest.Native]::NtResumeProcess($dispatcher.Handle) -eq 0) 'the adopted worker recovers inside its fresh grace period'
+    Start-Sleep -Seconds 2
+    $dispatcher=Wait-Dispatcher
+    Assert-True ($dispatcher.Id -eq $previous) 'stale failure counters cannot terminate a newly adopted worker'
     $previous = $dispatcher.Id
     Assert-True ([WgpsTest.Native]::NtSuspendProcess($dispatcher.Handle) -eq 0) 'the dispatcher is suspended'
     $timer.Restart()
@@ -333,8 +355,8 @@ public static int SuspendNew(string name, int exclude, int timeoutMilliseconds) 
     $timer.Restart()
     $dispatcher = Wait-Dispatcher -NotId $hung -Seconds 30
     Write-Output "OBSERVED: a dispatcher suspended before publishing its inputs was replaced by a ready one after $($timer.Elapsed.TotalSeconds.ToString('0.0')) s."
-    Assert-True ($timer.Elapsed.TotalSeconds -le 14 -and -not (Get-Process -Id $hung -ErrorAction SilentlyContinue)) `
-        'a dispatcher that never publishes is ended and replaced after the startup deadline'
+    Assert-True ($timer.Elapsed.TotalSeconds -ge 19 -and $timer.Elapsed.TotalSeconds -le 25 -and -not (Get-Process -Id $hung -ErrorAction SilentlyContinue)) `
+        'a dispatcher that never publishes gets the startup deadline plus the persistent heartbeat-failure grace'
 
     # An NRPT helper blocked for as long as the test holds the NRPT lock does not delay a restart.
     $nrptLock = [Threading.Mutex]::new($false, 'Global\WireGuardProgramSplitNrptComponent')

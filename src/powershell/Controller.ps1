@@ -36,6 +36,7 @@ $tunnelRetryFile = Join-Path $state 'tunnel-retry'
 $dispatcherSupervisedFile = Join-Path $state 'dns-dispatcher.supervised'
 # Adapter maintenance inspects only devices under this key; see AdapterMaintenance.ps1.
 $rootAdapterKey = 'HKLM:\SYSTEM\CurrentControlSet\Enum\ROOT\WIREGUARD'
+$script:nextNrptRepair = [TimeSpan]::Zero
 
 function Get-ControllerElapsed {
     # Monotonic scheduling survives daylight-saving changes and wall-clock corrections.
@@ -150,9 +151,13 @@ function Get-StackState {
         -not (Test-Path -LiteralPath $filtersInstalledFile -PathType Leaf) -or
         -not (Test-Path -LiteralPath (Join-Path $state 'dns-etw-session.txt') -PathType Leaf) -or
         -not (Test-Path -LiteralPath $dispatcherSupervisedFile -PathType Leaf)) { return 'Inactive' }
-    try {$service = Get-Service -Name $configuration.ServiceName -ErrorAction SilentlyContinue}
-    catch {return 'Unknown'}
+    try {$service = Get-Service -Name $configuration.ServiceName -ErrorAction Stop}
+    catch {
+        if($_.FullyQualifiedErrorId -like 'NoServiceFoundForGivenName*'){return 'TunnelDown'}
+        return 'Unknown'
+    }
     if (-not $service) { return 'Unknown' }
+    if ($service.Status -ne 'Running') { return 'TunnelDown' }
     if (-not (Test-OwnedNrptRulePresent)) { return 'DnsRuleMissing' }
     if ($service.Status -eq 'Running' -and -not $tunnelRetry) { return 'Active' }
     return 'TunnelDown'
@@ -457,9 +462,11 @@ function Restart-Tunnel([string] $Reason, [switch] $StopFirst, [switch] $Adopt) 
         }
     }
     if($StopFirst) {
-        $running=Get-Service -Name $configuration.ServiceName -ErrorAction SilentlyContinue
-        if(-not $running){return}
-        if($running.Status -eq 'Running') {
+        $missing=$false
+        try {$running=Get-Service -Name $configuration.ServiceName -ErrorAction Stop}
+        catch {if($_.FullyQualifiedErrorId -like 'NoServiceFoundForGivenName*'){$running=$null;$missing=$true}else{return}}
+        if(-not $running -and -not $missing){return}
+        if($running -and $running.Status -eq 'Running') {
             try {
                 Test-TunnelDns -TimeoutMilliseconds 750
                 Clear-ProgramSplitSoftFailure
@@ -577,6 +584,7 @@ function Invoke-HealthFailureCore($Failure) {
         $script:physicalHoldLogged = $false
         Repair-Filters -Reason $reason
     } elseif($stage -in @('Dispatcher','DnsRule')) {
+        if($stage -eq 'DnsRule' -and (Test-Path -LiteralPath (Join-Path $state 'nrpt-suspended'))){return}
         if($stage -eq 'Dispatcher' -and -not (Test-ProgramSplitSoftFailureReady 'Dispatcher' (Get-ControllerElapsed).TotalSeconds)){return}
         if(-not (Add-ProgramSplitRepairAttempt $root $reason)){return}
         Save-HealthFailureEvidence -Reason $reason
@@ -609,17 +617,8 @@ function Invoke-HealthFailureCore($Failure) {
             catch {Write-ControllerLog 'Changed direct DNS inputs could not reload yet; keeping the tunnel in place.'}
             return
         }
-        if($stage -ne 'Tunnel'){Write-ControllerLog 'Unclassified health error; preserving running components and checking again.';return}
-        $kind=if($stage){[string]$stage}else{'Unknown'}
-        if(-not (Test-ProgramSplitSoftFailureReady $kind (Get-ControllerElapsed).TotalSeconds)){return}
-        if(-not (Add-ProgramSplitRepairAttempt $root $reason)) {
-            Write-ControllerLog 'Repair circuit is open; keeping the stack in place and checking health again.'
-            return
-        }
-        Write-ControllerLog "Stack health check failed; restarting the stack: $reason"
-        Save-HealthFailureEvidence -Reason $reason
-        Stop-Stack
-        Invoke-Repair -Reserved
+        Clear-ProgramSplitSoftFailure
+        Write-ControllerLog 'Unclassified error or unapplied tunnel settings; keeping the running connection until diagnosis or an explicit reload.'
     }
 }
 
@@ -926,9 +925,9 @@ try {
             if($stackState -eq 'Unknown') {Clear-ProgramSplitSoftFailure}
             elseif($stackState -eq 'DnsRuleMissing') {
                 Clear-ProgramSplitSoftFailure
-                if((Get-ControllerElapsed) -ge $script:nextRepair){
-                    try{Invoke-Component 'Invoke-LocalNrpt.ps1' 'Enable';$script:nextRepair=[TimeSpan]::Zero}
-                    catch{$script:nextRepair=(Get-ControllerElapsed)+[TimeSpan]::FromSeconds(10);Write-ControllerLog 'DNS rule restoration deferred; leaving the tunnel and dispatcher running.'}
+                if(-not (Test-Path -LiteralPath (Join-Path $state 'nrpt-suspended')) -and (Get-ControllerElapsed) -ge $script:nextNrptRepair){
+                    try{Invoke-Component 'Invoke-LocalNrpt.ps1' 'Enable';$script:nextNrptRepair=[TimeSpan]::Zero}
+                    catch{$script:nextNrptRepair=(Get-ControllerElapsed)+[TimeSpan]::FromSeconds(10);Write-ControllerLog 'DNS rule restoration deferred; leaving the tunnel and dispatcher running.'}
                 }
             } elseif ($stackState -eq 'TunnelDown' -and (Test-TunnelSettingsUnchanged)) {
                 if (Test-Path -LiteralPath $tunnelRetryFile -PathType Leaf) {

@@ -32,10 +32,10 @@ Assert-True ($dispatcherSource -match "'--system', 'example\.com', 3") `
     'dispatcher validation retries a transient refusal'
 Assert-True ($controllerSource -match 'Wait-ProgramSplitProbe -Probe \{ Test-TunnelDns -TimeoutMilliseconds 750 \}') `
     'startup gate keeps single-shot probes because its own loop already retries'
-Assert-True ($controllerSource -match '(?s)Stack health check failed.*?Save-HealthFailureEvidence -Reason \$reason\s*Stop-Stack\s*Invoke-Repair') `
+Assert-True ($controllerSource -match '(?s)Stack health check failed.*?Save-HealthFailureEvidence -Reason \$reason\s*Stop-Stack -KeepTunnel\s*Invoke-Repair') `
     'controller snapshots component logs before the restart that overwrites them'
 Assert-True ($controllerSource -match '(?s)catch \{ Invoke-HealthFailure \$_;return \}' -and
-    $controllerSource -match '(?s)function Invoke-HealthFailure.*?\$stage -in @\(''Tunnel'', ''Transport''\) -and\s*\(-not \(Test-ProgramSplitPhysicalInputs.*?holding the stack.*?\} else \{.*?Stop-Stack') `
+    $controllerSource -match '(?s)function Invoke-HealthFailureCore.*?\$stage -in @\(''Tunnel'', ''Transport''\) -and\s*\(-not \(Test-ProgramSplitPhysicalInputs.*?holding the stack') `
     'a transport or tunnel failure without physical uplink inputs holds the stack instead of stopping it'
 Assert-True ($controllerSource -match '(?s)function Test-LocalDns.*?if \(-not \(Test-PhysicalResolverAnswers\)\).*?not answering; keeping the stack in place.*?return') `
     'a local split-DNS probe failure holds the stack when the physical resolver itself is silent'
@@ -276,14 +276,14 @@ try {
     Assert-True ((Get-StackState) -eq 'TunnelDown' -and $script:serviceQueries -eq 1) `
         'a stopped tunnel host under intact per-application components is reported as tunnel-only'
     $script:serviceStatus = 'Running'
-    Assert-True ((Test-StackActive) -and $script:nrptQueries -eq 2) 'a complete stack is active'
+    Assert-True ((Test-StackActive) -and $script:nrptQueries -eq 1) 'a complete stack is active without querying NRPT for a stopped tunnel'
     $script:dispatcherRunning = $false
     Assert-True (Test-StackActive) 'a dispatcher between supervised processes needs no stack repair'
     $script:dispatcherRunning = $true
     $script:nrptRules = @()
     Assert-True (-not (Test-StackActive)) 'a missing owned NRPT rule still fails the per-pass active check'
     $script:serviceStatus = 'Stopped'
-    Assert-True ((Get-StackState) -eq 'DnsRuleMissing') 'a missing owned NRPT rule is restored without a stack teardown'
+    Assert-True ((Get-StackState) -eq 'TunnelDown') 'a stopped tunnel is started before restoring a missing owned NRPT rule'
 
     # Presence for disable and service-stop cleanup: the filters count until they are removed, unless a
     # profile import holds them.
@@ -488,9 +488,8 @@ try {
     $script:settingsUnchanged = $false
     Reset-Recovery
     Invoke-HealthFailure $failure
-    Assert-True ($script:components -contains 'Invoke-Tunnel.ps1 Stop' -and $script:starts -eq 1 -and
-        $script:components -notcontains 'Invoke-WfpFilters.ps1 Stop') `
-        'changed tunnel settings fall back to the full restart, which keeps the filters for Start-Stack to replace'
+    Assert-True ($script:components.Count -eq 0 -and $script:starts -eq 0) `
+        'unapplied tunnel settings cannot turn a health failure into a full restart'
     $script:settingsUnchanged = $true
 
     # A filter mismatch is repaired in place, even while the uplink is down.

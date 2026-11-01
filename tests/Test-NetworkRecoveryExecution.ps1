@@ -27,6 +27,10 @@ function Assert-True([bool]$Condition,[string]$Message){if(-not $Condition){thro
 function Get-Service {param($Name,$ErrorAction) [pscustomobject]@{Status='Running'}}
 function Get-ProgramSplitConfiguration {param($Root) [pscustomobject]@{AdapterName='Fixture tunnel'}}
 function Get-ProgramSplitPhysicalDefault {param($AdapterName) [pscustomobject]@{InterfaceIndex=$script:activeInterface}}
+function Get-NetRoute {param($AddressFamily,$DestinationPrefix,$PolicyStore,$ErrorAction)
+    if($script:routeUnknown){throw 'Simulated route inventory error'}
+    if(-not $script:routeMissing){[pscustomobject]@{InterfaceAlias='Fixture adapter';InterfaceIndex=$script:activeInterface}}
+}
 function Get-WinEvent {param($FilterHashtable,$MaxEvents,$ErrorAction) @()}
 function Start-Sleep {param($Seconds,$Milliseconds) if($script:afterScan){& $script:afterScan}}
 function Get-NetAdapter {param([switch]$IncludeHidden,$ErrorAction) if($script:afterInventory){& $script:afterInventory};$script:adapter}
@@ -49,6 +53,7 @@ function Reset-Fixture {
     [ProgramSplit.PhysicalNetwork]::Fresh=[ProgramSplit.PhysicalNetwork]::Snapshot.PSObject.Copy()
     $script:adapter=[pscustomobject]@{Name='Fixture adapter';InterfaceGuid=$id;HardwareInterface=$true;AdminStatus='Up';ifIndex=22;PnPDeviceID='PCI\FIXTURE'}
     $script:resets=0;$script:resetFails=$false;$script:afterScan=$null;$script:afterInventory=$null;$script:activeInterface=22
+    $script:routeMissing=$false;$script:routeUnknown=$false
     [IO.File]::WriteAllText((Join-Path $fixture 'state\network-recovery-budget.json'),'{"Schema":1,"Adapters":[]}')
     [IO.File]::WriteAllText((Join-Path $fixture 'state\enabled'),'1')
     [IO.File]::WriteAllText((Join-Path $fixture 'src\Invoke-WfpFilters.ps1'),'Write-Output "PASS: fixture filters"; exit 0')
@@ -86,6 +91,22 @@ try {
     $script:activeInterface=99
     $result=Invoke-ProgramSplitPhysicalRecovery $fixture $id 'ResetPaused' 3 -FailureStartedTick 0
     Assert-True ($result -like 'DEFER:*' -and $script:resets -eq 0) 'recovery does not disturb another working default interface'
+    Reset-Fixture
+    $script:routeUnknown=$true
+    $result=Invoke-ProgramSplitPhysicalRecovery $fixture $id 'ResetPaused' 3 -FailureStartedTick 0
+    Assert-True ($result -like 'DEFER:*' -and $script:resets -eq 0) 'unknown route inventory cannot authorize recovery'
+    Reset-Fixture
+    $script:afterInventory={$script:activeInterface=99}
+    $result=Invoke-ProgramSplitPhysicalRecovery $fixture $id 'ResetPaused' 3 -FailureStartedTick 0
+    Assert-True ($result -like 'DEFER:*' -and $script:resets -eq 0) 'a route change during slow inventory cancels the pending reset'
+    Reset-Fixture
+    $script:afterInventory={
+        $path=Join-Path $fixture 'config\network-recovery.json'
+        $p=[IO.File]::ReadAllText($path)|ConvertFrom-Json;$p.AllowAdapterRestart=$false
+        [IO.File]::WriteAllText($path,($p|ConvertTo-Json -Depth 4))
+    }
+    $result=Invoke-ProgramSplitPhysicalRecovery $fixture $id 'ResetPaused' 3 -FailureStartedTick 0
+    Assert-True ($result -like 'DEFER:*' -and $script:resets -eq 0) 'revoked hardware restart permission cancels an in-flight attempt'
     Reset-Fixture
     $result=Invoke-ProgramSplitPhysicalRecovery $fixture $id 'ResetPaused' 3 -FailureStartedTick 0
     Assert-True ($result -like 'PASS:*' -and $script:resets -eq 1) 'eligible pause resets exactly the enrolled physical interface'
@@ -131,6 +152,7 @@ try {
     Assert-True ($result -like 'DEFER:*' -and $script:resets -eq 0) 'overall disable prevents physical recovery'
     foreach($action in @('ReconnectWifi','ResetWifi')){
         Reset-Fixture
+        $script:routeMissing=$true
         [ProgramSplit.PhysicalNetwork]::Snapshot.Type=71
         [ProgramSplit.PhysicalNetwork]::Fresh.Type=71
         [ProgramSplit.PhysicalNetwork]::Snapshot.Paused=$false
@@ -147,6 +169,38 @@ try {
         Assert-True ($result -like 'DEFER:*' -and [ProgramSplit.PhysicalNetwork]::Scans -eq 1 -and
             [ProgramSplit.PhysicalNetwork]::Connections -eq 0) "$action respects a new disconnect during the scan wait"
     }
+    foreach($cancellation in @('route','disabled','associated')){
+        Reset-Fixture
+        $script:routeMissing=$true
+        [ProgramSplit.PhysicalNetwork]::Snapshot.Type=71;[ProgramSplit.PhysicalNetwork]::Fresh.Type=71
+        [ProgramSplit.PhysicalNetwork]::Snapshot.Paused=$false;[ProgramSplit.PhysicalNetwork]::Fresh.Paused=$false
+        [ProgramSplit.PhysicalNetwork]::Wireless=[pscustomobject]@{State=4;RadioOn=$true;Visible=$true;Signal=80}
+        $script:wifiIntent=[pscustomobject]@{Id=8002;Reason=163851;RecordId=100;Profile='Fixture network';Time=[datetime]::UtcNow.AddSeconds(-70)}
+        $policyPath=Join-Path $fixture 'config\network-recovery.json'
+        [IO.File]::WriteAllText($policyPath,(@{Schema=1;Enabled=$true;AllowAdapterRestart=$false;Adapters=@(@{Guid=$id.ToString();Type=71;WifiProfile='Fixture network'})}|ConvertTo-Json -Depth 4))
+        $script:afterScan={
+            if($cancellation -eq 'route'){$script:routeMissing=$false;$script:activeInterface=99}
+            elseif($cancellation -eq 'associated'){[ProgramSplit.PhysicalNetwork]::Wireless.State=1}
+            else {[IO.File]::WriteAllText($policyPath,'{"Schema":1,"Enabled":false,"Adapters":[]}')}
+        }
+        $result=Invoke-ProgramSplitPhysicalRecovery $fixture $id 'ReconnectWifi' 0 -FailureStartedTick 0
+        Assert-True ($result -like 'DEFER:*' -and [ProgramSplit.PhysicalNetwork]::Scans -eq 1 -and
+            [ProgramSplit.PhysicalNetwork]::Connections -eq 0 -and $script:resets -eq 0) "a scan-time $cancellation transition cancels Wi-Fi reconnection"
+    }
+    Reset-Fixture
+    [ProgramSplit.PhysicalNetwork]::Snapshot.Type=71;[ProgramSplit.PhysicalNetwork]::Fresh.Type=71
+    [ProgramSplit.PhysicalNetwork]::Snapshot.Paused=$false;[ProgramSplit.PhysicalNetwork]::Fresh.Paused=$false
+    [ProgramSplit.PhysicalNetwork]::Wireless=[pscustomobject]@{State=4;RadioOn=$true;Visible=$true;Signal=80}
+    $script:wifiIntent=[pscustomobject]@{Id=8002;Reason=163851;RecordId=100;Profile='Fixture network';Time=[datetime]::UtcNow.AddSeconds(-70)}
+    [IO.File]::WriteAllText((Join-Path $fixture 'config\network-recovery.json'),(@{Schema=1;Enabled=$true;AllowAdapterRestart=$true;Adapters=@(@{Guid=$id.ToString();Type=71;WifiProfile='Fixture network'})}|ConvertTo-Json -Depth 4))
+    $wifiBudget=@{Guid=$id.ToString();WindowUtc=[datetime]::UtcNow.ToString('o');ResetUtc=[datetime]::MinValue.ToString('o');SequenceUtc=[datetime]::UtcNow.AddSeconds(-90).ToString('o');Resets=0;RefreshRecord=99}
+    [IO.File]::WriteAllText((Join-Path $fixture 'state\network-recovery-budget.json'),(@{Schema=1;Adapters=@($wifiBudget)}|ConvertTo-Json -Depth 4))
+    $script:activeInterface=99
+    $result=Invoke-ProgramSplitPhysicalRecovery $fixture $id 'ResetWifi' 0 -FailureStartedTick 0
+    Assert-True ($result -like 'DEFER:*' -and $script:resets -eq 0) 'disconnected Wi-Fi hardware recovery preserves another active default route'
+    $script:routeMissing=$true
+    $result=Invoke-ProgramSplitPhysicalRecovery $fixture $id 'ResetWifi' 0 -FailureStartedTick 0
+    Assert-True ($result -like 'PASS:*' -and $script:resets -eq 1 -and [ProgramSplit.PhysicalNetwork]::Connections -eq 1) 'explicitly authorized Wi-Fi hardware recovery is reachable when no other physical default route exists'
     Reset-Fixture
     $script:physicalRecoveryNext=[ProgramSplit.PhysicalNetwork]::GetTickCount64()/1000.0-90
     $script:physicalPauseSamples=@{$id.ToString()=2};$script:physicalRecoveryError='';$script:pollActions=0
@@ -185,6 +239,7 @@ try {
     }
     Assert-True ($script:pollActions -eq 0) 'traffic progress during the observation window restarts the confirmation clock'
     Reset-Fixture;Reset-PollClock
+    $script:routeMissing=$true
     [ProgramSplit.PhysicalNetwork]::Snapshot.Type=71;[ProgramSplit.PhysicalNetwork]::Fresh.Type=71
     [ProgramSplit.PhysicalNetwork]::Snapshot.Paused=$false;[ProgramSplit.PhysicalNetwork]::Fresh.Paused=$false
     [ProgramSplit.PhysicalNetwork]::Wireless=[pscustomobject]@{State=4;RadioOn=$true;Visible=$true;Signal=80}

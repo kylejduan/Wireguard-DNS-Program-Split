@@ -171,8 +171,8 @@ $completeComponent = $controllerSource.Substring($controllerSource.IndexOf('func
 Assert-True ($completeComponent.IndexOf('Write-ControllerLog ($output') -ge 0 -and
     $completeComponent.IndexOf('Write-ControllerLog ($output') -lt $completeComponent.IndexOf('$result.ExitCode -ne 0')) `
     'controller logs a component''s output before judging its exit so a failed run keeps its action record'
-Assert-True ($controllerSource -match '(?s)Write-ControllerLog "Stack health check failed.*?\$reason.*?Stop-Stack\s*Invoke-Repair') `
-    'controller logs why a health check failed before restarting the stack'
+Assert-True ($controllerSource -match '(?s)Write-ControllerLog "Stack health check failed.*?Save-HealthFailureEvidence -Reason \$Reason.*?Stop-Stack -KeepTunnel\s*Invoke-Repair') `
+    'controller logs a failed filter repair before rebuilding while preserving the tunnel'
 Assert-True ($controllerSource -match '(?s)Test-Path -LiteralPath \$reloadFile\) \{.*?Stop-Stack -KeepTunnel\s*Invoke-Repair') `
     'an included-app reload keeps the tunnel running for the restart to adopt'
 Assert-True ($controllerSource -match '(?s)function Invoke-RepairAttempt(?:\([^)]*\))? \{\s*#[^\n]*\n\s*if \(\$stopEvent -and \$stopEvent\.WaitOne\(0\)\) \{ return \}' -and

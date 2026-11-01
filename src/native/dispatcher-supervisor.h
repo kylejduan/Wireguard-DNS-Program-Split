@@ -239,6 +239,7 @@ void superviseLoop(const std::filesystem::path& root, HANDLE stop) {
     unsigned failures{};
     ULONGLONG firstFailure{};
     bool answered = false;
+    const auto resetLiveness = [&] { failures = 0; firstFailure = 0; answered = false; lastProbe = 0; };
     struct Handles {
         HANDLE& child;
         HANDLE& helper;
@@ -264,6 +265,7 @@ void superviseLoop(const std::filesystem::path& root, HANDLE stop) {
             if (child) CloseHandle(child);
             child = nullptr;
             unreadySince = 0;
+            resetLiveness();
             continue;
         }
         // Invoke-DnsDispatcher.ps1 stops the dispatcher under the same lock, after clearing the flag.
@@ -276,19 +278,18 @@ void superviseLoop(const std::filesystem::path& root, HANDLE stop) {
                         appendHostLog(L"DNS dispatcher " + std::to_wstring(childId) + L" ended.");
                         CloseHandle(child);
                         child = nullptr;
-                        failures = 0;
-                        firstFailure = 0;
-                        answered = false;
-                        lastProbe = 0;
+                        resetLiveness();
                     }
                     if (!child && (child = adoptDispatcher(root, childId))) {
                         childSince = now;
+                        resetLiveness();
                         appendHostLog(L"Supervising running DNS dispatcher " + std::to_wstring(childId) + L".");
                     }
                     if (!child && now - lastStart >= kRestartSpacingMilliseconds) {
                         lastStart = now;
                         childSince = now;
                         child = startDispatcher(root, childId);
+                        resetLiveness();
                         appendHostLog(child ? L"Started DNS dispatcher " + std::to_wstring(childId) + L"."
                                             : L"DNS dispatcher start failed: " + std::to_wstring(GetLastError()) + L".");
                     }
@@ -310,7 +311,8 @@ void superviseLoop(const std::filesystem::path& root, HANDLE stop) {
             }
             answered = false;
         };
-        if (published && now - lastProbe >= kLivenessIntervalMilliseconds) {
+        if (alive && (published || now - childSince >= kStartupDeadlineMilliseconds) &&
+            now - lastProbe >= kLivenessIntervalMilliseconds) {
             lastProbe = now;
             if (dispatcherAnswers()) {
                 failures = 0;
@@ -321,10 +323,6 @@ void superviseLoop(const std::filesystem::path& root, HANDLE stop) {
                 ++failures;
                 if (dispatcherFailurePersistent(failures, firstFailure, now)) replace(L" does not answer");
             }
-        } else if (alive && !published && now - childSince >= kStartupDeadlineMilliseconds &&
-                   now - lastProbe >= kLivenessIntervalMilliseconds) {
-            lastProbe = now;
-            if (!dispatcherAnswers()) replace(L" did not publish its inputs in time");
         }
         const bool ready = published && answered && failures == 0;
         if (ready) republishProcessId(root, childId);

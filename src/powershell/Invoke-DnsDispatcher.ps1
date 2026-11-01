@@ -229,17 +229,9 @@ foreach ($attempt in 1..20) {
     catch { if ($attempt -eq 20) { throw } else { Start-Sleep -Milliseconds 50 } }
 }
 [IO.File]::WriteAllText($supervisedFile, (Get-Date -Format o))
-# A running dispatcher that lost its ETW session or port cannot recover by reloading;
-# the supervisor starts a fresh one about a second after this one ends.
-$running = Get-ManagedProcess
-$published = $running -and $(try { [IO.File]::ReadAllText($statusFile) } catch { '' }) -match "(?m)^pid=$($running.Id)\r?$"
-if ($published -and (@(Get-OwnedTraceNames).Count -ne 1 -or -not (Get-NetUDPEndpoint -LocalAddress '127.0.0.1' -LocalPort 53 `
-        -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -eq $running.Id }) -or
-        -not (Test-ProgramSplitOwnedTcpListener -ProcessId $running.Id))) {
-    # It may have ended meanwhile, which is what this wants.
-    Stop-Process -Id $running.Id -Force -ErrorAction SilentlyContinue
-    $null = $running.WaitForExit(10000)
-}
+# Start only reloads inputs. Inventory failures must not kill a working DNS worker.
+# The native supervisor owns persistent heartbeat failures and process replacement;
+# the worker exits itself when its ETW consumer ends or a worker thread fails.
 } finally {
     if ($mutexHeld) { $componentMutex.ReleaseMutex() }
     $componentMutex.Dispose()

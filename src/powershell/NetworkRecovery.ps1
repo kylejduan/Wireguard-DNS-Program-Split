@@ -33,6 +33,17 @@ function Test-ProgramSplitAdapterRestartAllowed($Policy) {
     return ($null -ne $option -and $option.Value -is [bool] -and $option.Value)
 }
 
+function Test-ProgramSplitRecoveryRouteSafe([string] $Root, [int] $InterfaceIndex, [string] $Action) {
+    try {
+        $settings=Get-ProgramSplitConfiguration -Root $Root
+        $routes=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore -ErrorAction Stop |
+            Where-Object {$_.InterfaceAlias -ne $settings.AdapterName})
+        if(-not $routes.Count){return $Action -in @('ReconnectWifi','ResetWifi')}
+        $preferred=Get-ProgramSplitPhysicalDefault -AdapterName $settings.AdapterName
+        return $preferred.InterfaceIndex -eq $InterfaceIndex
+    } catch {return $false}
+}
+
 function Get-ProgramSplitWifiIntent([guid] $Guid, [datetime] $Now) {
     # Only a recent failed connection request creates recovery intent. A newer
     # disconnect, successful connection, or request for another profile cancels it.
@@ -140,13 +151,7 @@ function Invoke-ProgramSplitPhysicalRecovery {
         $allowed = Get-ProgramSplitRecoveryAction $entry $snapshot $wireless $intent $budget $PauseSamples $now $uptime `
             (Test-ProgramSplitAdapterRestartAllowed $policy) $failureSeconds
         if ($allowed -ne $Action) { return 'DEFER: fresh evidence no longer authorizes recovery.' }
-        if($Action -ne 'ReconnectWifi') {
-            try {
-                $settings=Get-ProgramSplitConfiguration -Root $Root
-                $route=Get-ProgramSplitPhysicalDefault -AdapterName $settings.AdapterName
-                if($route.InterfaceIndex -ne $snapshot.Index){return 'DEFER: another physical adapter carries the default route.'}
-            } catch {return 'DEFER: active physical adapter could not be confirmed.'}
-        }
+        if(-not (Test-ProgramSplitRecoveryRouteSafe $Root $snapshot.Index $Action)){return 'DEFER: another physical route or an uncertain route is in use.'}
         # Validate the actual persistent filters, not just their on-disk marker.
         $proof = & (Join-Path $PSScriptRoot 'Invoke-WfpFilters.ps1') -Action Validate 2>&1
         if ($LASTEXITCODE -ne 0 -or ($proof -join ' ') -notmatch '^PASS:') { throw 'Persistent payload protection could not be verified.' }
@@ -183,6 +188,14 @@ function Invoke-ProgramSplitPhysicalRecovery {
                 $adapters=@(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {[guid]$_.InterfaceGuid -eq $Guid})
                 if($adapters.Count -ne 1){throw 'Physical adapter identity is no longer unique.'}
                 $adapter=$adapters[0]
+            }
+            $currentPolicy=Get-ProgramSplitRecoveryPolicy $Root
+            $currentEntry=@(if($currentPolicy){$currentPolicy.Adapters|Where-Object {[guid]$_.Guid -eq $Guid}})
+            if(-not $currentPolicy -or @($currentEntry).Count -ne 1 -or $currentEntry[0].Type -ne $entry.Type -or
+                $currentEntry[0].WifiProfile -cne $entry.WifiProfile -or
+                ($Action -ne 'ReconnectWifi' -and -not (Test-ProgramSplitAdapterRestartAllowed $currentPolicy)) -or
+                -not (Test-ProgramSplitRecoveryRouteSafe $Root $snapshot.Index $Action)) {
+                $record.Outcome='cancelled';return 'DEFER: enrollment, restart permission or active route changed.'
             }
             $fresh=[ProgramSplit.PhysicalNetwork]::Read($Guid)
             if($fresh.Guid -ne $Guid -or -not $fresh.Hardware -or -not $fresh.AdminUp -or $fresh.LowPower -or $fresh.Type -ne $entry.Type -or
@@ -231,8 +244,12 @@ function Invoke-ProgramSplitPhysicalRecovery {
                 Start-Sleep -Seconds 2
                 $latestIntent=Get-ProgramSplitWifiIntent $Guid ([datetime]::UtcNow)
                 $radio=[ProgramSplit.PhysicalNetwork]::ReadWireless($Guid,$entry.WifiProfile)
+                $latestPolicy=Get-ProgramSplitRecoveryPolicy $Root
+                $stillEnrolled=@(if($latestPolicy){$latestPolicy.Adapters|Where-Object {[guid]$_.Guid -eq $Guid -and $_.Type -eq 71 -and $_.WifiProfile -ceq $entry.WifiProfile}})
                 if(-not $radio.RadioOn -or $radio.State -ne 4 -or -not $radio.Visible -or
-                    -not $latestIntent -or $latestIntent.RecordId -ne $intent.RecordId) {
+                    -not $latestIntent -or $latestIntent.RecordId -ne $intent.RecordId -or $stillEnrolled.Count -ne 1 -or
+                    -not [IO.File]::Exists((Join-Path $Root 'state\enabled')) -or
+                    -not (Test-ProgramSplitRecoveryRouteSafe $Root $snapshot.Index $Action)) {
                     $record.Outcome='cancelled';return 'DEFER: Wi-Fi request or state changed during scan.'
                 }
                 [ProgramSplit.PhysicalNetwork]::Connect($Guid, $entry.WifiProfile)
@@ -300,6 +317,7 @@ function Test-ProgramSplitPhysicalRecovery {
             $action=Get-ProgramSplitRecoveryAction $entry $snapshot $wireless $intent $budgets[$key] $samples $now ([ProgramSplit.PhysicalNetwork]::GetTickCount64()/1000.0) `
                 (Test-ProgramSplitAdapterRestartAllowed $policy) $failureSeconds
             if($action -and $nowTick -ge $script:physicalGraceUntil -and $nowTick -ge $script:physicalNextAttempt[$key]){
+                if(-not (Test-ProgramSplitRecoveryRouteSafe $Root $snapshot.Index $action)){continue}
                 $script:physicalNextAttempt[$key]=$nowTick+120
                 try {Invoke-Component 'Invoke-NetworkRecovery.ps1' 'Recover' @('-InterfaceGuid',$key,'-RecoveryAction',$action,'-PauseSamples',[string]$samples,'-PausedSentBytes',[string]$script:physicalFirstSent[$key],'-FailureStartedTick',[string][UInt64](($nowTick-$failureSeconds)*1000),'-PausedReceivedBytes',[string]$script:physicalFirstReceived[$key])}
                 finally{$script:physicalPauseSamples[$key]=0}
