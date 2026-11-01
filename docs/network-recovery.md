@@ -115,6 +115,12 @@ Start reloads inputs and cannot kill a worker on a transient inventory error. Af
 worker, the documented NRPT fallback can temporarily use system DNS. This does
 not request a tunnel teardown.
 
+The native heartbeat checks the UDP receive loop. A partial TCP or ETW fault that
+still answers that heartbeat can require manual component recovery; an input
+reload is not a guarantee that every internal worker fault is repaired. Automatic
+repair favors preserving an answering worker over killing one on uncertain
+inventory data.
+
 Preserving a tunnel that still receives traffic can leave selected applications
 waiting for their provider's DNS to recover. Automatic hardware resets, when
 explicitly allowed, can still fail or disrupt an interface; the program cannot

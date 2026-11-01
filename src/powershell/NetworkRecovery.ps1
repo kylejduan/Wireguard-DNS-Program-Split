@@ -36,8 +36,10 @@ function Test-ProgramSplitAdapterRestartAllowed($Policy) {
 function Test-ProgramSplitRecoveryRouteSafe([string] $Root, [int] $InterfaceIndex, [string] $Action) {
     try {
         $settings=Get-ProgramSplitConfiguration -Root $Root
-        $routes=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore -ErrorAction Stop |
-            Where-Object {$_.InterfaceAlias -ne $settings.AdapterName})
+        # Filtering inside the cmdlet throws ObjectNotFound when the default is
+        # absent. Enumerate first so a real query error stays distinct from none.
+        $routes=@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop |
+            Where-Object {$_.DestinationPrefix -eq '0.0.0.0/0' -and $_.InterfaceAlias -ne $settings.AdapterName})
         if(-not $routes.Count){return $Action -in @('ReconnectWifi','ResetWifi')}
         $preferred=Get-ProgramSplitPhysicalDefault -AdapterName $settings.AdapterName
         return $preferred.InterfaceIndex -eq $InterfaceIndex

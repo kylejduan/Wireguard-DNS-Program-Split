@@ -157,6 +157,16 @@ try {
     Restart-Tunnel 'Missing service after failed start' -StopFirst
     Assert-True (($script:components -join ',') -eq 'Invoke-Tunnel.ps1 Start') 'the retry path recreates a missing service without a needless stop'
     Reset-Fixture
+    $retryBranch=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.IfStatementAst]},$true) |
+        ForEach-Object {$_.Clauses} | Where-Object {$_.Item1.Extent.Text -eq '$stackState -eq ''TunnelDown'''})
+    Assert-True ($retryBranch.Count -eq 1) 'the controller has one tunnel-retry loop branch'
+    $script:settingsUnchanged=$false
+    [IO.File]::WriteAllText($tunnelRetryFile,'retry')
+    function Invoke-Repair {$script:components.Add('full stack repair')}
+    $body=$retryBranch[0].Item2.Extent.Text
+    & ([scriptblock]::Create($body.Substring(1,$body.Length-2)))
+    Assert-True ($script:components.Count -eq 0 -and $script:charges -eq 0) 'a retry marker and unapplied settings cannot trigger a full rebuild of a running tunnel'
+    Reset-Fixture
     $ruleBranch=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.IfStatementAst]},$true) |
         ForEach-Object {$_.Clauses} | Where-Object {$_.Item1.Extent.Text -eq '$stackState -eq ''DnsRuleMissing'''})
     Assert-True ($ruleBranch.Count -eq 1) 'the controller has one rule-only loop branch'

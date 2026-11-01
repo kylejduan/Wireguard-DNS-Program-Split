@@ -29,7 +29,9 @@ function Get-ProgramSplitConfiguration {param($Root) [pscustomobject]@{AdapterNa
 function Get-ProgramSplitPhysicalDefault {param($AdapterName) [pscustomobject]@{InterfaceIndex=$script:activeInterface}}
 function Get-NetRoute {param($AddressFamily,$DestinationPrefix,$PolicyStore,$ErrorAction)
     if($script:routeUnknown){throw 'Simulated route inventory error'}
-    if(-not $script:routeMissing){[pscustomobject]@{InterfaceAlias='Fixture adapter';InterfaceIndex=$script:activeInterface}}
+    if($DestinationPrefix -and $script:routeMissing){throw [Management.Automation.ErrorRecord]::new([Exception]::new('No matching route'),'CmdletizationQuery_NotFound_DestinationPrefix',[Management.Automation.ErrorCategory]::ObjectNotFound,$DestinationPrefix)}
+    if(-not $DestinationPrefix){[pscustomobject]@{DestinationPrefix='127.0.0.0/8';InterfaceAlias='Loopback';InterfaceIndex=1}}
+    if(-not $script:routeMissing){[pscustomobject]@{DestinationPrefix='0.0.0.0/0';InterfaceAlias='Fixture adapter';InterfaceIndex=$script:activeInterface}}
 }
 function Get-WinEvent {param($FilterHashtable,$MaxEvents,$ErrorAction) @()}
 function Start-Sleep {param($Seconds,$Milliseconds) if($script:afterScan){& $script:afterScan}}

@@ -929,14 +929,15 @@ try {
                     try{Invoke-Component 'Invoke-LocalNrpt.ps1' 'Enable';$script:nextNrptRepair=[TimeSpan]::Zero}
                     catch{$script:nextNrptRepair=(Get-ControllerElapsed)+[TimeSpan]::FromSeconds(10);Write-ControllerLog 'DNS rule restoration deferred; leaving the tunnel and dispatcher running.'}
                 }
-            } elseif ($stackState -eq 'TunnelDown' -and (Test-TunnelSettingsUnchanged)) {
-                if (Test-Path -LiteralPath $tunnelRetryFile -PathType Leaf) {
-                    Restart-Tunnel -Reason 'Tunnel DNS did not answer when the stack started.' -StopFirst
-                } else { Restart-Tunnel -Reason 'The tunnel service is not running.' -Adopt:$adoptionPending }
-                # The tunnel-only path validates nothing else, so a stack it completes is checked on the next
-                # pass, including the driver's callouts, instead of after the full interval.
-                $lastHealth = if (Test-StackActive) { (Get-ControllerElapsed) - [TimeSpan]::FromSeconds(31) }
-                    else { Get-ControllerElapsed }
+            } elseif ($stackState -eq 'TunnelDown') {
+                if(Test-TunnelSettingsUnchanged) {
+                    if (Test-Path -LiteralPath $tunnelRetryFile -PathType Leaf) {
+                        Restart-Tunnel -Reason 'Tunnel DNS did not answer when the stack started.' -StopFirst
+                    } else { Restart-Tunnel -Reason 'The tunnel service is not running.' -Adopt:$adoptionPending }
+                    # A completed tunnel-only start needs the full health check on the next pass.
+                    $lastHealth = if (Test-StackActive) { (Get-ControllerElapsed) - [TimeSpan]::FromSeconds(31) }
+                        else { Get-ControllerElapsed }
+                } else {Clear-ProgramSplitSoftFailure} # Unapplied settings require an explicit reload.
             } else {
                 Invoke-Repair
                 $lastHealth = Get-ControllerElapsed
