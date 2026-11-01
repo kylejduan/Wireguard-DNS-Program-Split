@@ -88,7 +88,7 @@ function Remove-ProgramSplitStrayDevice([string] $InstanceId, [string] $LogDirec
     }
 }
 
-function Invoke-ProgramSplitAdapterMaintenance([string] $Root, [switch] $Repair) {
+function Invoke-ProgramSplitAdapterMaintenance([string] $Root, [switch] $Repair, [string] $ApprovedInstanceId = '') {
     # Cheap no-op in the ordinary case; do not enumerate every adapter every health check.
     $registryPath = 'HKLM:\SYSTEM\CurrentControlSet\Enum\ROOT\WIREGUARD'
     if (-not (Test-Path -LiteralPath $registryPath -ErrorAction Stop)) { return }
@@ -105,6 +105,12 @@ function Invoke-ProgramSplitAdapterMaintenance([string] $Root, [switch] $Repair)
             }
             if (-not $Repair) {
                 Write-Output "Adapter maintenance found inactive servicing device $id ($($snapshot.Name))."
+                continue
+            }
+            # Inactivity does not establish ownership: another VPN may retain an
+            # idle root adapter. Automatic maintenance only reports candidates.
+            if($id -ine $ApprovedInstanceId){
+                Write-Output "Adapter maintenance preserved ${id}: removal requires an explicit instance selection."
                 continue
             }
             $logDirectory = Join-Path $Root 'logs'
@@ -133,7 +139,7 @@ function Invoke-ProgramSplitAdapterMaintenance([string] $Root, [switch] $Repair)
 }
 
 function Assert-ProgramSplitAdapterPreflight([string] $Root) {
-    Invoke-ProgramSplitAdapterMaintenance -Root $Root -Repair
+    Invoke-ProgramSplitAdapterMaintenance -Root $Root
     # Registry-only remnants are not network adapters and remain outside this guard's ownership.
     # A visible root device that cannot be safely removed blocks new adapter creation instead.
     $remaining = @(Get-PnpDevice -Class Net -ErrorAction Stop |

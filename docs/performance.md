@@ -459,3 +459,39 @@ boot, against 63 seconds on 0.3.2, and the persistent set was present
 throughout. A listed browser's traffic was not sampled during these boots;
 afterwards the tunnel and direct exits were the VPN and ISP addresses, and the
 stack used 0.73% of one core over 30 seconds.
+
+## October 31, 2026: Windows recovery overhead
+
+The installed stack was sampled for 60 seconds after the network-recovery and
+listener-check fixes. Its six persistent processes used **1.17% of one CPU core**
+and **297.8 MiB of private memory** in total. All six remained alive. This scope
+includes the controller host, PowerShell controller, validation worker and tray,
+DNS dispatcher and tunnel host. It excludes short-lived probes and kernel/driver
+CPU. This is an operational sample, not a matched whole-application A/B test.
+
+A paired microbenchmark found avoidable work on the two-second controller pass:
+the recovery watcher re-invoked the native-helper script before discovering that
+its thirty-second observation was not due. It now loads the helper only when its
+type is absent. Native observations, current policy/budget reads, event checks and
+all recovery guards remain fresh at their original cadence.
+
+| Watcher operation | CPU per call | Elapsed per call |
+| --- | ---: | ---: |
+| Observation not due, before helper reuse | 3.24 ms | 8.10 ms |
+| Observation not due, with helper reuse | 0.43 ms | 0.40 ms |
+| Complete healthy observation, with helper reuse | 11.56 ms | 41.31 ms |
+
+The idle-path comparison alternated six paired rounds of 500 calls per version
+in one warmed PowerShell process against the same live installation. Complete
+observations used four rounds of 25 calls and include enrollment/budget parsing,
+Ethernet and Wi-Fi native reads, and eligibility checks. Hardware-changing actions
+were replaced with a rejecting stub in the benchmark. No recovery action occurred.
+The roughly 87% CPU reduction applies to the watcher's idle check, not the entire
+application. Aggregate process CPU accounting has finite timer resolution.
+
+The earlier 3.43 ms measurement covered only native interface/WLAN queries; it
+excluded the complete watcher and must not be used as its total cost. The resource
+sample above preceded helper reuse and does not establish a whole-stack speedup.
+No new throughput-saturation, gaming-latency or worst-case packet-path A/B test was
+performed. Persistent payload filtering, kernel forwarding and DNS attribution
+behavior are unchanged by this helper-reuse optimization.

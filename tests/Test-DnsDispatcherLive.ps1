@@ -6,7 +6,7 @@ Set-StrictMode -Version Latest
 $addresses = @('0.0.0.0', '127.0.0.1', '127.0.0.2', '127.0.0.3', '127.0.0.4')
 $existingService = Get-Service -Name WireGuardProgramSplitController -ErrorAction SilentlyContinue
 $udp = @(Get-NetUDPEndpoint -LocalPort 53 -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in $addresses })
-$tcp = @(Get-NetTCPConnection -LocalPort 53 -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in $addresses })
+$tcp = @(Get-NetTCPConnection -LocalPort 53 -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in $addresses })
 if ($existingService -or $udp.Count -or $tcp.Count) {
     $existingService | Format-Table Name, Status
     $udp | Format-Table LocalAddress, LocalPort, OwningProcess

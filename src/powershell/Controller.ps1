@@ -7,6 +7,8 @@ Set-StrictMode -Version Latest
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Common.ps1')
 . (Join-Path $PSScriptRoot 'ValidationWorker.ps1')
+. (Join-Path $PSScriptRoot 'NetworkRecovery.ps1')
+. (Join-Path $PSScriptRoot 'RepairPolicy.ps1')
 Assert-ProgramSplit64BitPowerShell
 $configuration = Get-ProgramSplitConfiguration -Root $root
 $state = Join-Path $root 'state'
@@ -250,7 +252,18 @@ function Save-HealthFailureEvidence([string] $Reason) {
     # only record of why the check failed. Snapshot them first. Best effort: this must never throw.
     try {
         $evidenceRoot = Join-Path $logs 'health-failures'
-        $folder = Join-Path $evidenceRoot (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
+        [IO.Directory]::CreateDirectory($evidenceRoot)|Out-Null
+        foreach($expired in @(Get-ChildItem -LiteralPath $evidenceRoot -Directory | Where-Object {$_.CreationTimeUtc -lt [datetime]::UtcNow.AddDays(-30)})) {
+            try{Remove-ProgramSplitTree -Path $expired.FullName}catch{}
+        }
+        $digest=[Security.Cryptography.SHA256]::Create()
+        try{$key=([BitConverter]::ToString($digest.ComputeHash([Text.Encoding]::UTF8.GetBytes($Reason))) -replace '-','').Substring(0,16)}finally{$digest.Dispose()}
+        $previous=Get-ChildItem -LiteralPath $evidenceRoot -Directory -Filter "*-$key" | Select-Object -First 1
+        if($previous){
+            [IO.File]::WriteAllText((Join-Path $previous.FullName 'last-recurrence.txt'),(Get-Date -Format o))
+            return
+        }
+        $folder = Join-Path $evidenceRoot ((Get-Date -Format 'yyyyMMdd-HHmmss-fff')+'-'+$key)
         [IO.Directory]::CreateDirectory($folder) | Out-Null
         $reasonFile = Join-Path $folder 'reason.txt'
         [IO.File]::WriteAllText($reasonFile, "$(Get-Date -Format o) $Reason")
@@ -378,7 +391,7 @@ function Invoke-DispatcherValidation {
                 'Physical source address or pre-dispatch DNS resolver is unavailable|' +
                 'No physical IPv4 default gateway|Local split-DNS health probe')) {
             $_.Exception.Data['ProgramSplitStage'] = 'Transport'
-        }
+        } else { $_.Exception.Data['ProgramSplitStage'] = 'Dispatcher' }
         throw
     }
 }
@@ -390,7 +403,8 @@ function Test-StackHealth {
         $_.Exception.Data['ProgramSplitStage'] = 'Filters'
         throw
     }
-    Invoke-Validation 'Invoke-LocalNrpt.ps1'
+    try { Invoke-Validation 'Invoke-LocalNrpt.ps1' }
+    catch { $_.Exception.Data['ProgramSplitStage']='DnsRule';throw }
     Invoke-DispatcherValidation
     # NRPT and the dispatcher passed, so a failure from here on is VPN-side: the provider, the server or
     # the tunnel host. Mark it so recovery can keep the per-application components in place.
@@ -464,14 +478,19 @@ function Restart-Tunnel([string] $Reason, [switch] $StopFirst, [switch] $Adopt) 
     }
 }
 
-function Invoke-Repair {
-    Invoke-RepairAttempt
+function Invoke-Repair([switch] $Reserved) {
+    Invoke-RepairAttempt -Reserved:$Reserved
 }
 
-function Invoke-RepairAttempt {
+function Invoke-RepairAttempt([switch] $Reserved) {
     # A stop requested during a restart must not rebuild the stack the stop handler then tears down.
     if ($stopEvent -and $stopEvent.WaitOne(0)) { return }
     if ((Get-ControllerElapsed) -lt $script:nextRepair) { return }
+    if(-not $Reserved -and -not (Test-ProgramSplitRepairBudget $root)) {
+        $script:nextRepair=(Get-ControllerElapsed)+[TimeSpan]::FromMinutes(5)
+        Write-ControllerLog 'Repair circuit is open; preserving protection and deferring another stack rebuild.'
+        return
+    }
     try {
         Get-ProgramSplitPhysicalDefault -AdapterName $configuration.AdapterName | Out-Null
         $script:networkWaitLogged = $false
@@ -489,6 +508,7 @@ function Invoke-RepairAttempt {
         $script:nextRepair = [TimeSpan]::Zero
         $script:tunnelOutageLogged = $false
     } catch {
+        $null=Add-ProgramSplitRepairAttempt $root $_.Exception.Message
         $script:nextRepair = (Get-ControllerElapsed) + [TimeSpan]::FromSeconds($script:repairDelaySeconds)
         $script:repairDelaySeconds = [Math]::Min(60, $script:repairDelaySeconds * 2)
     }
@@ -515,10 +535,11 @@ function Repair-Filters([string] $Reason) {
         }
         Write-ControllerLog 'Payload filters reinstalled; the rest of the stack stayed in place.'
     } catch {
+        if(-not (Add-ProgramSplitRepairAttempt $root $Reason)){return}
         Write-ControllerLog "Stack health check failed; restarting the stack: $($_.Exception.Message)"
         Save-HealthFailureEvidence -Reason $Reason
         Stop-Stack
-        Invoke-Repair
+        Invoke-Repair -Reserved
     }
 }
 
@@ -528,6 +549,13 @@ function Invoke-HealthFailure($Failure) {
     if ($stage -eq 'Filters') {
         $script:physicalHoldLogged = $false
         Repair-Filters -Reason $reason
+    } elseif($stage -in @('Dispatcher','DnsRule')) {
+        if(-not (Add-ProgramSplitRepairAttempt $root $reason)){return}
+        Save-HealthFailureEvidence -Reason $reason
+        $component=if($stage -eq 'Dispatcher'){'Invoke-DnsDispatcher.ps1'}else{'Invoke-LocalNrpt.ps1'}
+        $action=if($stage -eq 'Dispatcher'){'Start'}else{'Enable'}
+        try {Invoke-Component $component $action;Invoke-Validation $component}
+        catch {Write-ControllerLog "DNS component repair deferred; tunnel and filters remain in place: $($_.Exception.Message)"}
     } elseif ($stage -in @('Tunnel', 'Transport') -and
         (-not (Test-ProgramSplitPhysicalInputs -AdapterName $configuration.AdapterName `
             -TunnelDns $configuration.TunnelDns) -or -not (Test-PhysicalResolverAnswers))) {
@@ -545,10 +573,14 @@ function Invoke-HealthFailure($Failure) {
         Restart-Tunnel -Reason $reason -StopFirst
     } else {
         $script:physicalHoldLogged = $false
+        if(-not (Add-ProgramSplitRepairAttempt $root $reason)) {
+            Write-ControllerLog 'Repair circuit is open; keeping the stack in place and checking health again.'
+            return
+        }
         Write-ControllerLog "Stack health check failed; restarting the stack: $reason"
         Save-HealthFailureEvidence -Reason $reason
         Stop-Stack
-        Invoke-Repair
+        Invoke-Repair -Reserved
     }
 }
 
@@ -778,6 +810,9 @@ try {
             break
         }
         $desired = Test-Path -LiteralPath $enabledFile -PathType Leaf
+        # Sample before potentially slow health/repair work so an uplink outage
+        # does not keep pushing the physical observation behind DNS timeouts.
+        if ($desired) { Test-ProgramSplitPhysicalRecovery -Root $root }
         if ($desired) {
             $nextCleanup = [TimeSpan]::Zero
             $cleanupDelaySeconds = 2
@@ -789,6 +824,7 @@ try {
             }
         }
         if (-not $desired) {
+            Clear-ProgramSplitRepairBudget $root
             # Check the backoff deadline before probing the stack, and probe it once per pass unless a
             # cleanup attempt has just changed it. A failed cache restoration is retried on its own. A
             # profile import swapping the tunnel profile stops only the tunnel and restores nothing.
@@ -853,6 +889,7 @@ try {
                 catch { Start-Sleep -Milliseconds 250; Test-StackHealth }
                 $script:physicalHoldLogged = $false
                 $script:tunnelOutageLogged = $false
+                Clear-ProgramSplitRepairBudget $root
             } catch { Invoke-HealthFailure $_ }
             $lastHealth = Get-ControllerElapsed
         }

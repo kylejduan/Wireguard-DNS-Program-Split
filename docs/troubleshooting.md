@@ -83,7 +83,7 @@ One active `WireGuardSplit` adapter is expected. Other VPNs may legitimately hav
 
 Windows servicing can create stray `ROOT\WIREGUARD` devices from older driver-installation records. WireGuard documents this in its [upstream cleanup fix](https://github.com/WireGuard/wireguard-nt/commit/b0d305a1865c9b23fa677d9ddeb564a60d315973). Working Windows 11 tunnels use the `SWD\WireGuard` namespace. This project checks before creating a tunnel adapter and also after activation and every five minutes while enabled, so an older, compatible runtime pair can remain in use.
 
-Background repair requires the owned software-enumerated tunnel to be up and its service to be running. Startup preflight instead requires the owned service to be stopped and no adapter named `WireGuardSplit` to exist. A global start mutex serializes creation attempts. Running or starting owned services are reused; the controller does not create a second tunnel. The tunnel service uses Manual startup so SCM cannot bypass this sequence at boot. It only removes a root-enumerated network device with WireGuard hardware/service/provider identity, disconnected status, zero sent/received bytes, no manually configured or routable address, and no routes beyond automatic local/multicast routes. It reinspects identity and activity immediately before invoking `pnputil /remove-device` for that exact instance. At most one removal is attempted per pass. Software-enumerated devices, ambiguous/inaccessible devices, registry-only remnants, and shared driver packages are left alone. Before creation, any remaining enumerated root WireGuard device blocks startup, including a device that could not be safely removed. A later retry can clean the next eligible device; uncertain devices require investigation. Registry-only remnants are not enumerated adapters and do not block startup. No service restart, driver removal, or reboot is requested.
+Background maintenance reports candidates without removing them. Startup preflight requires the owned tunnel service to be stopped and no adapter named `WireGuardSplit` to exist. A global start mutex serializes creation attempts, and any remaining enumerated root WireGuard device blocks creation. Inactivity alone does not prove a root adapter belongs to this project. After identifying its owner and confirming removal is appropriate, an administrator can run `Invoke-AdapterMaintenance.ps1 -Action Repair -InstanceId 'ROOT\WIREGUARD\0007'`, substituting the exact inspected instance. The service must be stopped or its software-enumerated tunnel healthy. Removal still requires WireGuard hardware/service/provider identity, disconnected status, zero traffic, automatic local addresses and local routes, then an immediate identity/activity recheck. Other instances, software-enumerated devices, shared driver packages and registry-only remnants are preserved. No reboot is requested.
 
 From elevated PowerShell, inspect or run maintenance immediately:
 
@@ -107,3 +107,19 @@ The usual cause is the tunnel service stuck in `StartPending` or `StopPending`: 
 ## Startup is slow
 
 `WireGuardProgramSplitController` should report `Automatic`; `WireGuardTunnel$WireGuardSplit` should report `Manual`. The controller starts the tunnel after adapter preflight, so the installation still activates automatically at boot. Compare the boot timestamp to the first `Stack active after tunnel readiness check` line. The controller has no fixed post-success delay; remaining time is physical-network readiness, adapter creation, endpoint handshake, and the first successful DNS probe. Inspect `controller-service.log` if the controller service itself repeatedly restarts.
+
+## Repeated health-check failures
+
+DNS ownership and NRPT failures repair only their own component. Full rebuilds and
+failed starts share a durable budget of three attempts per fifteen-minute window.
+At the limit the controller keeps traffic protection in place, continues health
+checks, and defers another rebuild. A complete successful health check or an
+explicit disable clears the budget. Corrupt or future-dated budget state defers
+repairs and requires inspection. The first snapshot for a repeated failure reason
+is retained; subsequent occurrences update its last-seen time. Up to ten distinct
+reasons are kept, with thirty-day expiration checked when capturing evidence.
+
+See [physical network recovery](network-recovery.md) for the separate, explicitly
+enrolled Ethernet/Wi-Fi recovery limits. Windows Server CI does not reproduce all
+Windows 11 driver and network-management behavior; test on representative Windows
+11 hardware before broad deployment.

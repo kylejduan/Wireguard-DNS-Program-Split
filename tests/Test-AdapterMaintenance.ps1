@@ -96,13 +96,15 @@ try {
     $script:registryPresent = $true
     $output = Invoke-ProgramSplitAdapterMaintenance -Root $temporary
     Assert-True ($script:removed.Count -eq 0 -and $output -match 'found inactive') 'status never removes a device'
+    $output = Invoke-ProgramSplitAdapterMaintenance -Root $temporary -Repair
+    Assert-True ($script:removed.Count -eq 0 -and $output -match 'explicit instance') 'automatic maintenance preserves an inactive adapter of unknown ownership'
     foreach ($change in @('up','traffic','guid','index','recreated','inspection-failure','remove-failure')) {
         $script:change = $change; $script:reads = 0
-        $output = Invoke-ProgramSplitAdapterMaintenance -Root $temporary -Repair
+        $output = Invoke-ProgramSplitAdapterMaintenance -Root $temporary -Repair -ApprovedInstanceId 'ROOT\WIREGUARD\0007'
         Assert-True ($script:removed.Count -eq 0 -and $output -match 'incomplete') "retains device on $change without throwing"
     }
     $script:change = ''; $script:reads = 0
-    $output = Invoke-ProgramSplitAdapterMaintenance -Root $temporary -Repair
+    $output = Invoke-ProgramSplitAdapterMaintenance -Root $temporary -Repair -ApprovedInstanceId 'ROOT\WIREGUARD\0007'
     Assert-True ($script:removed.Count -eq 1 -and $script:removed[0] -eq 'ROOT\WIREGUARD\0007' -and
         $script:reads -eq 2 -and $output -match 'removed inactive') 'removes only the verified exact instance after reinspection'
     $evidence = [IO.File]::ReadAllText((Join-Path $temporary 'logs\adapter-removal-before.json')) | ConvertFrom-Json
@@ -121,6 +123,10 @@ try {
     catch { $blocked = $_.Exception.Message -match 'creation deferred' }
     Assert-True $blocked 'preflight preserves a newly active device and blocks creation'
     $script:change = ''; $script:reads = 0
+    $blocked=$false
+    try {Assert-ProgramSplitAdapterPreflight -Root $temporary|Out-Null}catch{$blocked=$true}
+    Assert-True ($blocked -and $script:removed.Count -eq 1) 'preflight never deletes an unapproved inactive root adapter'
+    Invoke-ProgramSplitAdapterMaintenance -Root $temporary -Repair -ApprovedInstanceId 'ROOT\WIREGUARD\0007'|Out-Null
     $output = Assert-ProgramSplitAdapterPreflight -Root $temporary
     Assert-True ($script:removed.Count -eq 2 -and ($output -join ' ') -match 'PASS:') `
         'preflight succeeds only after the root device is gone, preserving the SWD tunnel inventory'

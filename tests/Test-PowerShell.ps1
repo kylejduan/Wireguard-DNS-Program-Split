@@ -175,7 +175,7 @@ Assert-True ($controllerSource -match '(?s)Write-ControllerLog "Stack health che
     'controller logs why a health check failed before restarting the stack'
 Assert-True ($controllerSource -match '(?s)Test-Path -LiteralPath \$reloadFile\) \{.*?Stop-Stack -KeepTunnel\s*Invoke-Repair') `
     'an included-app reload keeps the tunnel running for the restart to adopt'
-Assert-True ($controllerSource -match '(?s)function Invoke-RepairAttempt \{\s*#[^\n]*\n\s*if \(\$stopEvent -and \$stopEvent\.WaitOne\(0\)\) \{ return \}' -and
+Assert-True ($controllerSource -match '(?s)function Invoke-RepairAttempt(?:\([^)]*\))? \{\s*#[^\n]*\n\s*if \(\$stopEvent -and \$stopEvent\.WaitOne\(0\)\) \{ return \}' -and
     $controllerSource -match 'Wait-ProgramSplitProbe -Probe \{ Test-TunnelDns[^\n]*`\s*-TimeoutMilliseconds 20000 -RetryMilliseconds 250 -StopEvent \$stopEvent') `
     'a service stop during a restart skips the rebuild and abandons the tunnel readiness wait'
 Assert-True ($controllerSource -match 'Test-Path -LiteralPath \(Join-Path \$state ''endpoint-route\.txt''\)') `
@@ -510,7 +510,8 @@ try {
     $dispatcherStartSource = $dispatcherScriptSource.Substring(
         $dispatcherScriptSource.IndexOf('# Start: the identity record'))
     Assert-True ($dispatcherValidateSource -match 'Get-NetUDPEndpoint' -and
-        $dispatcherValidateSource -match 'Get-NetTCPConnection') `
+        $dispatcherValidateSource -match 'Test-ProgramSplitOwnedTcpListener -ProcessId \$process\.Id' -and
+        $commonSource -match '(?s)function Test-ProgramSplitOwnedTcpListener.*?Get-NetTCPConnection.*?OwningProcess -eq \$ProcessId') `
         'dispatcher health validation retains independent socket ownership checks'
     Assert-True ($dispatcherScriptSource -match '(?s)function Get-DirectNetwork.*?Get-ProgramSplitPhysicalDefault.*?Get-ProgramSplitPhysicalResolvers [^\n]*`\s*-InterfaceIndex \$physical\.InterfaceIndex') `
         'the dispatcher snapshot takes its source address and resolvers from one chosen interface'
@@ -840,6 +841,10 @@ PersistentKeepalive = 25
         'profile import rejects a noncanonical WireGuard key' $input $output $settings
     Assert-ProfileRejected ($valid -replace ':51820', ':70000') `
         'profile import rejects an invalid endpoint port' $input $output $settings
+    foreach($hook in @('PreUp','PostUp','PreDown','PostDown')) {
+        Assert-ProfileRejected ($valid -replace '\[Interface\]', "[Interface]`n$hook = cmd.exe /c echo fixture") `
+            'profile import rejects privileged command hooks' $input $output $settings
+    }
 } finally {
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }

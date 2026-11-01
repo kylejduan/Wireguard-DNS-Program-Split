@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+- Windows: route DNS-component failures to their own repair, cap full rebuilds and
+  failed starts at three attempts per fifteen minutes across controller restarts,
+  and retain the first snapshot of repeated failures with bounded retention.
+- Windows: root-adapter cleanup requires explicit instance selection. Background
+  maintenance only reports candidates; inactivity alone cannot prove ownership.
+- Profile import rejects executable PreUp/PostUp/PreDown/PostDown hooks.
+
+- Windows: validate the DNS dispatcher's TCP listener with exact endpoint/process
+  ownership and a bounded loopback connection. Some Windows builds report state
+  zero for real listening sockets; filtering only for `Listen` caused repeated
+  repairs of a healthy dispatcher. UDP ownership and DNS liveness remain required.
+- Windows: add optional physical network recovery with explicit GUID enrollment,
+  native Ethernet-pause detection, recent Wi-Fi request evidence, scan/retry before
+  reset, fresh-state checks, persistent retry budgets and bounded private records.
+  Recovery requires the running split controller and validated payload filters.
+  It is disabled by default; see [operation and limits](docs/network-recovery.md).
+- Recovery validates complete pause samples and transmit progress, restarts its
+  grace after sleep or observation gaps, tolerates malformed WLAN events, and
+  commits ledgers atomically. Missing ledgers defer action. Single-adapter
+  enrollment and cancellation during a Wi-Fi retry have regression coverage.
+- Windows: restrict controller and DNS dispatcher handle inheritance to their
+  explicit inputs. A long-lived dispatcher can no longer retain unrelated pipe
+  ends or events from a concurrent component launch. A native child-process test
+  checks that allowed handles arrive and an unrelated inheritable event does not.
+- Tests: cover the listener metadata regression and physical recovery eligibility,
+  action cancellation, identity changes, protection prerequisites and durable
+  failed-attempt accounting. Windows fixtures launched from WSL now use a unique
+  native TEMP directory so junction and ACL tests run on NTFS.
+
 ## 0.3.3 - 2026-10-15
 
 - Windows: after a reboot, selected applications reach the tunnel as soon as it is up. A shutdown keeps the persistent filters, NRPT rule and dispatcher, and the controller then starts only the tunnel; that path did not load the PIA callout driver, which nothing else starts after a boot, so the filters blocked selected applications until the first 30-second health check repaired them about 32 seconds later. The driver now loads alongside the tunnel start, and the whole stack is validated on the next two-second pass instead of after the full interval.

@@ -12,7 +12,9 @@ $function = @($ast.FindAll({param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Start-TunnelAfterPreflight'
 },$true))
 Assert-True ($function.Count -eq 1) 'one function owns the preflight-to-start sequence'
-. ([scriptblock]::Create($function[0].Extent.Text))
+$fixtureMutex = 'Global\WireGuardProgramSplitPreflightTest-' + [guid]::NewGuid().ToString()
+# Unit fixtures must not contend with an installed controller's SYSTEM-owned lock.
+. ([scriptblock]::Create($function[0].Extent.Text.Replace('Global\WireGuardProgramSplitTunnelStart', $fixtureMutex)))
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("wgps-preflight-test-{0}" -f [guid]::NewGuid())
 [IO.Directory]::CreateDirectory($temporary) | Out-Null
 $helper = Join-Path $temporary 'Invoke-AdapterMaintenance.ps1'

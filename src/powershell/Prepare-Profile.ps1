@@ -60,6 +60,9 @@ foreach ($line in $lines) {
     if ($trimmed -match '^([^#;=]+?)\s*=\s*(.*)$') {
         $key = $Matches[1].Trim().ToLowerInvariant()
         $value = $Matches[2].Trim()
+        if($key -in @('preup','postup','predown','postdown')) {
+            throw 'WireGuard profile command hooks are not supported.'
+        }
 
         $requiredField = ($section -eq 'interface' -and $key -in @('privatekey', 'address', 'dns')) -or
             ($section -eq 'peer' -and $key -in @('publickey', 'allowedips', 'endpoint'))

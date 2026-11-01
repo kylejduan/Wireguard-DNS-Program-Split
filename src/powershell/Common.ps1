@@ -244,6 +244,33 @@ function Test-ProgramSplitDispatcherAnswers {
     } catch { return $false } finally { $client.Dispose() }
 }
 
+function Test-ProgramSplitOwnedTcpListener {
+    # Some Windows builds report State=0 even for a listener accepting connections.
+    # Retain the exact endpoint/process ownership check, then verify listening with a
+    # bounded loopback connection instead of filtering on that unreliable state field.
+    param(
+        [Parameter(Mandatory)] [int] $ProcessId,
+        [ValidateRange(1, 65535)] [int] $Port = 53,
+        [ValidateRange(50, 5000)] [int] $TimeoutMilliseconds = 1000
+    )
+
+    $client = $null
+    $pending = $null
+    try {
+        $endpoint = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $Port -ErrorAction Stop |
+            Where-Object { $_.OwningProcess -eq $ProcessId -and $_.RemoteAddress -eq '0.0.0.0' -and $_.RemotePort -eq 0 }
+        if (-not $endpoint) { return $false }
+        $client = [Net.Sockets.TcpClient]::new([Net.Sockets.AddressFamily]::InterNetwork)
+        $pending = $client.BeginConnect([Net.IPAddress]::Loopback, $Port, $null, $null)
+        if (-not $pending.AsyncWaitHandle.WaitOne($TimeoutMilliseconds)) { return $false }
+        $client.EndConnect($pending)
+        return $client.Connected
+    } catch { return $false } finally {
+        if ($client) { $client.Dispose() }
+        if ($pending) { $pending.AsyncWaitHandle.Dispose() }
+    }
+}
+
 function Test-ProgramSplitDispatcherReady {
     # A ready owned dispatcher: the managed process, with its exact image, listening on 127.0.0.1:53 and
     # answering the liveness query.

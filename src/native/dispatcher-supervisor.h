@@ -72,18 +72,28 @@ HANDLE startDispatcher(const std::filesystem::path& root, DWORD& processId) {
     SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
     HANDLE output = CreateFileW((root / L"logs" / L"dns-dispatcher-ready.log").c_str(), GENERIC_WRITE,
                                 FILE_SHARE_READ | FILE_SHARE_DELETE, &inherit, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    if (output != INVALID_HANDLE_VALUE) {
-        startup.dwFlags = STARTF_USESTDHANDLES;
-        startup.hStdOutput = output;
-        startup.hStdError = output;
+    // Diagnostic-file contention must not prevent DNS recovery.
+    if (output == INVALID_HANDLE_VALUE) {
+        output = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              &inherit, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+    HANDLE input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               &inherit, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (output == INVALID_HANDLE_VALUE || input == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
+        if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
+        SetLastError(error);
+        return nullptr;
     }
     PROCESS_INFORMATION process{};
     // Not in this host's job: a dispatcher outlives a host restart and is adopted, so DNS keeps working.
-    const BOOL created = CreateProcessW(exe.c_str(), commandLine.data(), nullptr, nullptr, output != INVALID_HANDLE_VALUE,
-                                        CREATE_NO_WINDOW, nullptr, root.c_str(), &startup, &process);
-    if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
+    const BOOL created = wgps::createWithInheritedHandles(exe.c_str(), commandLine.data(), root.c_str(),
+                                        CREATE_NO_WINDOW, {input, output}, input, output, output, process);
+    const DWORD error = GetLastError();
+    CloseHandle(output);
+    CloseHandle(input);
+    SetLastError(error);
     if (!created) return nullptr;
     CloseHandle(process.hThread);
     processId = process.dwProcessId;

@@ -15,6 +15,8 @@
 #include "log-pipe.h"
 #include "parse-number.h"
 #include "log-self-test.h"
+#include "inherited-process.h"
+#include "inherited-process-self-test.h"
 #include <algorithm>
 
 namespace {
@@ -160,16 +162,10 @@ bool launchController(HANDLE job, HANDLE& child, HANDLE log) {
         L" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File " +
         quoteArgument(gControllerScript) + L" -StopEventHandle " +
         std::to_wstring(reinterpret_cast<ULONG_PTR>(gStopEvent));
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = nullInput;
-    startup.hStdOutput = log;
-    startup.hStdError = log;
     PROCESS_INFORMATION process{};
-    const BOOL created = CreateProcessW(powerShell.c_str(), commandLine.data(), nullptr, nullptr, TRUE,
-                                        CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup,
-                                        &process);
+    const BOOL created = wgps::createWithInheritedHandles(powerShell.c_str(), commandLine.data(), nullptr,
+                                        CREATE_NO_WINDOW | CREATE_SUSPENDED, {nullInput, log, gStopEvent},
+                                        nullInput, log, log, process);
     CloseHandle(nullInput);
     if (!created) return false;
     if (!AssignProcessToJobObject(job, process.hProcess) || ResumeThread(process.hThread) == DWORD(-1)) {
@@ -374,6 +370,7 @@ int selfTest() {
         if (length && base64Decode(std::wstring(encoded.begin(), encoded.end())) != allBytes.substr(0, length)) return 18;
     }
     if (base64Encode("ab") != "YWI=" || !base64Decode(L"YW=I").empty() || !base64Decode(L"YWI").empty() || !base64Decode(L"YW*=").empty()) return 19;
+    if (!wgps::inheritedProcessSelfTest()) return 20;
     std::wcout << L"PASS: bounded logs and controller service command-line setup and exit reporting.\n";
     return 0;
 }
@@ -382,6 +379,14 @@ int selfTest() {
 
 int wmain(int argc, wchar_t** argv) {
     if (argc == 2 && std::wcscmp(argv[1], L"--self-test") == 0) return selfTest();
+    if (argc == 4 && std::wcscmp(argv[1], L"--check-inherited-handles") == 0) {
+        const auto handle = [](const wchar_t* text) {
+            return reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(_wcstoui64(text, nullptr, 10)));
+        };
+        if (!SetEvent(handle(argv[2]))) return 1;
+        SetEvent(handle(argv[3])); // Must not signal the parent's excluded event.
+        return 0;
+    }
     if (argc == 4 && std::wcscmp(argv[1], L"--run") == 0) return boundedRun(argv[2], argv[3]);
     // The supervisor alone, for tests against an installation-shaped directory; ends when the process does.
     if (argc == 3 && std::wcscmp(argv[1], L"--supervise-dispatcher") == 0) {

@@ -30,7 +30,10 @@ $functions = @($ast.FindAll({
             'Get-MonotonicSeconds', 'Get-PendingHostAge')
 }, $true))
 if ($functions.Count -ne 6) { throw 'The tunnel recovery functions were not found.' }
-foreach ($function in $functions) { . ([scriptblock]::Create($function.Extent.Text)) }
+$fixtureMutex = 'Global\WireGuardProgramSplitLiveTest-' + [guid]::NewGuid().ToString()
+foreach ($function in $functions) {
+    . ([scriptblock]::Create($function.Extent.Text.Replace('Global\WireGuardProgramSplitTunnelStart',$fixtureMutex)))
+}
 
 $suffix = [guid]::NewGuid().ToString('N').Substring(0, 8)
 $serviceName = "WgpsRecoveryTest$suffix"

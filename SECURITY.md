@@ -10,4 +10,4 @@ Please report suspected vulnerabilities privately through GitHub Security Adviso
 
 ## Deployment warning
 
-This software runs PowerShell as SYSTEM, installs WFP state, changes NRPT and DNS-cache policy, and stores a WireGuard private key locally. Review the source, verify dependency signatures, and test on a non-critical machine before relying on it. The current design has documented fail-open payload cases and is not a hardened anonymity or kill-switch product.
+This software runs PowerShell as SYSTEM, installs WFP state, changes NRPT and DNS-cache policy, and stores a WireGuard private key locally. Review the source, verify dependency signatures, and test on a non-critical machine before relying on it. Persistent WFP filters protect selected IPv4 payloads and block their non-loopback IPv6 while enabled. Ordinary DNS can fall back to the physical resolver if the dispatcher cannot recover; see [limitations](docs/limitations.md). This is not a hardened anonymity product. Optional [physical network recovery](docs/network-recovery.md) can restart explicitly enrolled adapters and keeps private, bounded diagnostic records.

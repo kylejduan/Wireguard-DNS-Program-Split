@@ -4,6 +4,10 @@ Per-executable WireGuard split tunneling with split DNS. Selected executables' I
 
 > **Experimental:** this is a source release for advanced users. It installs privileged networking components, currently tunnels IPv4 only, and the Windows implementation still has documented fail-open cases, such as selected applications' ordinary DNS when a repair cannot restart the dispatcher. Read [Limitations](docs/limitations.md) and the [Linux operating limits](docs/linux.md) before using it.
 
+Optional [physical network recovery](docs/network-recovery.md) can recover a sustained
+native Ethernet pause or retry a recently requested Wi-Fi connection. It requires
+explicit adapter enrollment and leaves normal router/DNS outages alone.
+
 ## What is different
 
 | Traffic | Selected executable | Unlisted executable |

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-param([ValidateSet('Status', 'Repair', 'BeforeStart')] [string] $Action = 'Status')
+param([ValidateSet('Status', 'Repair', 'BeforeStart')] [string] $Action = 'Status',
+    [ValidatePattern('^ROOT\\WIREGUARD\\[0-9]{4}$')] [string] $InstanceId)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -39,7 +40,7 @@ try {
             $existing = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop |
                 Where-Object { $_.Name -eq $configuration.AdapterName })
             if ($existing.Count) { throw 'A split adapter already exists; refusing another creation attempt.' }
-        } else {
+        } elseif($service.State -ne 'Stopped') {
             $active = Get-NetAdapter -Name $configuration.AdapterName -ErrorAction Stop
             if ($service.State -ne 'Running' -or $active.Status -ne 'Up' -or
                 $active.PnPDeviceID -notmatch '^SWD\\WireGuard\\\{[0-9a-f-]+\}$') {
@@ -48,7 +49,7 @@ try {
         }
     }
     if ($Action -eq 'BeforeStart') { Assert-ProgramSplitAdapterPreflight -Root $root }
-    else { Invoke-ProgramSplitAdapterMaintenance -Root $root -Repair:($Action -eq 'Repair') }
+    else { Invoke-ProgramSplitAdapterMaintenance -Root $root -Repair:($Action -eq 'Repair') -ApprovedInstanceId $InstanceId }
 } finally {
     if ($held) { $mutex.ReleaseMutex() }
     $mutex.Dispose()

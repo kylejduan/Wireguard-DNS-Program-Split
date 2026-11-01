@@ -7,6 +7,11 @@ Set-StrictMode -Version Latest
 function Assert-True([bool] $Condition, [string] $Message) {
     if (-not $Condition) { throw "ASSERTION FAILED: $Message" }
 }
+# This suite isolates controller sequencing; durable circuit accounting is
+# exercised separately against its real JSON implementation.
+function Test-ProgramSplitRepairBudget {param($Root) $true}
+function Add-ProgramSplitRepairAttempt {param($Root,$Reason) $true}
+function Clear-ProgramSplitRepairBudget {param($Root)}
 
 $controllerPath = Join-Path $RepositoryRoot 'src\powershell\Controller.ps1'
 $controllerSource = [IO.File]::ReadAllText($controllerPath)
@@ -167,6 +172,9 @@ try {
         -not (Test-Path -LiteralPath (Join-Path $snapshot 'controller-service.log'))) `
         'evidence snapshot skips the append-only supervisor logs'
     Assert-True (($controllerLog -join ' ') -match 'evidence saved') 'evidence snapshot location is written to the controller log'
+    foreach($repeat in 1..20){Save-HealthFailureEvidence -Reason 'Tunnel DNS health probe failed: test reason'}
+    Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $logs 'health-failures') -Directory).Count -eq 1) 'repeated failures preserve the first snapshot instead of pushing it out'
+    Assert-True ([IO.File]::Exists((Join-Path $snapshot 'last-recurrence.txt'))) 'repeated failures record a last occurrence'
 
     # A long-running dispatcher log can be far larger than anything worth copying whole, and it is the
     # file a DNS failure most needs. Keep its tail instead of skipping it.
@@ -391,6 +399,16 @@ try {
         Assert-True ($script:starts -eq 1) 'repair rebuilds the stack when no stop is pending'
     } finally { $stopEvent.Dispose() }
     $stopEvent = $null
+    # A health repair already charged its attempt before stopping the tunnel.
+    # Its third reserved attempt must still be allowed to rebuild the stack.
+    function Test-ProgramSplitRepairBudget {param($Root) $false}
+    $script:starts=0;$script:nextRepair=[TimeSpan]::Zero
+    Invoke-Repair
+    Assert-True ($script:starts -eq 0) 'an open circuit prevents an unreserved rebuild'
+    $script:nextRepair=[TimeSpan]::Zero
+    Invoke-Repair -Reserved
+    Assert-True ($script:starts -eq 1) 'a reserved repair completes even at the burst limit'
+    function Test-ProgramSplitRepairBudget {param($Root) $true}
     # A dispatcher that died is the supervisor's: a repair, even one deferred by its backoff, never
     # removes the rule or stops the dispatcher.
     $script:nrptRules = @([pscustomobject]@{ Owned = $true })
@@ -501,12 +519,12 @@ try {
     # Only failures an uplink outage can cause are held for it (Codex #4).
     $script:validationFailures['Invoke-LocalNrpt.ps1'] = 'The owned local split-DNS NRPT rule is missing or duplicated.'
     $failure = Get-HealthFailure
-    Assert-True (-not $failure.Exception.Data['ProgramSplitStage']) 'an NRPT invariant failure is not a transport failure'
+    Assert-True ($failure.Exception.Data['ProgramSplitStage'] -eq 'DnsRule') 'an NRPT invariant failure is repaired in its own component'
     Reset-Recovery
     Invoke-HealthFailure $failure
-    Assert-True ($script:starts -eq 1 -and -not $script:physicalHoldLogged -and
+    Assert-True ($script:starts -eq 0 -and $script:components -contains 'Invoke-LocalNrpt.ps1 Enable' -and
         $script:components -notcontains 'Invoke-WfpFilters.ps1 Stop') `
-        'an NRPT invariant failure is repaired, not held, while the uplink is down'
+        'an NRPT invariant failure repairs only the rule while the uplink is down'
     $script:validationFailures.Clear()
     # A dispatcher killed during the check: its supervised successor is validated instead of repairing.
     $script:validationFailOnce['Invoke-DnsDispatcher.ps1'] = 'Invoke-DnsDispatcher.ps1 Validate failed: The managed DNS dispatcher process is unavailable.'
@@ -517,10 +535,10 @@ try {
         'a dispatcher replaced during a health check passes once its successor is ready'
     $script:validationFailures['Invoke-DnsDispatcher.ps1'] = 'Invoke-DnsDispatcher.ps1 Validate failed: The managed DNS dispatcher process is unavailable.'
     $failure = Get-HealthFailure
-    Assert-True (-not $failure.Exception.Data['ProgramSplitStage']) 'a dispatcher ownership failure is not a transport failure'
+    Assert-True ($failure.Exception.Data['ProgramSplitStage'] -eq 'Dispatcher') 'a dispatcher ownership failure is a component failure'
     Reset-Recovery
     Invoke-HealthFailure $failure
-    Assert-True ($script:starts -eq 1 -and -not $script:physicalHoldLogged) 'a dispatcher ownership failure is repaired while the uplink is down'
+    Assert-True ($script:starts -eq 0 -and $script:components -contains 'Invoke-DnsDispatcher.ps1 Start') 'a dispatcher ownership failure repairs DNS without restarting the tunnel'
     foreach ($message in @('The active physical route, source address, or DNS resolver changed.',
             'Local split-DNS health probe failed: SERVFAIL')) {
         $script:validationFailures['Invoke-DnsDispatcher.ps1'] = "Invoke-DnsDispatcher.ps1 Validate failed: $message"

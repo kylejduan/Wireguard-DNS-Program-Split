@@ -159,9 +159,9 @@ if ($Action -eq 'Validate') {
         if ($traceNames.Count -ne 1) { throw 'The managed DNS dispatcher must own exactly one ETW session.' }
         $udpEndpoint = Get-NetUDPEndpoint -LocalAddress '127.0.0.1' -LocalPort 53 -ErrorAction SilentlyContinue |
             Where-Object { $_.OwningProcess -eq $process.Id }
-        $tcpEndpoint = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 53 -State Listen -ErrorAction SilentlyContinue |
-            Where-Object { $_.OwningProcess -eq $process.Id }
-        if (-not $udpEndpoint -or -not $tcpEndpoint) { throw 'The managed DNS dispatcher does not own loopback port 53.' }
+        if (-not $udpEndpoint -or -not (Test-ProgramSplitOwnedTcpListener -ProcessId $process.Id)) {
+            throw 'The managed DNS dispatcher does not own working UDP/TCP listeners on loopback port 53.'
+        }
         if (-not (Test-ProgramSplitDispatcherAnswers)) { throw 'The managed DNS dispatcher does not answer its liveness query.' }
         if (-not (Test-LoadedInputs $process)) {
             throw 'The DNS dispatcher has not loaded the current inputs and resolved identities.'
@@ -235,6 +235,7 @@ $running = Get-ManagedProcess
 $published = $running -and $(try { [IO.File]::ReadAllText($statusFile) } catch { '' }) -match "(?m)^pid=$($running.Id)\r?$"
 if ($published -and (@(Get-OwnedTraceNames).Count -ne 1 -or -not (Get-NetUDPEndpoint -LocalAddress '127.0.0.1' -LocalPort 53 `
         -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -eq $running.Id }) -or
+        -not (Test-ProgramSplitOwnedTcpListener -ProcessId $running.Id) -or
         -not (Test-ProgramSplitDispatcherAnswers))) {
     # It may have ended meanwhile, which is what this wants.
     Stop-Process -Id $running.Id -Force -ErrorAction SilentlyContinue
