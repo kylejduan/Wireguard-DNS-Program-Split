@@ -3,8 +3,11 @@ param(
     [ValidateSet('Status','Enable','Disable','Recover')] [string] $Action = 'Status',
     [string[]] $InterfaceAlias = @(),
     [string] $WifiProfile = '',
+    [switch] $AllowAdapterRestart,
     [guid] $InterfaceGuid,
     [Nullable[UInt64]] $PausedSentBytes = $null,
+    [Nullable[UInt64]] $FailureStartedTick = $null,
+    [Nullable[UInt64]] $PausedReceivedBytes = $null,
     [ValidateSet('ResetPaused','ReconnectWifi','ResetWifi')] [string] $RecoveryAction = 'ResetPaused',
     [ValidateRange(0,3)] [int] $PauseSamples = 0
 )
@@ -18,13 +21,14 @@ if(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrat
 $null=Get-ProgramSplitConfiguration $root
 . (Join-Path $PSScriptRoot 'PhysicalNetwork.ps1')
 if($Action -eq 'Recover') {
-    Invoke-ProgramSplitPhysicalRecovery $root $InterfaceGuid $RecoveryAction $PauseSamples $PausedSentBytes
+    Invoke-ProgramSplitPhysicalRecovery $root $InterfaceGuid $RecoveryAction $PauseSamples $PausedSentBytes $FailureStartedTick $PausedReceivedBytes
     exit 0
 }
 $path=Join-Path $root 'config\network-recovery.json'
 if($Action -eq 'Status') {
     $policy=Get-ProgramSplitRecoveryPolicy $root
     if(-not $policy){Write-Output 'Physical network recovery is disabled.';exit 0}
+    Write-Output ('Automatic hardware restarts allowed: '+(Test-ProgramSplitAdapterRestartAllowed $policy))
     foreach($entry in $policy.Adapters){[ProgramSplit.PhysicalNetwork]::Read([guid]$entry.Guid)}
     exit 0
 }
@@ -71,7 +75,7 @@ if(-not [IO.File]::Exists($budgetPath)) {
     } finally {Remove-Item -LiteralPath $budgetTemporary -Force -ErrorAction SilentlyContinue}
 } else {$null=Get-ProgramSplitRecoveryBudget $root}
 try {
-    [IO.File]::WriteAllText($temporary,(@{Schema=1;Enabled=$true;Adapters=@($enrolled)}|ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($temporary,(@{Schema=1;Enabled=$true;AllowAdapterRestart=[bool]$AllowAdapterRestart;Adapters=@($enrolled)}|ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
     [ProgramSplit.PhysicalNetwork]::AtomicMove($temporary,$path)
 } finally {Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue}
 Write-Output 'Recovery enabled for the explicitly enrolled adapters. Existing retry budgets are retained.'

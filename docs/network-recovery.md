@@ -27,6 +27,15 @@ Renaming an interface does not change its enrollment; replacing the hardware
 requires enrollment again. Only physical Ethernet and Wi-Fi adapters are accepted.
 There is no automatic enrollment, wildcard selection, or virtual-adapter reset.
 
+Enrollment enables observation and conservative Wi-Fi scan/reconnect attempts.
+**It does not authorize a hardware restart.** An older enrollment without the
+`AllowAdapterRestart` Boolean also leaves hardware restarts off. To opt into the
+advanced hardware recovery behavior, repeat the enrollment command with
+`-AllowAdapterRestart`. Running enrollment again without that switch turns
+hardware restarts off and retains the existing retry ledger. Manual-only hardware
+recovery is the recommended setting when protecting a working connection matters
+more than unattended recovery of a stalled secondary adapter.
+
 Use `-Action Status` to inspect enrollment and native adapter observations. Use
 `-Action Disable` to turn off physical recovery. Disabling retains the attempt
 budget; toggling the feature cannot bypass its cooldown. These commands do not
@@ -38,20 +47,27 @@ The enabled controller observes enrolled interfaces at most every 30 seconds.
 It waits at least 90 seconds after its first observation and after an observation
 gap longer than 45 seconds, including sleep, hibernate and Fast Startup transitions.
 
-* **Ethernet:** `GetIfEntry2` must report a hardware interface with link up,
+* **Ethernet, only with hardware restarts allowed:** `GetIfEntry2` must report a hardware interface with link up,
   administrative state up, no low-power flag, and the native paused bit on three
-  successive valid observations, with no transmit progress. Only then may that
-  exact GUID be restarted. Low-power or disconnected observations and observation
+  or more successive valid observations spanning at least five minutes, with no
+  transmit or receive progress. The executor independently checks the first
+  observation's monotonic timestamp. Only then may that exact GUID be restarted,
+  and only if it is already the preferred physical default route. A working
+  alternative uplink or an unknown route defers the reset. Low-power or disconnected observations and observation
   gaps break the sequence. Cable removal, a failed DNS lookup, no DHCP,
   packet loss, or a dead router do not satisfy this rule.
 * **Wi-Fi:** a disconnected, powered-on radio needs a WLAN AutoConfig failure
   within the last two minutes for the enrolled profile, with reason 163851
   (network unavailable). A newer connection request, success or disconnect
-  supersedes it. Recovery first scans and retries the saved profile if it is
-  visible. If another
-  matching failure follows that attempt within two minutes, and the requested
-  network is visible and connectable with at least 25 percent signal quality,
-  it may restart that exact adapter and retry. Authentication failures, a working
+  supersedes it. Windows gets at least a minute to recover: both the continuous
+  disconnected observation and the latest failed request must be at least a
+  minute old. Recovery then scans and retries the saved profile if it is visible.
+  Only with hardware restarts separately allowed, after at least five minutes of
+  continuous failure, another matching failure following an issued retry within
+  ten minutes can qualify for a reset. The latest failure must still be between
+  one and two minutes old, and the requested
+  network must be visible and connectable with at least 25 percent signal quality,
+  with that adapter already the preferred physical route. Authentication failures, a working
   connection, radio-off state and another requested profile are left alone.
 
 Every reset requires the split controller to be enabled and running and its
@@ -72,6 +88,26 @@ the initial ledger. A valid administrator can inspect the private state to resol
 Do not delete it automatically to force retries.
 
 ## Evidence and limits
+
+VPN health recovery also distinguishes a failed probe from a dead connection.
+A running tunnel needs at least three spaced failed observations spanning a minute
+before a tunnel-only restart, plus a fresh failed DNS probe and no receive-counter
+progress. A successful probe, incoming traffic, an unknown traffic observation,
+a long sampling gap, or a missing physical resolver cancels the accumulated
+evidence. A genuinely stopped tunnel service is started promptly. DNS transport
+failures repair DNS inputs in place; a missing NRPT rule repairs only that rule.
+Unclassified diagnosis errors and repair-ledger cleanup errors defer and log.
+Tunnel restarts share the existing persistent three-attempt budget per fifteen
+minutes. A live DNS worker gets ten seconds of failed local heartbeats to recover;
+an exited worker still restarts promptly. After fifteen seconds without a ready
+worker, the documented NRPT fallback can temporarily use system DNS. This does
+not request a tunnel teardown.
+
+Preserving a tunnel that still receives traffic can leave selected applications
+waiting for their provider's DNS to recover. Automatic hardware resets, when
+explicitly allowed, can still fail or disrupt an interface; the program cannot
+guarantee a vendor driver's recovery. These thresholds reduce avoidable restarts
+and do not prove that all future faults are harmless.
 
 `config\network-recovery.json` holds enrollment, and
 `state\network-recovery-budget.json` holds retry accounting. Up to ten records in

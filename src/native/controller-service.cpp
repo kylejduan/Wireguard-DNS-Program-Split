@@ -371,6 +371,9 @@ int selfTest() {
     }
     if (base64Encode("ab") != "YWI=" || !base64Decode(L"YW=I").empty() || !base64Decode(L"YWI").empty() || !base64Decode(L"YW*=").empty()) return 19;
     if (!wgps::inheritedProcessSelfTest()) return 20;
+    if (dispatcherFailurePersistent(3, 1000, 3999) || dispatcherFailurePersistent(50, 1000, 10999) ||
+        dispatcherFailurePersistent(2, 1000, 11000) || dispatcherFailurePersistent(3, 1000, 999) ||
+        !dispatcherFailurePersistent(3, 1000, 11000)) return 21;
     std::wcout << L"PASS: bounded logs and controller service command-line setup and exit reporting.\n";
     return 0;
 }

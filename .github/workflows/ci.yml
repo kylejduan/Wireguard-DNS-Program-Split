@@ -60,6 +60,7 @@ jobs:
           ./tests/Test-NetworkRecoveryExecution.ps1 -RepositoryRoot $PWD
           ./tests/Test-RepairPolicy.ps1 -RepositoryRoot $PWD
           ./tests/Test-TunnelRecovery.ps1 -RepositoryRoot $PWD
+          ./tests/Test-RecoveryStability.ps1 -RepositoryRoot $PWD
           ./tests/Test-ControllerHealth.ps1 -RepositoryRoot $PWD
           ./tests/Test-InstallLayout.ps1 -RepositoryRoot $PWD
           ./tests/Test-InstallPaths.ps1 -RepositoryRoot $PWD

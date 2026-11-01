@@ -12,6 +12,11 @@ function Assert-True([bool] $Condition, [string] $Message) {
 function Test-ProgramSplitRepairBudget {param($Root) $true}
 function Add-ProgramSplitRepairAttempt {param($Root,$Reason) $true}
 function Clear-ProgramSplitRepairBudget {param($Root)}
+# Continuous-failure timing and traffic cancellation use their real implementation
+# in Test-RecoveryStability.ps1; this suite isolates the eventual repair sequence.
+function Test-ProgramSplitSoftFailureReady {param($Kind,$Now) $true}
+function Clear-ProgramSplitSoftFailure {}
+function Test-ProgramSplitTunnelTrafficProgress {param($AdapterName) $false}
 
 $controllerPath = Join-Path $RepositoryRoot 'src\powershell\Controller.ps1'
 $controllerSource = [IO.File]::ReadAllText($controllerPath)
@@ -29,7 +34,7 @@ Assert-True ($controllerSource -match 'Wait-ProgramSplitProbe -Probe \{ Test-Tun
     'startup gate keeps single-shot probes because its own loop already retries'
 Assert-True ($controllerSource -match '(?s)Stack health check failed.*?Save-HealthFailureEvidence -Reason \$reason\s*Stop-Stack\s*Invoke-Repair') `
     'controller snapshots component logs before the restart that overwrites them'
-Assert-True ($controllerSource -match '(?s)catch \{ Invoke-HealthFailure \$_ \}' -and
+Assert-True ($controllerSource -match '(?s)catch \{ Invoke-HealthFailure \$_;return \}' -and
     $controllerSource -match '(?s)function Invoke-HealthFailure.*?\$stage -in @\(''Tunnel'', ''Transport''\) -and\s*\(-not \(Test-ProgramSplitPhysicalInputs.*?holding the stack.*?\} else \{.*?Stop-Stack') `
     'a transport or tunnel failure without physical uplink inputs holds the stack instead of stopping it'
 Assert-True ($controllerSource -match '(?s)function Test-LocalDns.*?if \(-not \(Test-PhysicalResolverAnswers\)\).*?not answering; keeping the stack in place.*?return') `
@@ -222,9 +227,9 @@ $loopFunctions = @($ast.FindAll({
             'Test-FilterHoldRequested', 'Stop-Stack', 'Stop-StackForDisable', 'Test-DnsCacheRestorePending',
             'Test-DispatcherIdentitiesCurrent',
             'Invoke-Repair', 'Invoke-RepairAttempt', 'Invoke-DispatcherValidation',
-            'Test-StackHealth', 'Restart-Tunnel', 'Repair-Filters', 'Invoke-HealthFailure', 'Start-Stack')
+            'Test-StackHealth', 'Restart-Tunnel', 'Repair-Filters', 'Invoke-HealthFailure', 'Invoke-HealthFailureCore', 'Start-Stack')
 }, $true))
-Assert-True ($loopFunctions.Count -eq 17) 'controller defines each loop-path helper once'
+Assert-True ($loopFunctions.Count -eq 18) 'controller defines each loop-path helper once'
 foreach ($function in $loopFunctions) { . ([scriptblock]::Create($function.Extent.Text)) }
 Assert-True (-not ($controllerSource -match 'DnsHold|KeepNrpt|dns-hold') -and
     -not ([IO.File]::ReadAllText($commonPath) -match 'DnsHold')) `
@@ -278,7 +283,7 @@ try {
     $script:nrptRules = @()
     Assert-True (-not (Test-StackActive)) 'a missing owned NRPT rule still fails the per-pass active check'
     $script:serviceStatus = 'Stopped'
-    Assert-True ((Get-StackState) -eq 'Inactive') 'a stopped tunnel without the owned NRPT rule needs the full repair'
+    Assert-True ((Get-StackState) -eq 'DnsRuleMissing') 'a missing owned NRPT rule is restored without a stack teardown'
 
     # Presence for disable and service-stop cleanup: the filters count until they are removed, unless a
     # profile import holds them.
@@ -553,16 +558,18 @@ try {
     $script:uplinkPresent = $true
     Reset-Recovery
     Invoke-HealthFailure $failure
-    Assert-True ($script:starts -eq 1 -and $script:components -contains 'Invoke-Tunnel.ps1 Stop' -and
+    Assert-True ($script:starts -eq 0 -and $script:components -contains 'Invoke-DnsDispatcher.ps1 Start' -and
+        $script:components -notcontains 'Invoke-Tunnel.ps1 Stop' -and
         $script:components -notcontains 'Invoke-WfpFilters.ps1 Stop' -and
         $script:components -notcontains 'Invoke-LocalNrpt.ps1 Disable' -and
         $script:components -notcontains 'Invoke-DnsDispatcher.ps1 Stop') `
-        'a transport failure with the uplink present restarts the stack and keeps the filters, NRPT rule and dispatcher'
+        'a transport DNS failure with the uplink present reloads DNS in place and preserves the tunnel, filters and rule'
     Reset-Recovery
     Restart-Tunnel -Reason 'The tunnel service is not running.'
     Assert-True ($script:components -notcontains 'Invoke-Tunnel.ps1 Start' -and
-        $script:components -notcontains 'Invoke-WfpFilters.ps1 Stop' -and $script:starts -eq 1) `
-        'a stopped tunnel with stale dispatcher inputs gets the full restart instead of a tunnel-only start'
+        $script:components -notcontains 'Invoke-WfpFilters.ps1 Stop' -and $script:starts -eq 0 -and
+        $script:components -contains 'Invoke-DnsDispatcher.ps1 Start') `
+        'a stopped tunnel with stale dispatcher inputs refreshes DNS without a stack teardown'
     $script:validationFailures.Clear()
 
     # A reload, which Tray.ps1 requests after an included-app change, is one transactional replacement.
@@ -672,8 +679,9 @@ try {
     $script:components.Clear()
     $script:nextRepair = [TimeSpan]::Zero
     Restart-Tunnel -Reason 'The tunnel service is not running.' -Adopt
-    Assert-True ($script:components -notcontains 'Invoke-Tunnel.ps1 Start' -and $script:starts -eq 1) `
-        'a failing loopback probe with an answering physical resolver gets the full restart'
+    Assert-True ($script:components -notcontains 'Invoke-Tunnel.ps1 Start' -and $script:starts -eq 0 -and
+        $script:components -contains 'Invoke-DnsDispatcher.ps1 Start') `
+        'a failing loopback probe with an answering physical resolver gets an in-place DNS reload'
     $script:validationFailures['Invoke-DnsDispatcher.ps1'] =
         'Invoke-DnsDispatcher.ps1 Validate failed: The active physical route, source address, or DNS resolver changed.'
     $script:resolverAnswers = $false

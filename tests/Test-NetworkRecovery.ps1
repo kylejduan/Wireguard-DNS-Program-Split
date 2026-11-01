@@ -11,8 +11,12 @@ $entry=[pscustomobject]@{Guid=$id;Type=6;WifiProfile=''}
 $snapshot=[pscustomobject]@{Guid=$id;Type=6;Hardware=$true;AdminUp=$true;LowPower=$false;Paused=$true;LinkUp=$true}
 $now=[datetime]::SpecifyKind([datetime]'2026-01-01T12:00:00',[DateTimeKind]::Utc)
 $wireless=$null;$intent=$null;$budget=$null;$samples=3;$uptime=300
-function Decide { Get-ProgramSplitRecoveryAction $entry $snapshot $wireless $intent $budget $samples $now $uptime }
+$allowRestart=$true;$failureSeconds=300
+function Decide { Get-ProgramSplitRecoveryAction $entry $snapshot $wireless $intent $budget $samples $now $uptime $allowRestart $failureSeconds }
 Assert-Equal (Decide) 'ResetPaused' 'confirmed enrolled physical pause permits recovery'
+$allowRestart=$false;Assert-Equal (Decide) '' 'hardware restart requires a separate explicit opt-in';$allowRestart=$true
+$failureSeconds=299;Assert-Equal (Decide) '' 'five minutes of continuous pause are required';$failureSeconds=300
+Assert-Equal (Get-ProgramSplitRecoveryAction $entry $snapshot $wireless $intent $budget $samples $now $uptime) '' 'omitted permission and duration never reset hardware'
 foreach($samples in @(0,1,2)){Assert-Equal (Decide) '' 'transient pause is ignored'}
 $samples=3;$uptime=89;Assert-Equal (Decide) '' 'boot grace';$uptime=300
 foreach($field in @('Hardware','AdminUp','LinkUp')){
@@ -32,23 +36,30 @@ $budget=$null
 
 $entry.Type=71;$entry.WifiProfile='Fixture network';$snapshot.Type=71;$snapshot.Paused=$false
 $wireless=[pscustomobject]@{State=4;RadioOn=$true;Visible=$true;Signal=80}
-$intent=[pscustomobject]@{Id=8002;Reason=163851;RecordId=100;Profile='Fixture network';Time=$now.AddSeconds(-10.5)}
+$intent=[pscustomobject]@{Id=8002;Reason=163851;RecordId=100;Profile='Fixture network';Time=$now.AddSeconds(-70.5)}
 Assert-Equal (Decide) 'ReconnectWifi' 'recent fractional-second failed request permits scan and retry'
+$failureSeconds=59;Assert-Equal (Decide) '' 'a brief Wi-Fi disconnect is left to Windows';$failureSeconds=60
+Assert-Equal (Decide) 'ReconnectWifi' 'retry waits for a full minute of failed connection intent'
+$failureSeconds=300
+$intent.Time=$now.AddSeconds(-59);Assert-Equal (Decide) '' 'a newer failed request gets its own minute to self-recover';$intent.Time=$now.AddSeconds(-70)
 $intent.Id=8003;Assert-Equal (Decide) '' 'manual disconnect is respected';$intent.Id=8002
 $intent.Id=8000;Assert-Equal (Decide) '' 'do not interrupt an ongoing connection';$intent.Id=8002
 $intent.Id=8001;Assert-Equal (Decide) '' 'successful connection cancels failure';$intent.Id=8002
 $intent.Reason=131080;Assert-Equal (Decide) '' 'authentication failure is not a driver reset';$intent.Reason=163851
 $intent.Profile='Different network';Assert-Equal (Decide) '' 'do not interfere with another requested network';$intent.Profile=$entry.WifiProfile
 $intent.Time=$now.AddSeconds(-121);Assert-Equal (Decide) '' 'old failures are not replayed'
-$intent.Time=$now.AddSeconds(1);Assert-Equal (Decide) '' 'future failure timestamps are refused';$intent.Time=$now.AddSeconds(-10)
+$intent.Time=$now.AddSeconds(1);Assert-Equal (Decide) '' 'future failure timestamps are refused';$intent.Time=$now.AddSeconds(-70)
 $wireless.RadioOn=$false;Assert-Equal (Decide) '' 'radio off is respected';$wireless.RadioOn=$true
 $wireless.State=1;Assert-Equal (Decide) '' 'a working Wi-Fi link is never reset';$wireless.State=4
 $budget=[pscustomobject]@{WindowUtc=$now.AddMinutes(-20).ToString('o');ResetUtc=$now.AddHours(-2).ToString('o');SequenceUtc=$now.AddSeconds(-40).ToString('o');Resets=0;RefreshRecord=90}
 Assert-Equal (Decide) 'ResetWifi' 'a new failure after the scan/retry can reset a visible requested AP'
+$allowRestart=$false;Assert-Equal (Decide) '' 'Wi-Fi hardware restart also requires explicit opt-in';$allowRestart=$true
+$failureSeconds=299;Assert-Equal (Decide) '' 'Wi-Fi hardware restart waits five continuous minutes';$failureSeconds=300
 $intent.RecordId=90;Assert-Equal (Decide) '' 'the same failure does not repeatedly reset';$intent.RecordId=100
 $wireless.Visible=$false;Assert-Equal (Decide) '' 'an absent AP is not an adapter fault';$wireless.Visible=$true
 $wireless.Signal=5;Assert-Equal (Decide) '' 'weak coverage is not an adapter fault';$wireless.Signal=80
-$budget.SequenceUtc=$now.AddSeconds(-200).ToString('o');Assert-Equal (Decide) '' 'failed sequence backs off'
+$budget.SequenceUtc=$now.AddSeconds(-300).ToString('o');Assert-Equal (Decide) 'ResetWifi' 'a five-minute failure may follow an earlier issued retry'
+$budget.SequenceUtc=$now.AddSeconds(-600).ToString('o');Assert-Equal (Decide) 'ReconnectWifi' 'an expired sequence refreshes rather than resets'
 $budget.SequenceUtc=$now.AddSeconds(-601).ToString('o');Assert-Equal (Decide) 'ReconnectWifi' 'a fresh later request can retry'
 $budget.SequenceUtc=$now.AddSeconds(1).ToString('o');Assert-Equal (Decide) '' 'clock rollback does not permit Wi-Fi retry'
 
@@ -61,6 +72,12 @@ try {
     Assert-Equal (Get-ProgramSplitRecoveryPolicy $temp) $null 'explicit opt-out'
     [IO.File]::WriteAllText($path,(@{Schema=1;Enabled=$true;Adapters=@($entry)}|ConvertTo-Json -Depth 4))
     Assert-Equal ((Get-ProgramSplitRecoveryPolicy $temp).Adapters.Count) 1 'explicit enrollment accepted'
+    Assert-Equal (Test-ProgramSplitAdapterRestartAllowed (Get-ProgramSplitRecoveryPolicy $temp)) $false 'existing enrollment does not implicitly authorize hardware resets'
+    [IO.File]::WriteAllText($path,(@{Schema=1;Enabled=$true;AllowAdapterRestart=$true;Adapters=@($entry)}|ConvertTo-Json -Depth 4))
+    Assert-Equal (Test-ProgramSplitAdapterRestartAllowed (Get-ProgramSplitRecoveryPolicy $temp)) $true 'separate hardware restart permission is recognized'
+    [IO.File]::WriteAllText($path,(@{Schema=1;Enabled=$true;AllowAdapterRestart='true';Adapters=@($entry)}|ConvertTo-Json -Depth 4))
+    $failed=$false;try{Get-ProgramSplitRecoveryPolicy $temp|Out-Null}catch{$failed=$true}
+    Assert-Equal $failed $true 'a string cannot grant hardware restart permission'
     [IO.File]::WriteAllText($path,(@{Schema=1;Enabled=$true;Adapters=@($entry,$entry)}|ConvertTo-Json -Depth 4))
     $failed=$false;try{Get-ProgramSplitRecoveryPolicy $temp|Out-Null}catch{$failed=$true}
     Assert-Equal $failed $true 'duplicate identities rejected'

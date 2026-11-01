@@ -265,6 +265,7 @@ try {
     # A dispatcher that exists but does not answer, suspended here as a hung one would be, is replaced.
     Add-Type -Namespace WgpsTest -Name Native -MemberDefinition @'
 [DllImport("ntdll.dll")] public static extern int NtSuspendProcess(IntPtr process);
+[DllImport("ntdll.dll")] public static extern int NtResumeProcess(IntPtr process);
 // Suspends the first process with this name other than exclude as soon as it appears, or returns 0.
 public static int SuspendNew(string name, int exclude, int timeoutMilliseconds) {
     var timer = System.Diagnostics.Stopwatch.StartNew();
@@ -278,6 +279,14 @@ public static int SuspendNew(string name, int exclude, int timeoutMilliseconds) 
     return 0;
 }
 '@
+    # A short scheduling stall recovers under the same PID; the watchdog must not make it permanent.
+    $previous = $dispatcher.Id
+    Assert-True ([WgpsTest.Native]::NtSuspendProcess($dispatcher.Handle) -eq 0) 'the dispatcher briefly stalls'
+    Start-Sleep -Seconds 3
+    Assert-True ([WgpsTest.Native]::NtResumeProcess($dispatcher.Handle) -eq 0) 'the dispatcher resumes by itself'
+    Start-Sleep -Seconds 2
+    $dispatcher = Wait-Dispatcher
+    Assert-True ($dispatcher.Id -eq $previous) 'a brief dispatcher stall keeps the original process'
     $previous = $dispatcher.Id
     Assert-True ([WgpsTest.Native]::NtSuspendProcess($dispatcher.Handle) -eq 0) 'the dispatcher is suspended'
     $timer.Restart()
@@ -286,7 +295,7 @@ public static int SuspendNew(string name, int exclude, int timeoutMilliseconds) 
     $hostLookup = Start-Probe $direct 'example.com' 3
     Complete-Probes @($hostLookup)
     Write-Output "OBSERVED: a suspended dispatcher was replaced by a ready one in $($replaced.ToString('0.0')) s."
-    Assert-True ($replaced -le 8 -and -not (Get-Process -Id $previous -ErrorAction SilentlyContinue) -and
+    Assert-True ($replaced -ge 10 -and $replaced -le 18 -and -not (Get-Process -Id $previous -ErrorAction SilentlyContinue) -and
         $hostLookup.Process.ExitCode -eq 0 -and (Get-DnsClientNrptRule | Where-Object { $_.DisplayName -eq $ownedName })) `
         'a dispatcher that stops answering is replaced, and host DNS works again with the rule in place'
 
@@ -304,7 +313,7 @@ public static int SuspendNew(string name, int exclude, int timeoutMilliseconds) 
     $timer.Restart()
     $dispatcher = Wait-Dispatcher -NotId $previous -Seconds 20
     Write-Output "OBSERVED: an adopted dispatcher that hung was replaced by a ready one in $($timer.Elapsed.TotalSeconds.ToString('0.0')) s."
-    Assert-True ($timer.Elapsed.TotalSeconds -le 8 -and -not (Get-Process -Id $previous -ErrorAction SilentlyContinue)) `
+    Assert-True ($timer.Elapsed.TotalSeconds -ge 10 -and $timer.Elapsed.TotalSeconds -le 18 -and -not (Get-Process -Id $previous -ErrorAction SilentlyContinue)) `
         'an adopted dispatcher that stops answering is ended and replaced'
 
     # A dispatcher that hangs before publishing its inputs is replaced after the startup deadline.

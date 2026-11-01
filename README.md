@@ -4,9 +4,10 @@ Per-executable WireGuard split tunneling with split DNS. Selected executables' I
 
 > **Experimental:** this is a source release for advanced users. It installs privileged networking components, currently tunnels IPv4 only, and the Windows implementation still has documented fail-open cases, such as selected applications' ordinary DNS when a repair cannot restart the dispatcher. Read [Limitations](docs/limitations.md) and the [Linux operating limits](docs/linux.md) before using it.
 
-Optional [physical network recovery](docs/network-recovery.md) can recover a sustained
-native Ethernet pause or retry a recently requested Wi-Fi connection. It requires
-explicit adapter enrollment and leaves normal router/DNS outages alone.
+Optional [physical network recovery](docs/network-recovery.md) can retry a recently
+requested Wi-Fi connection after a minute of failure. Hardware resets require a
+separate opt-in and five minutes of continuous fault evidence. Normal router/DNS
+outages do not authorize a physical reset.
 
 ## What is different
 

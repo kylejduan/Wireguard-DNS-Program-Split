@@ -17,8 +17,14 @@ constexpr ULONGLONG kHelperTimeoutMilliseconds = 60000;
 constexpr ULONGLONG kLivenessIntervalMilliseconds = 1000;
 constexpr DWORD kLivenessTimeoutMilliseconds = 300;
 constexpr unsigned kLivenessFailures = 3;
-// A started or adopted dispatcher that has not published its inputs by then is hung and is replaced.
+constexpr ULONGLONG kLivenessFailureGraceMilliseconds = 10000;
+// Missing metadata alone must not terminate a dispatcher that still answers.
 constexpr ULONGLONG kStartupDeadlineMilliseconds = 10000;
+
+bool dispatcherFailurePersistent(unsigned failures, ULONGLONG firstFailure, ULONGLONG now) {
+    return failures >= kLivenessFailures && now >= firstFailure &&
+           now - firstFailure >= kLivenessFailureGraceMilliseconds;
+}
 
 bool pathExists(const std::filesystem::path& path) {
     return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
@@ -231,6 +237,7 @@ void superviseLoop(const std::filesystem::path& root, HANDLE stop) {
     ULONGLONG lastProbe{};
     ULONGLONG childSince{};
     unsigned failures{};
+    ULONGLONG firstFailure{};
     bool answered = false;
     struct Handles {
         HANDLE& child;
@@ -270,6 +277,7 @@ void superviseLoop(const std::filesystem::path& root, HANDLE stop) {
                         CloseHandle(child);
                         child = nullptr;
                         failures = 0;
+                        firstFailure = 0;
                         answered = false;
                         lastProbe = 0;
                     }
@@ -291,8 +299,8 @@ void superviseLoop(const std::filesystem::path& root, HANDLE stop) {
         }
         const bool alive = child && WaitForSingleObject(child, 0) == WAIT_TIMEOUT;
         const bool published = alive && statusProcessId(readSmallFile(root / L"state" / L"dns-dispatcher-status.txt")) == childId;
-        // A process that exists but does not answer is not ready, and after a few failed probes it is
-        // replaced: ended here, it is restarted by the next pass. So is one that never publishes its inputs.
+        // Allow a short scheduler stall to recover. An exited process still restarts immediately;
+        // a live one needs continuous failed local heartbeats before replacement.
         const auto replace = [&](const wchar_t* reason) {
             if (TerminateProcess(child, 1)) {
                 appendHostLog(L"DNS dispatcher " + std::to_wstring(childId) + reason + L"; replacing it.");
@@ -306,14 +314,17 @@ void superviseLoop(const std::filesystem::path& root, HANDLE stop) {
             lastProbe = now;
             if (dispatcherAnswers()) {
                 failures = 0;
+                firstFailure = 0;
                 answered = true;
-            } else if (++failures >= kLivenessFailures) {
-                replace(L" does not answer");
+            } else {
+                if (!failures) firstFailure = now;
+                ++failures;
+                if (dispatcherFailurePersistent(failures, firstFailure, now)) replace(L" does not answer");
             }
         } else if (alive && !published && now - childSince >= kStartupDeadlineMilliseconds &&
                    now - lastProbe >= kLivenessIntervalMilliseconds) {
             lastProbe = now;
-            replace(L" did not publish its inputs in time");
+            if (!dispatcherAnswers()) replace(L" did not publish its inputs in time");
         }
         const bool ready = published && answered && failures == 0;
         if (ready) republishProcessId(root, childId);
