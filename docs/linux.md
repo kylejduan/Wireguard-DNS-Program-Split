@@ -502,3 +502,43 @@ The conntrack flow table is the exception to the stdout limit: allocation reads
 one listing streamed under the same 15-second deadline, keeping only the set of
 zone numbers and one partial line (at most 64 KiB) while discarding flow details.
 See the [follow-up measurements and tradeoffs](performance.md#october-11-2026-broader-audit-and-implementation).
+
+## Automatic peer failover
+
+An optional root-owned, mode-0600 `/etc/wg-program-split/failover.json` adds
+one to seven trusted backup server public-key/IPv4-endpoint pairs. The primary
+remains in `profile.conf`; each backup uses that profile's existing client key,
+preshared key, address, DNS resolver, MTU and keepalive. Obtain compatible peers
+from your provider and verify their public keys. No provider discovery, account
+login or automatic credential renewal is performed. See
+[`config/linux-failover.example.json`](../config/linux-failover.example.json).
+
+For a new installation, pass `--failover /path/to/failover.json` to `validate`,
+`plan` and `install` alongside the profile and settings. On an existing host,
+stop selected applications, explicitly disable the split, install the private
+file, and activate again. Editing or removing it during an active lifetime is
+rejected like an uncoordinated profile edit.
+
+The controller counts consecutive failures of the actual marked DNS/handshake
+probe only while the full owned network inventory still verifies. After three
+failures it chooses the next configured peer. Switches are at least 30 seconds
+apart, measured with the boot clock so wall-clock corrections cannot cause a
+retry storm. Healthy peers are retained; there is no automatic primary
+preemption during a boot. A fresh boot begins with the configured primary and
+can recover through the same bounded sequence.
+
+Peer changes keep the BPF guard attached and blocked. Only the recorded VPN
+network resources are removed and recreated; host DNS, ordinary routes,
+Tailscale and unlisted traffic are not modified. New selected connections are
+allowed after fresh DNS, handshake and ownership verification. Existing VPN
+connections can need application reconnection when the peer changes.
+
+The journal records rotation intent before cleanup and retains the old peer
+index until its receipt is empty. Controller interruption resumes that cleanup
+using the old peer's identity, then prepares the new peer. Missing or modified
+ownership evidence blocks recovery instead of adopting or deleting foreign
+resources. All peers unavailable means selected applications remain blocked
+and bounded retries continue. A provider-wide outage, expired client credential
+or every configured server being retired still requires provider/operator
+attention. The JSON status includes the zero-based active peer index, pending
+index, failure count and boot-clock retry deadline under `failover`.

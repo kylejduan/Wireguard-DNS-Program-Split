@@ -51,6 +51,7 @@ def _parser():
         command = commands.add_parser(name)
         command.add_argument('--profile', required=True, type=Path)
         command.add_argument('--settings', required=True, type=Path)
+        command.add_argument('--failover', type=Path, help='optional trusted backup peers JSON')
         if name == 'install':
             command.add_argument('--artifacts', type=Path, default=Path(sys.argv[0]).resolve().parent)
     for name in ('activate', 'status', 'check', 'disable', 'uninstall', 'guard', 'daemon'):
@@ -68,6 +69,10 @@ def main(argv=None):
         if args.command in ('validate', 'plan', 'install'):
             profile_text, settings_text = args.profile.read_text(), args.settings.read_text()
             profile, settings = parse_profile(profile_text), parse_settings(settings_text)
+            failover_text = args.failover.read_text() if args.failover else None
+            if failover_text is not None:
+                from .failover import parse_peers
+                parse_peers(failover_text, profile)
             if args.command == 'validate':
                 result = {'valid': True, 'mode': 'include', 'included': len(settings.included_executables)}
             elif args.command == 'plan':
@@ -78,7 +83,7 @@ def main(argv=None):
             else:
                 from .preflight import check_host
                 check_host()
-                result = install(args.artifacts, profile_text, settings_text)
+                result = install(args.artifacts, profile_text, settings_text, failover_text=failover_text)
                 subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], check=True, timeout=30,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=SERVICE_ENV)
         else:

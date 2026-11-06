@@ -44,6 +44,22 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(set(result['removed']), ALLOWED)
         self.assertEqual((self.root / 'etc/wg-program-split/profile.conf').read_text(), self.profile)
 
+    def test_optional_failover_is_private_validated_and_preserved(self):
+        key = base64.b64encode(b'z' * 32).decode()
+        text = json.dumps({'schema_version': 1, 'peers': [
+            {'public_key': key, 'endpoint': '192.0.2.3:51820'}]})
+        install(self.artifacts, self.profile, self.settings, root=self.root, failover_text=text)
+        path = self.root / 'etc/wg-program-split/failover.json'
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.read_text(), text)
+        uninstall(root=self.root)
+        self.assertEqual(path.read_text(), text)
+
+    def test_invalid_failover_fails_before_installation(self):
+        with self.assertRaises(ValueError):
+            install(self.artifacts, self.profile, self.settings, root=self.root, failover_text='{}')
+        self.assertFalse((self.root / 'usr/bin/wg-program-split').exists())
+
     def test_include_list_reads_stored_keys_inactive_without_runtime_side_effects(self):
         from wg_program_split import cli
         from wg_program_split.controller import Controller, Paths

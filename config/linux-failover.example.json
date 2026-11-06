@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "peers": [
+    {
+      "public_key": "REPLACE_WITH_PROVIDER_SERVER_PUBLIC_KEY",
+      "endpoint": "192.0.2.20:51820"
+    }
+  ]
+}

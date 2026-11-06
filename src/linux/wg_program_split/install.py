@@ -98,10 +98,13 @@ def _create(path, content, mode):
     return _identity(path)
 
 
-def install(artifacts, profile_text, settings_text, *, root=Path('/')):
+def install(artifacts, profile_text, settings_text, *, root=Path('/'), failover_text=None):
     """Install once without enabling services or changing live networking."""
     root = _root(root)
-    parse_profile(profile_text)
+    profile = parse_profile(profile_text)
+    if failover_text is not None:
+        from .failover import parse_peers
+        parse_peers(failover_text, profile)
     settings_text = settings_json(parse_settings(settings_text))
     payloads = {}
     artifacts = Path(artifacts)
@@ -119,7 +122,10 @@ def install(artifacts, profile_text, settings_text, *, root=Path('/')):
         for destination in payloads:
             if (root / destination).exists() or (root / destination).is_symlink():
                 raise InstallError('refusing to overwrite an existing installation file')
-        for name, content in (('profile.conf', profile_text), ('settings.json', settings_text)):
+        configs = [('profile.conf', profile_text), ('settings.json', settings_text)]
+        if failover_text is not None:
+            configs.append(('failover.json', failover_text))
+        for name, content in configs:
             path = root / CONFIG / name
             if path.exists() or path.is_symlink():
                 existing = _identity(path)
