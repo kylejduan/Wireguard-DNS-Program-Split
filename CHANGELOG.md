@@ -15,21 +15,27 @@
   a bounded asynchronous queue, explicit drop notices and bounded shutdown.
 - Windows: let the installing account read the logs subtree so **Open logs**
   works from Explorer, while keeping configuration, keys and state protected.
-  Add the manually invoked read-only `Get-PerformanceState.ps1` diagnostic.
+  Those logs and failure snapshots can expose DNS names, process IDs and paths
+  from every account on the machine to that installing account. Add the manually
+  invoked read-only `Get-PerformanceState.ps1` diagnostic.
 - Tests: exercise real DNS Client/ETW tunnel outages, image-resolution stalls,
   receiver-side selected-name isolation, isolated retries after intentional
   same-name answer withholding, recovery, log contention and lifetime
   handling. The unchanged baseline fails the outage test while direct DNS stays
   available with the new dispatcher. See [measurements and limits](docs/performance.md#november-6-2026-dns-isolation-and-reboot-verification).
-- Windows: reduce supervision polling and wait for a usable physical route at
-  startup, avoiding repeated full rebuilds while the uplink is unavailable.
+- Windows: reuse recovery helpers, avoid needless attribution-waiter wakeups
+  and supervisor mutex work, and retain the existing observation intervals. Wait
+  for a usable physical route rather than rebuilding repeatedly while offline.
 - Windows: route DNS-component failures to their own repair, cap full rebuilds and
   failed starts at three attempts per fifteen minutes across controller restarts,
   and retain the first snapshot of repeated failures with bounded retention.
+  Further full-rebuild attempts are deferred while the persistent budget is
+  exhausted; restarting the controller does not reset it.
 - Windows: root-adapter cleanup requires explicit instance selection. Background
   maintenance only reports candidates; inactivity alone cannot prove ownership.
+  An enumerated orphan can block tunnel creation until an administrator inspects
+  and explicitly removes it; selected traffic stays blocked meanwhile.
 - Profile import rejects executable PreUp/PostUp/PreDown/PostDown hooks.
-
 - Windows: validate the DNS dispatcher's TCP listener with exact endpoint/process
   ownership and a bounded loopback connection. Some Windows builds report state
   zero for real listening sockets; filtering only for `Listen` caused repeated

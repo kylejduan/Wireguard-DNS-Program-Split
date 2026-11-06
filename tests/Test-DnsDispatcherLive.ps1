@@ -131,12 +131,13 @@ try {
         do {
             $raceLog = Read-SharedText (Join-Path $root 'dispatcher.log')
             $withheld = $raceLog -match "(?m)^DNS $escaped type=1 -> DIRECT[^\r\n]* WITHHELD \(selected lookup of the same name\)"
-            if ($withheld) { break }
+            $knownSelected = $raceLog -match "(?m)^HINT $escaped type=1 [^\r\n]*selected=1 [^\r\n]*identity=known"
+            if ($withheld -and $knownSelected) { break }
             Start-Sleep -Milliseconds 25
         } while ($drain.Elapsed.TotalSeconds -lt 2)
-        if (-not $withheld) {
+        if (-not $withheld -or -not $knownSelected) {
             [regex]::Matches($raceLog, "(?m)^(HINT|DNS) $escaped [^\r\n]*") | ForEach-Object { Write-Output "DETAIL: $($_.Value)" }
-            throw "Selected lookup failed without a withholding decision for $name."
+            throw "Selected lookup failed without known selected attribution and withholding for $name."
         }
         $retry = Launch $selectedLane @('system-dns', $name) "selected-retry-$index"
         if (-not $retry.WaitForExit(15000)) { throw 'An isolated selected retry timed out.' }
@@ -145,7 +146,7 @@ try {
             throw "Selected DNS did not recover through the tunnel on retry for $name."
         }
     }
-    Write-Output "OBSERVED: $($failedSelected.Count) selected race refusals had explicit withholding evidence and successful tunnel retries."
+    Write-Output "OBSERVED: $($failedSelected.Count) selected race refusals had known selected attribution, explicit withholding evidence and successful tunnel retries."
 
 
     # Truncated UDP answers while unlisted lookups of the same name keep raising events. For "tc-" names the

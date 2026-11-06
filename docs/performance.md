@@ -571,7 +571,7 @@ direct lookups over twelve seconds while the tunnel resolver was silent:
 
 | Dispatcher | Direct successes | Successful direct DNS p99 |
 |---|---:|---:|
-| Unchanged baseline `dd5ddfa8` | 105 / 240 | 2.12 ms |
+| Pre-hardening baseline `dd5ddfa8` | 105 / 240 | 2.12 ms |
 | Hardened dispatcher | 240 / 240 | 2.01 ms |
 
 Latency among successful requests alone hides the baseline's 135 failures.
@@ -601,11 +601,15 @@ old/new samples were 25.63/15.03 MiB and 243/140 threads. These are dispatcher
 samples, not total operating-system costs.
 
 A sixty-second reference-workstation sample after activation measured 0.0317%
-of the 32-logical-processor machine's CPU and 483.3 MiB private memory across
-persistent product processes. The dispatcher itself used 4.58 MiB and 0.104%
-of one core. Most private memory remains in PowerShell; no controller/tray
-rewrite or reduction in that cost is claimed. These samples exclude transient
-helpers and system-wide driver, DPC and interrupt work.
+of the 32-logical-processor machine's CPU (about 1.02% of one core) and
+483.3 MiB private memory across ten persistent product processes and console
+children. The dispatcher itself used 4.58 MiB and 0.104% of one core (about
+0.0033% of machine CPU). Most private memory remains in PowerShell; no
+controller/tray rewrite or reduction in that cost is claimed. The October 31
+sample counted six processes and excluded console children; it used a different
+installation and process set, so the 297.8/483.3 MiB figures are not a controlled
+memory regression comparison. These samples exclude transient helpers and
+system-wide driver, DPC and interrupt work.
 
 No bulk-download gain is claimed. Receive segment coalescing was configured
 on but operationally restricted by WFP compatibility on the reference host.
@@ -625,6 +629,11 @@ The controller started about 27 seconds after OS boot, the tunnel about
 33 seconds after boot, and the first full filter/dispatcher/tunnel validation
 completed about 37 seconds after boot. The physical interface was correctly
 rediscovered after its numeric index changed. Subsequent health checks passed.
-These are observations of this reboot, not a startup-time or long-term
+An early Wi-Fi observation was deferred
+while its interface was unavailable; it triggered no adapter reset. A later
+four-second HTTPS connection probe timed out, while five immediate follow-up
+Windows requests and WSL HTTPS succeeded without intervention. Its cause was
+not isolated. These are observations of this reboot, not a startup-time or
+long-term
 availability guarantee. Private host identifiers, keys, logs and rollback
 files are not part of this source release.

@@ -84,6 +84,21 @@ Selected applications' IPv6 is blocked, not tunneled. On a host with IPv6, confi
 & 'C:\Program Files\WireGuardProgramSplit\src\Invoke-WfpFilters.ps1' -Action Validate
 ```
 
+## Upgrade an existing installation
+
+Exit selected applications before starting: uninstalling removes their filters
+and DNS policy, so their traffic is not protected until the new installation is
+verified. Keep a protected backup of the profile, settings, included-app list
+and compatible signed runtime/driver files outside the installation directory;
+uninstalling removes that directory.
+
+Build the new release and run its `Install.ps1 -PlanOnly` against those preserved
+inputs **before uninstalling**. This checks changed requirements, such as rejected
+profile hooks, while the working installation is still present. Then uninstall
+using the old release and install the new one. Restore any optional settings
+explicitly and complete the verification above before relaunching selected
+applications. Do not assume an in-place binary copy is a supported upgrade.
+
 ## Move an existing ProgramData installation
 
 From an elevated 64-bit Windows PowerShell session in a built checkout of the release that is installed:
