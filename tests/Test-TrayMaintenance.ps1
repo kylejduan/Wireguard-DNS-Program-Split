@@ -25,11 +25,26 @@ try {
 
     $runnerPath = Join-Path $root 'bin\controller-service.exe'
     Copy-Item (Join-Path $RepositoryRoot 'build\test-tray-stub.exe') $runnerPath
-    $runner = Start-Process $runnerPath -ArgumentList '--run' -PassThru -WindowStyle Hidden
+    $systemPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $tunnelCommand = '"' + $systemPowerShell + '" -NoProfile -File "' + (Join-Path $root 'src\Invoke-Tunnel.ps1') + '"'
+    $trayCommand = '"' + $systemPowerShell + '" -NoProfile -File "' + (Join-Path $root 'src\TrayActions.ps1') + '"'
+    $paths = @($image, (Join-Path $root 'src\TrayActions.ps1'))
+    $tunnelEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($tunnelCommand))
+    $trayEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($trayCommand))
+    Assert-True (-not (Test-ProgramSplitTrayRunnerCommand -CommandLine ('"' + $runnerPath + '" --run 600000 ' + $tunnelEncoded) -TrayPaths $paths)) 'controller component runners are not tray work'
+    Assert-True (Test-ProgramSplitTrayRunnerCommand -CommandLine ('"' + $runnerPath + '" --run 600000 ' + $trayEncoded) -TrayPaths $paths) 'tray command is recognized inside the encoded runner request'
+    Assert-True (Test-ProgramSplitTrayRunnerCommand -CommandLine ('"' + $runnerPath + '" --run 600000 invalid') -TrayPaths $paths) 'an undecodable runner fails closed'
+    Assert-True (-not (Test-ProgramSplitTrayRunnerCommand -CommandLine '"C:\Directory --run name\controller-service.exe" /service "C:\Controller.ps1"' -TrayPaths $paths)) 'a directory name does not turn service mode into runner mode'
+    $unrelated = Start-Process $runnerPath -ArgumentList ('--run 600000 ' + $tunnelEncoded) -WorkingDirectory $root -PassThru -WindowStyle Hidden
+    $children += $unrelated; $null = $unrelated.Handle
+    Stop-ProgramSplitTrayProcesses -Root $root -TimeoutMilliseconds 1000
+    Assert-True (-not $unrelated.HasExited) 'tray teardown neither waits for nor kills a controller component runner'
+    $unrelated.Kill(); $null = $unrelated.WaitForExit(5000)
+    $runner = Start-Process $runnerPath -ArgumentList ('--run 600000 ' + $trayEncoded) -WorkingDirectory $root -PassThru -WindowStyle Hidden
     $children += $runner; $null = $runner.Handle
     $failed = $false
     try { Stop-ProgramSplitTrayProcesses -Root $root -TimeoutMilliseconds 300 } catch { $failed = $true }
-    Assert-True ($failed -and -not $runner.HasExited) 'maintenance refuses a live bounded runner without killing it'
+    Assert-True ($failed -and -not $runner.HasExited) 'maintenance refuses a live tray runner without killing it'
     $runner.Kill(); $null = $runner.WaitForExit(5000)
 
     $name = 'Global\WgpsTrayMutexTest-' + [guid]::NewGuid()

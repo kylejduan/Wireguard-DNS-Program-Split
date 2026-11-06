@@ -104,7 +104,7 @@ function Test-ProgramSplitTrayTaskOwnership {
 
 function Enter-ProgramSplitTrayMutationLock {
     param(
-        [ValidateRange(0, 600000)] [int] $TimeoutMilliseconds = 210000,
+        [ValidateRange(0, 600000)] [int] $TimeoutMilliseconds = 270000,
         [string] $Name = 'Global\WireGuardProgramSplitTrayAction'
     )
     $mutex = [Threading.Mutex]::new($false, $Name)
@@ -114,6 +114,21 @@ function Enter-ProgramSplitTrayMutationLock {
         if (-not $held) { throw 'A tray change is still running; no maintenance changes were made.' }
         return $mutex
     } catch { $mutex.Dispose(); throw }
+}
+
+function Test-ProgramSplitTrayRunnerCommand {
+    param([string] $CommandLine, [Parameter(Mandatory)] [string[]] $TrayPaths)
+    if ($CommandLine -notmatch '(?i)^\s*(?:"[^"]*"|\S+)\s+--run(?:\s|$)') { return $false }
+    if ($CommandLine -notmatch '(?i)^\s*(?:"[^"]*"|\S+)\s+--run\s+\S+\s+(\S+)\s*$') { return $true }
+    try {
+        $bytes = [Convert]::FromBase64String($Matches[1])
+        if ($bytes.Length % 2) { return $true }
+        $command = [Text.UnicodeEncoding]::new($false, $false, $true).GetString($bytes)
+        foreach ($path in $TrayPaths) {
+            if ($command.IndexOf($path, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+        }
+        return $false
+    } catch { return $true }
 }
 
 function Stop-ProgramSplitTrayProcesses {
@@ -143,7 +158,7 @@ function Stop-ProgramSplitTrayProcesses {
         }
         $pending = @($records | Where-Object {
             if ($_.ExecutablePath -eq $image) { return $true }
-            if ($_.ExecutablePath -eq $runner -and $_.CommandLine -match '(?i)(?:^|\s)--run(?:\s|$)') { return $true }
+            if ($_.ExecutablePath -eq $runner -and (Test-ProgramSplitTrayRunnerCommand -CommandLine $_.CommandLine -TrayPaths (@($image) + $scripts))) { return $true }
             if ($_.Name -eq 'powershell.exe' -and $_.CommandLine) {
                 foreach ($script in $scripts) {
                     if ($_.CommandLine.IndexOf($script, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }

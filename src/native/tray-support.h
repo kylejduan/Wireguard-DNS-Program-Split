@@ -128,7 +128,13 @@ inline std::string unbase64(const std::string& text) {
     return result;
 }
 struct Result { bool ok{}; std::wstring message; };
+inline ULONGLONG awakeMilliseconds() {
+    ULONGLONG ticks{};
+    if (!QueryUnbiasedInterruptTime(&ticks)) throw std::runtime_error("Cannot read the awake-time clock");
+    return ticks / 10000;
+}
 inline Result resultFrame(const std::string& frame, bool strictOutput = false) {
+    if (frame.empty() || frame.back() != '\n') throw std::runtime_error("Incomplete action result line");
     std::map<std::string, std::string> fields;
     size_t start{};
     bool header{};
@@ -165,6 +171,7 @@ inline Result resultFrame(const std::string& frame, bool strictOutput = false) {
 // Only one operation runs at a time. Its bounded runner owns the PowerShell
 // process tree. The UI thread performs no waits or pipe reads.
 class Action {
+    friend struct ActionTest;
     struct State {
         Handle done{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
         std::atomic_bool stop{};
@@ -175,7 +182,7 @@ class Action {
     std::shared_ptr<State> state_;
     std::thread thread_;
     static Result run(const std::wstring& root, const std::wstring& child, DWORD timeout,
-                      const std::shared_ptr<State>& state, bool strictOutput = false) {
+                      const std::shared_ptr<State>& state, bool strictOutput = false, DWORD margin = 15000) {
         if (state->stop) throw std::runtime_error("Tray action cancelled");
         const std::wstring runner = root + L"\\bin\\controller-service.exe";
         std::wstring command = quote(runner) + L" --run " + std::to_wstring(timeout) + L" " + base64(child);
@@ -188,17 +195,32 @@ class Action {
         Handle error(CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING, 0, nullptr));
         if (!input.value || !error.value) throw std::runtime_error("Cannot create action streams");
         PROCESS_INFORMATION childProcess{};
-        if (!wgps::createWithInheritedHandles(runner.c_str(), command.data(), root.c_str(), CREATE_NO_WINDOW,
+        if (!wgps::createWithInheritedHandles(runner.c_str(), command.data(), root.c_str(),
+            CREATE_NO_WINDOW | (strictOutput ? CREATE_SUSPENDED : 0),
             {input.value, writer.value, error.value}, input.value, writer.value, error.value, childProcess))
             throw std::runtime_error("Cannot start bounded tray action");
         Handle process(childProcess.hProcess), thread(childProcess.hThread);
+        if (strictOutput) {
+            AllowSetForegroundWindow(childProcess.dwProcessId);
+            if (ResumeThread(thread.value) == static_cast<DWORD>(-1)) {
+                TerminateProcess(process.value, 1); WaitForSingleObject(process.value, 5000);
+                throw std::runtime_error("Cannot resume file selection");
+            }
+        }
         CloseHandle(writer.value); writer.value = nullptr;
-        const ULONGLONG deadline = GetTickCount64() + timeout + 5000;
+        // Match the runner's Windows wait: sleep and hibernation do not consume
+        // the operation budget. The controller retains its separate hold limit.
+        const ULONGLONG deadline = awakeMilliseconds() + timeout + margin;
         std::string frame;
         bool overflow{};
         try {
             for (;;) {
-                if (state->stop || GetTickCount64() >= deadline) throw std::runtime_error("Tray action cancelled or timed out");
+                if (state->stop) throw std::runtime_error("Tray action cancelled");
+                if (awakeMilliseconds() >= deadline) {
+                    std::lock_guard lock(state->mutex);
+                    if (state->finishMutation) return {false, L"The change may still be finishing. Check its status before another change."};
+                    throw std::runtime_error("Tray action timed out");
+                }
                 DWORD available{};
                 if (PeekNamedPipe(output.value, nullptr, 0, nullptr, &available, nullptr) && available) {
                     char buffer[4096]; DWORD received{};
@@ -244,7 +266,7 @@ class Action {
         std::wstring child = quote(ps) + L" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " +
             quote(root + L"\\src\\TrayActions.ps1") + L" -Action " + quote(action);
         if (!value.empty()) child += L" -InputPath " + quote(value);
-        return run(root, child, action == L"Import" ? 180000 : 30000, state);
+        return run(root, child, action == L"Import" ? 240000 : 30000, state);
     }
 
 public:

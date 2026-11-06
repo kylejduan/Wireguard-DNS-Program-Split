@@ -12,7 +12,7 @@ try {
     foreach ($dir in @('bin', 'src', 'config', 'profiles', 'state')) {
         [IO.Directory]::CreateDirectory((Join-Path $root $dir)) | Out-Null
     }
-    foreach ($name in @('controller-service.exe', 'tray.exe', 'test-tray-action.exe', 'test-tray-dialog.exe', 'test-tray-session.exe')) {
+    foreach ($name in @('controller-service.exe', 'tray.exe', 'test-tray-action.exe', 'test-tray-dialog.exe', 'test-tray-session.exe', 'test-tray-backstop.exe', 'test-tray-stub.exe')) {
         Copy-Item -LiteralPath (Join-Path $RepositoryRoot "build\$name") -Destination (Join-Path $root 'bin')
     }
     foreach ($name in @('Common.ps1', 'Tray.ps1', 'TrayActions.ps1', 'Prepare-Profile.ps1')) {
@@ -62,10 +62,16 @@ try {
     [IO.File]::WriteAllText($controllerScript, @'
 $ErrorActionPreference='Stop'
 $state=Join-Path $PSScriptRoot 'state'
-$until=[DateTime]::UtcNow.AddMinutes(3)
+$until=[DateTime]::UtcNow.AddMinutes(10)
 while([DateTime]::UtcNow -lt $until){
+ if(-not (Test-Path $PSScriptRoot)){break}
  try {
   $active=Join-Path $state 'active';$stopped=Join-Path $state 'stack-stopped'
+  if((Test-Path (Join-Path $state 'block-stop')) -and -not (Test-Path (Join-Path $state 'enabled'))){
+   Remove-Item $active,$stopped -Force -ErrorAction SilentlyContinue
+   Start-Sleep -Milliseconds 100
+   continue
+  }
   if(Test-Path (Join-Path $state 'enabled')){
    Remove-Item $stopped -Force -ErrorAction SilentlyContinue
    $settings=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'config\settings.json'))|ConvertFrom-Json
@@ -88,16 +94,24 @@ while([DateTime]::UtcNow -lt $until){
     }
     & $runner $root Toggle
     Write-FixtureProfile '192.0.2.3'
+    $beforeBusyProfile = (Get-FileHash (Join-Path $root 'profiles\WireGuardSplit.conf')).Hash
+    $beforeBusySettings = (Get-FileHash (Join-Path $root 'config\settings.json')).Hash
+    [IO.File]::WriteAllText((Join-Path $root 'state\block-stop'), 'fixture')
+    & $runner $root Import $profileInput
+    Assert-True ($LASTEXITCODE -ne 0 -and (Test-Path (Join-Path $root 'state\enabled')) -and
+        (Get-FileHash (Join-Path $root 'profiles\WireGuardSplit.conf')).Hash -eq $beforeBusyProfile -and
+        (Get-FileHash (Join-Path $root 'config\settings.json')).Hash -eq $beforeBusySettings) 'a busy controller leaves the unchanged pair and restores the original enabled intent'
+    Remove-Item (Join-Path $root 'state\block-stop')
     & $runner $root Import $profileInput
     Assert-True ($LASTEXITCODE -eq 0 -and ([IO.File]::ReadAllText((Join-Path $root 'config\settings.json')) | ConvertFrom-Json).TunnelAddress -eq '192.0.2.3') 'the real profile transaction commits after the fixture confirms readiness'
-    Assert-True (-not (Test-Path (Join-Path $root 'profiles\WireGuardSplit.conf.previous')) -and -not (Test-Path (Join-Path $root 'state\keep-filters.request'))) 'successful import removes recovery backups and the temporary filter hold'
+    Assert-True (-not (Test-Path (Join-Path $root 'profiles\WireGuardSplit.conf.previous')) -and (Test-Path (Join-Path $root 'state\keep-filters.request'))) 'successful import preserves the temporary hold for a controller that sampled the old disabled intent'
     $profileHash = (Get-FileHash (Join-Path $root 'profiles\WireGuardSplit.conf')).Hash
     $settingsHash = (Get-FileHash (Join-Path $root 'config\settings.json')).Hash
     Write-FixtureProfile '192.0.2.254'
     & $runner $root Import $profileInput
     Assert-True ($LASTEXITCODE -ne 0 -and (Get-FileHash (Join-Path $root 'profiles\WireGuardSplit.conf')).Hash -eq $profileHash -and
         (Get-FileHash (Join-Path $root 'config\settings.json')).Hash -eq $settingsHash) 'readiness failure restores the exact previous profile and settings'
-    Assert-True ((Test-Path (Join-Path $root 'state\enabled')) -and -not (Test-Path (Join-Path $root 'state\keep-filters.request'))) 'rollback restores the enabled intent and releases its filter hold'
+    Assert-True ((Test-Path (Join-Path $root 'state\enabled')) -and (Test-Path (Join-Path $root 'state\keep-filters.request'))) 'rollback restores the enabled intent and preserves the handoff hold'
     $preparePath = Join-Path $root 'src\Prepare-Profile.ps1'
     $prepareSource = [IO.File]::ReadAllText($preparePath)
     [IO.File]::WriteAllText($preparePath, @'
@@ -118,9 +132,16 @@ Start-Sleep -Seconds 60
         if ($preparedProcess) { $preparedProcess.Dispose() }
     }
     [IO.File]::WriteAllText($preparePath, $prepareSource)
+    & $runner $root Toggle
+    Assert-True ($LASTEXITCODE -eq 0 -and -not (Test-Path (Join-Path $root 'state\keep-filters.request'))) 'an explicit disable clears the import hold immediately'
     $controller.Kill(); $null = $controller.WaitForExit(5000); $controller.Dispose(); $controller = $null
     & (Join-Path $root 'bin\test-tray-dialog.exe') (Join-Path $root 'bin\tray.exe') $runner $root
     Assert-True ($LASTEXITCODE -eq 0) 'both real file pickers cancel without selecting a file'
+    $backstopRoot = Join-Path $root 'backstop'
+    New-Item -ItemType Directory -Path (Join-Path $backstopRoot 'bin') -Force | Out-Null
+    Copy-Item (Join-Path $root 'bin\test-tray-stub.exe') (Join-Path $backstopRoot 'bin\controller-service.exe')
+    & (Join-Path $root 'bin\test-tray-backstop.exe') $backstopRoot
+    Assert-True ($LASTEXITCODE -eq 0) 'a stuck runner is cancelled only before mutation starts'
     $smokeError = Join-Path $root 'smoke-error.txt'
     $smoke = Start-Process -FilePath (Join-Path $root 'bin\tray.exe') -ArgumentList '--smoke-test' -RedirectStandardError $smokeError -PassThru
     $null = $smoke.Handle

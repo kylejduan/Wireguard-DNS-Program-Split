@@ -43,9 +43,11 @@ function Import-Profile([string] $InputPath) {
     $disableRequested = $false
     $stopConfirmed = $false
     $replacementAttempted = $false
+    $holdWritten = $false
+    $resumeRequested = $false
     try {
         if (-not (Test-Path -LiteralPath $InputPath -PathType Leaf)) { throw 'Profile input does not exist.' }
-        $wasEnabled = Test-Path -LiteralPath $enabledFile
+        $wasEnabled = Test-Path -LiteralPath $enabledFile -PathType Leaf
         if ((Test-Path -LiteralPath "$activeProfile.previous") -or
             (Test-Path -LiteralPath "$activeSettings.previous")) {
             throw 'A preserved recovery backup exists; resolve it before importing another profile.'
@@ -53,12 +55,15 @@ function Import-Profile([string] $InputPath) {
         Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile
         # Swapping the profile is not a disable: the persistent payload filters stay, so selected
         # applications fail closed until the stack returns with the new tunnel address.
-        if ($wasEnabled) { [IO.File]::WriteAllText($keepFiltersFile, (Get-Date -Format o)) }
+        if ($wasEnabled) {
+            [IO.File]::WriteAllText($keepFiltersFile, (Get-Date -Format o))
+            $holdWritten = $true
+        }
         Remove-Item -LiteralPath $enabledFile -Force -ErrorAction SilentlyContinue
         $disableRequested = $true
         $stopWait = [Diagnostics.Stopwatch]::StartNew()
-        while (-not (Test-Path -LiteralPath $stackStoppedFile) -and $stopWait.Elapsed.TotalSeconds -lt 20) { Start-Sleep -Milliseconds 250 }
-        if (-not (Test-Path -LiteralPath $stackStoppedFile)) { throw 'The controller did not stop the managed stack.' }
+        while (-not (Test-Path -LiteralPath $stackStoppedFile -PathType Leaf) -and $stopWait.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Milliseconds 250 }
+        if (-not (Test-Path -LiteralPath $stackStoppedFile -PathType Leaf)) { throw 'The controller did not stop the managed stack.' }
         $stopConfirmed = $true
 
         $prepared = "$activeProfile.new"
@@ -80,9 +85,10 @@ function Import-Profile([string] $InputPath) {
         if ($wasEnabled) {
             Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile
             [IO.File]::WriteAllText($enabledFile, (Get-Date -Format o))
+            $resumeRequested = $true
             $startWait = [Diagnostics.Stopwatch]::StartNew()
-            while (-not (Test-Path -LiteralPath $activeFile) -and $startWait.Elapsed.TotalSeconds -lt 50) { Start-Sleep -Milliseconds 500 }
-            if (-not (Test-Path -LiteralPath $activeFile)) {
+            while (-not (Test-Path -LiteralPath $activeFile -PathType Leaf) -and $startWait.Elapsed.TotalSeconds -lt 50) { Start-Sleep -Milliseconds 500 }
+            if (-not (Test-Path -LiteralPath $activeFile -PathType Leaf)) {
                 throw 'The imported profile failed its tunnel-DNS readiness check.'
             }
         }
@@ -96,6 +102,7 @@ function Import-Profile([string] $InputPath) {
     } catch {
         $failure = $_.Exception.Message
         if ($disableRequested) {
+            $resumeRequested = $false
             Remove-Item -LiteralPath $enabledFile -Force -ErrorAction SilentlyContinue
         }
         $rollbackErrors = [Collections.Generic.List[string]]::new()
@@ -105,26 +112,34 @@ function Import-Profile([string] $InputPath) {
             if (-not $rollbackErrors.Count) {
                 try {
                     Restore-ProgramSplitProfilePair -ActiveProfile $activeProfile -ActiveSettings $activeSettings `
-                        -StoppedMarker $stackStoppedFile
+                        -StoppedMarker $stackStoppedFile -TimeoutSeconds 60
                 } catch { $rollbackErrors.Add($_.Exception.Message) }
             }
         }
         Remove-Item -LiteralPath "$activeProfile.new", "$activeSettings.new" -Force -ErrorAction SilentlyContinue
-        if ($wasEnabled -and $disableRequested -and $stopConfirmed -and -not $rollbackErrors.Count) {
+        if ($wasEnabled -and $disableRequested -and ($stopConfirmed -or -not $replacementAttempted) -and -not $rollbackErrors.Count) {
             try {
-                Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile
+                if ($stopConfirmed) { Clear-ProgramSplitStoppedMarker -Path $stackStoppedFile }
                 [IO.File]::WriteAllText($enabledFile, (Get-Date -Format o))
+                $resumeRequested = $true
             } catch { $rollbackErrors.Add($_.Exception.Message) }
         }
         if ($rollbackErrors.Count) {
             $failure += " Rollback also failed; the tunnel remains disabled: $($rollbackErrors -join '; ')"
+        } elseif ($disableRequested -and $resumeRequested) {
+            $failure += ' The previous enabled state was requested again.'
+        } elseif ($disableRequested) {
+            $failure += ' The split remains disabled.'
         }
         throw $failure
     }
     finally {
-        # Without the request, a stack the import leaves disabled loses its filters on the next pass.
-        Remove-Item -LiteralPath $keepFiltersFile -Force -ErrorAction SilentlyContinue
-
+        # Keep the hold after re-enabling: a controller pass may already have
+        # sampled the disabled intent. It ignores the hold when enabled, and the
+        # next explicit Disable clears it. Abandoned holds expire in the controller.
+        if ($holdWritten -and -not $resumeRequested) {
+            Remove-Item -LiteralPath $keepFiltersFile -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -142,7 +157,8 @@ try {
             Write-Output 'PASS: tray inputs and include list.'
         }
         'Toggle' {
-            if (Test-Path -LiteralPath $enabledFile) {
+            if (Test-Path -LiteralPath $enabledFile -PathType Leaf) {
+                Remove-Item -LiteralPath $keepFiltersFile -Force -ErrorAction SilentlyContinue
                 Remove-Item -LiteralPath $enabledFile -Force
                 Write-Output 'Disabling the split tunnel.'
             } else {

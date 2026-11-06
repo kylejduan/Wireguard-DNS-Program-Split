@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <windows.h>
+#include <string>
 int wmain(int argc, wchar_t** argv) {
     if (argc == 4 && wcscmp(argv[1], L"--hold") == 0) {
         HANDLE mutex = CreateMutexW(nullptr, TRUE, argv[2]);
@@ -10,7 +11,15 @@ int wmain(int argc, wchar_t** argv) {
         ReleaseMutex(mutex); CloseHandle(mutex);
         return 0;
     }
-    if (argc == 2 && wcscmp(argv[1], L"--run") == 0) { Sleep(300000); return 0; }
+    if (argc >= 2 && wcscmp(argv[1], L"--run") == 0) {
+        if (argc > 2) {
+            HANDLE file = CreateFileW(L"runner-pid.txt", GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, 0, nullptr);
+            if (file == INVALID_HANDLE_VALUE) return 3;
+            const std::string pid = std::to_string(GetCurrentProcessId()); DWORD written{};
+            WriteFile(file, pid.data(), static_cast<DWORD>(pid.size()), &written, nullptr); CloseHandle(file);
+        }
+        Sleep(300000); return 0;
+    }
     if (argc != 1) return 2;
     Sleep(300000);
     return 0;

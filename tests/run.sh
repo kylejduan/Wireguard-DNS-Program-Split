@@ -39,6 +39,9 @@ compiler=${CXX:-x86_64-w64-mingw32-g++}
 "$compiler" -std=c++20 -O2 -Wall -Wextra -Werror -static -municode \
   "$repo_root/tests/native/tray-stub.cpp" -o "$repo_root/build/test-tray-stub.exe"
 
+"$compiler" -std=c++20 -O2 -Wall -Wextra -Werror -static -municode \
+  "$repo_root/tests/native/tray-backstop.cpp" -o "$repo_root/build/test-tray-backstop.exe" -lcrypt32
+
 for executable in controller-service dns-dispatcher dns-probe wfp-probe tray; do
   "$repo_root/build/$executable.exe" --self-test
 done

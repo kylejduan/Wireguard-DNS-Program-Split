@@ -40,11 +40,13 @@ struct Tray {
     UINT taskbarCreated{RegisterWindowMessageW(L"TaskbarCreated")};
     bool smoke{};
     bool version4{};
+    std::wstring lastActionError;
 
     void complete() {
         if (!action.event() || action.busy()) return;
         auto result = action.take();
         ShutdownBlockReasonDestroy(window);
+        if (!result.ok) lastActionError = result.message;
         if (!result.message.empty()) notice(result.message, result.ok);
     }
 
@@ -113,7 +115,7 @@ struct Tray {
         const UINT command = TrackPopupMenu(menu.value, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                             point.x, point.y, 0, window, nullptr);
         PostMessageW(window, WM_NULL, 0, 0);
-        Shell_NotifyIconW(NIM_SETFOCUS, &icon);
+        if (!command) Shell_NotifyIconW(NIM_SETFOCUS, &icon);
         if (command >= removeBase && command - removeBase < apps.size() && !action.busy()) {
             start(L"Remove", apps[command - removeBase]); return;
         }
@@ -124,15 +126,30 @@ struct Tray {
             break;
         case logs:
         {
-            ComScope com;
-            if (reinterpret_cast<INT_PTR>(ShellExecuteW(window, L"open", (root + L"\\logs").c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
-                notice(L"Could not open the logs directory.", false);
+            wchar_t windows[MAX_PATH]{};
+            if (!GetWindowsDirectoryW(windows, MAX_PATH)) throw std::runtime_error("Cannot locate Explorer");
+            const std::wstring explorer = std::wstring(windows) + L"\\explorer.exe";
+            std::wstring command = quote(explorer) + L" " + quote(root + L"\\logs");
+            STARTUPINFOW startup{}; startup.cb = sizeof(startup);
+            PROCESS_INFORMATION launched{};
+            if (!CreateProcessW(explorer.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &launched))
+                throw std::runtime_error("Could not open the logs directory");
+            CloseHandle(launched.hThread); CloseHandle(launched.hProcess);
             break;
         }
         case lastError:
-            try { MessageBoxW(window, displayWide(readFile(root + L"\\state\\last-error.txt", 65536)).c_str(), title, MB_OK | MB_ICONINFORMATION); }
-            catch (...) { notice(L"No readable error has been recorded.", true); }
+        {
+            std::wstring message;
+            if (!lastActionError.empty()) message = L"Last tray operation error:\n" + lastActionError;
+            try {
+                const auto controllerError = displayWide(readFile(root + L"\\state\\last-error.txt", 65536));
+                if (!message.empty()) message += L"\n\n";
+                message += L"Controller:\n" + controllerError;
+            } catch (...) {}
+            if (message.empty()) notice(L"No readable error has been recorded.", true);
+            else MessageBoxW(window, message.c_str(), title, MB_OK | MB_ICONINFORMATION);
             break;
+        }
         case quit: if (!action.busy()) DestroyWindow(window); break;
         }
     }
@@ -197,9 +214,19 @@ int selfTest() {
     require(!resultFrame("WGPS-RUN 1\nexit=0\ntimedout=1\nstdout-truncated=0\nstderr-truncated=0\nstdout=\nstderr=\n").ok, "Runner deadline");
     require(resultFrame("WGPS-RUN 1\nexit=0\ntimedout=0\nstdout-truncated=0\nstderr-truncated=0\nstdout=/w==\nstderr=\n").ok, "Display decoding preserves success");
     require(!resultFrame("WGPS-RUN 1\nexit=3762504530\ntimedout=0\nstdout-truncated=0\nstderr-truncated=0\nstdout=\nstderr=\n").ok, "Unsigned Windows crash code");
+    require(!resultFrame("WGPS-RUN 1\nerror=launch failed\n").ok, "Runner launch error");
+    require(!resultFrame("WGPS-RUN 1\nexit=0\ntimedout=0\nstdout-truncated=1\nstderr-truncated=0\nstdout=\nstderr=\n").ok, "Runner truncation");
+    require(awakeMilliseconds() > 0, "Awake-time clock");
     bool rejected{};
     try { (void)resultFrame("WGPS-RUN 1\nexit=0\nexit=1\n"); } catch (...) { rejected = true; }
     require(rejected, "Duplicate frame");
+    for (const auto& frame : {std::string("no header\n"), std::string("WGPS-RUN 1\nexit=0\n"),
+            std::string("WGPS-RUN 1\nexit=0\ntimedout=0\nstdout-truncated=0\nstderr-truncated=0\nstdout=%%%\nstderr=\n"),
+            std::string("WGPS-RUN 1\nerror=unfinished")}) {
+        rejected = false;
+        try { (void)resultFrame(frame); } catch (...) { rejected = true; }
+        require(rejected, "Incomplete or malformed frame");
+    }
     rejected = false;
     try { (void)applications("\xff"); } catch (...) { rejected = true; }
     require(rejected, "Invalid UTF-8");
