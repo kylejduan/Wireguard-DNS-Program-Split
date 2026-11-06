@@ -169,3 +169,4 @@ try {
     if ($held) { $mutex.ReleaseMutex() }
     $mutex.Dispose()
 }
+exit 0

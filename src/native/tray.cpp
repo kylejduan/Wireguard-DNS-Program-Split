@@ -4,17 +4,24 @@
 #include <cwchar>
 #include <cstring>
 #include <iostream>
+#include <objbase.h>
 
 namespace {
 using namespace wgps::tray;
 constexpr UINT callback = WM_APP + 1;
 constexpr UINT toggle = 1, add = 2, importProfile = 3, logs = 4, lastError = 5, quit = 6, removeBase = 100;
 const wchar_t* title = L"WireGuard Program Split";
+struct ComScope {
+    HRESULT status{CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)};
+    ComScope() { if (FAILED(status)) throw std::runtime_error("Cannot initialize the Windows shell"); }
+    ~ComScope() { CoUninitialize(); }
+};
 struct Menu {
     HMENU value{CreatePopupMenu()};
     ~Menu() { if (value) DestroyMenu(value); }
 };
 std::wstring selectFile(bool profile) {
+    ComScope com;
     std::vector<wchar_t> path(32768);
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
@@ -32,6 +39,14 @@ struct Tray {
     Action action;
     UINT taskbarCreated{RegisterWindowMessageW(L"TaskbarCreated")};
     bool smoke{};
+    bool version4{};
+
+    void complete() {
+        if (!action.event() || action.busy()) return;
+        auto result = action.take();
+        ShutdownBlockReasonDestroy(window);
+        if (!result.message.empty()) notice(result.message, result.ok);
+    }
 
     void notice(const std::wstring& message, bool ok) {
         wcsncpy_s(icon.szInfoTitle, title, _TRUNCATE);
@@ -53,21 +68,25 @@ struct Tray {
             icon.uFlags = NIF_TIP | NIF_SHOWTIP;
         }
         wcsncpy_s(icon.szTip, text.c_str(), _TRUNCATE);
-        if (!Shell_NotifyIconW(create ? NIM_ADD : NIM_MODIFY, &icon)) {
+        bool updated = Shell_NotifyIconW(create ? NIM_ADD : NIM_MODIFY, &icon);
+        if (!updated && create) updated = Shell_NotifyIconW(NIM_MODIFY, &icon);
+        if (!updated) {
             // Explorer may be starting. The next timer retries registration.
             icon.szTip[0] = 0;
             return;
         }
         if (create) {
             icon.uVersion = NOTIFYICON_VERSION_4;
-            Shell_NotifyIconW(NIM_SETVERSION, &icon);
+            version4 = Shell_NotifyIconW(NIM_SETVERSION, &icon) != FALSE;
         }
     }
     void start(const std::wstring& name, const std::wstring& input = {}) {
+        complete();
         try { action.start(root, name, input); }
         catch (const std::exception& e) { notice(wide(e.what()), false); }
     }
     void menu() {
+        complete();
         Menu menu;
         if (!menu.value) return;
         const UINT enabled = action.busy() ? MF_GRAYED : MF_ENABLED;
@@ -104,11 +123,14 @@ struct Tray {
             if (!action.busy()) start(command == add ? L"PickAdd" : L"PickImport");
             break;
         case logs:
+        {
+            ComScope com;
             if (reinterpret_cast<INT_PTR>(ShellExecuteW(window, L"open", (root + L"\\logs").c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
                 notice(L"Could not open the logs directory.", false);
             break;
+        }
         case lastError:
-            try { MessageBoxW(window, wide(readFile(root + L"\\state\\last-error.txt", 65536)).c_str(), title, MB_OK | MB_ICONINFORMATION); }
+            try { MessageBoxW(window, displayWide(readFile(root + L"\\state\\last-error.txt", 65536)).c_str(), title, MB_OK | MB_ICONINFORMATION); }
             catch (...) { notice(L"No readable error has been recorded.", true); }
             break;
         case quit: if (!action.busy()) DestroyWindow(window); break;
@@ -118,22 +140,31 @@ struct Tray {
         if (message == taskbarCreated && taskbarCreated) { update(true); return 0; }
         switch (message) {
         case WM_CREATE:
+            if (taskbarCreated && !ChangeWindowMessageFilterEx(window, taskbarCreated, MSGFLT_ALLOW, nullptr)) return -1;
             update(true);
-            SetTimer(window, 1, smoke ? 100 : 2000, nullptr);
+            if (!SetTimer(window, 1, smoke ? 100 : 2000, nullptr)) return -1;
             return 0;
         case WM_TIMER:
             if (smoke) { DestroyWindow(window); return 0; }
             update(icon.szTip[0] == 0);
-            if (action.event() && !action.busy()) {
-                auto result = action.take();
-                if (!result.message.empty()) notice(result.message, result.ok);
-            }
+            complete();
             return 0;
         case callback:
-            if (LOWORD(lparam) == WM_CONTEXTMENU || LOWORD(lparam) == WM_RBUTTONUP || LOWORD(lparam) == NIN_KEYSELECT) menu();
+            if ((version4 && (LOWORD(lparam) == WM_CONTEXTMENU || LOWORD(lparam) == NIN_KEYSELECT)) ||
+                (!version4 && LOWORD(lparam) == WM_RBUTTONUP)) menu();
             else if (LOWORD(lparam) == WM_LBUTTONDBLCLK && !action.busy()) start(L"Toggle");
             return 0;
         case WM_CLOSE: if (!action.busy()) DestroyWindow(window); return 0;
+        case WM_QUERYENDSESSION:
+            if (action.mutating()) {
+                ShutdownBlockReasonCreate(window, L"Finishing a WireGuard profile or application change.");
+                return FALSE;
+            }
+            return TRUE;
+        case WM_ENDSESSION:
+            if (wparam) DestroyWindow(window);
+            else ShutdownBlockReasonDestroy(window);
+            return 0;
         case WM_DESTROY:
             KillTimer(window, 1); Shell_NotifyIconW(NIM_DELETE, &icon); PostQuitMessage(0); return 0;
         }
@@ -148,7 +179,10 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
     }
     if (!tray) return DefWindowProcW(window, message, wparam, lparam);
     try { return tray->message(message, wparam, lparam); }
-    catch (...) { tray->notice(L"The tray operation failed.", false); return 0; }
+    catch (...) {
+        if (message == WM_CREATE) return -1;
+        tray->notice(L"The tray operation failed.", false); return 0;
+    }
 }
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 int selfTest() {
@@ -161,6 +195,8 @@ int selfTest() {
     require(menuText(L"A&B") == L"A&&B", "Menu escaping");
     require(resultFrame("WGPS-RUN 1\nexit=0\ntimedout=0\nstdout-truncated=0\nstderr-truncated=0\nstdout=T0s=\nstderr=\n").message == L"OK", "Runner output");
     require(!resultFrame("WGPS-RUN 1\nexit=0\ntimedout=1\nstdout-truncated=0\nstderr-truncated=0\nstdout=\nstderr=\n").ok, "Runner deadline");
+    require(resultFrame("WGPS-RUN 1\nexit=0\ntimedout=0\nstdout-truncated=0\nstderr-truncated=0\nstdout=/w==\nstderr=\n").ok, "Display decoding preserves success");
+    require(!resultFrame("WGPS-RUN 1\nexit=3762504530\ntimedout=0\nstdout-truncated=0\nstderr-truncated=0\nstdout=\nstderr=\n").ok, "Unsigned Windows crash code");
     bool rejected{};
     try { (void)resultFrame("WGPS-RUN 1\nexit=0\nexit=1\n"); } catch (...) { rejected = true; }
     require(rejected, "Duplicate frame");
@@ -202,7 +238,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         if (held == WAIT_TIMEOUT) return 0;
         if (held != WAIT_OBJECT_0 && held != WAIT_ABANDONED) throw std::runtime_error("Cannot acquire tray instance mutex");
         Tray tray; tray.root = root; tray.smoke = smoke;
-        if (tray.taskbarCreated) ChangeWindowMessageFilter(tray.taskbarCreated, MSGFLT_ADD);
+        if (!tray.taskbarCreated) throw std::runtime_error("Cannot register shell recovery message");
         WNDCLASSW cls{}; cls.lpfnWndProc = windowProcedure; cls.hInstance = instance;
         cls.lpszClassName = L"WireGuardProgramSplitTray";
         if (!RegisterClassW(&cls)) throw std::runtime_error("Cannot register tray window");

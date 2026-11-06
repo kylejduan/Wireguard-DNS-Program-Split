@@ -30,6 +30,7 @@ if (-not (Test-Path -LiteralPath (Split-Path -Parent $DestinationRoot) -PathType
 }
 $mutex = [Threading.Mutex]::new($false, 'Global\WireGuardProgramSplitInstall')
 $held = $false
+$trayMutationLock = $null
 $stopped = $false
 $moved = $false
 $starting = $false
@@ -49,8 +50,9 @@ function Set-ServiceCommand([string] $Name, [string] $Command) {
     }
 }
 function Stop-Stack {
-    Set-Service -Name $controllerName -StartupType Disabled
     Stop-ScheduledTask -TaskName $trayName -TaskPath '\'
+    Stop-ProgramSplitTrayProcesses -Root $activeRoot
+    Set-Service -Name $controllerName -StartupType Disabled
     $service = Get-Service -Name $controllerName
     if ($service.Status -ne 'Stopped') {
         if ($service.Status -ne 'StopPending') { $service.Stop() }
@@ -152,6 +154,11 @@ try {
     $plan = [pscustomobject]@{ SourceRoot = $SourceRoot; DestinationRoot = $DestinationRoot
         ScriptBackup = Join-Path $DestinationRoot $backupRelative; ServicesRestarted = @($controllerName, $tunnelName) }
     if ($PlanOnly) { return $plan }
+    $trayMutationLock = Enter-ProgramSplitTrayMutationLock
+    if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot 'state\enabled'))) {
+        throw 'The enabled state changed while waiting for the tray; migration was not started.'
+    }
+    foreach ($relative in @($hashes.Keys)) { $hashes[$relative] = (Get-FileHash -LiteralPath (Join-Path $SourceRoot $relative)).Hash }
     # Keep original scripts inside the protected tree for rollback and later inspection.
     $backup = Join-Path $SourceRoot $backupRelative
     [IO.Directory]::CreateDirectory($backup) | Out-Null
@@ -203,6 +210,11 @@ try {
     }
     throw $failure
 } finally {
-    if ($held) { $mutex.ReleaseMutex() }
-    $mutex.Dispose()
+    try {
+        if ($trayMutationLock) {
+            try { $trayMutationLock.ReleaseMutex() } finally { $trayMutationLock.Dispose() }
+        }
+    } finally {
+        try { if ($held) { $mutex.ReleaseMutex() } } finally { $mutex.Dispose() }
+    }
 }

@@ -12,10 +12,10 @@ try {
     foreach ($dir in @('bin', 'src', 'config', 'profiles', 'state')) {
         [IO.Directory]::CreateDirectory((Join-Path $root $dir)) | Out-Null
     }
-    foreach ($name in @('controller-service.exe', 'tray.exe')) {
+    foreach ($name in @('controller-service.exe', 'tray.exe', 'test-tray-action.exe', 'test-tray-dialog.exe', 'test-tray-session.exe')) {
         Copy-Item -LiteralPath (Join-Path $RepositoryRoot "build\$name") -Destination (Join-Path $root 'bin')
     }
-    foreach ($name in @('Common.ps1', 'TrayActions.ps1', 'Prepare-Profile.ps1')) {
+    foreach ($name in @('Common.ps1', 'Tray.ps1', 'TrayActions.ps1', 'Prepare-Profile.ps1')) {
         Copy-Item -LiteralPath (Join-Path $RepositoryRoot "src\powershell\$name") -Destination (Join-Path $root 'src')
     }
     # Only the mutex name changes in the copied helper, so a long fixture import
@@ -32,7 +32,9 @@ try {
     [IO.File]::WriteAllText($first, 'fixture'); [IO.File]::WriteAllText($second, 'fixture')
     $list = Join-Path $root 'state\included-apps.txt'
     [IO.File]::WriteAllLines($list, [string[]]@($first), $utf8)
-    $runner = Join-Path $RepositoryRoot 'build\test-tray-action.exe'
+    $runner = Join-Path $root 'bin\test-tray-action.exe'
+    & (Join-Path $PSHOME 'powershell.exe') -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $root 'src\Tray.ps1') -SelfTest | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) 'legacy tray self-test reports success explicitly'
     & $runner $root Status
     Assert-True ($LASTEXITCODE -eq 0) 'real bounded runner validates tray inputs'
     & $runner $root Add $second
@@ -117,7 +119,7 @@ Start-Sleep -Seconds 60
     }
     [IO.File]::WriteAllText($preparePath, $prepareSource)
     $controller.Kill(); $null = $controller.WaitForExit(5000); $controller.Dispose(); $controller = $null
-    & (Join-Path $RepositoryRoot 'build\test-tray-dialog.exe') (Join-Path $root 'bin\tray.exe') $runner $root
+    & (Join-Path $root 'bin\test-tray-dialog.exe') (Join-Path $root 'bin\tray.exe') $runner $root
     Assert-True ($LASTEXITCODE -eq 0) 'both real file pickers cancel without selecting a file'
     $smokeError = Join-Path $root 'smoke-error.txt'
     $smoke = Start-Process -FilePath (Join-Path $root 'bin\tray.exe') -ArgumentList '--smoke-test' -RedirectStandardError $smokeError -PassThru
@@ -143,11 +145,17 @@ Start-Sleep -Seconds 60
     if ($child) { $child.Dispose() }
     Remove-Item -LiteralPath $pidFile
     [IO.File]::WriteAllText((Join-Path $root 'src\TrayActions.ps1'), '$PID | Set-Content -LiteralPath (Join-Path $PSScriptRoot ''..\child-pid.txt'')' + "`r`nStart-Sleep -Seconds 2`r`n" + '[IO.File]::WriteAllText((Join-Path $PSScriptRoot ''..\finished.txt''), ''done'')')
+    & (Join-Path $root 'bin\test-tray-session.exe') $root
+    Assert-True ($LASTEXITCODE -eq 0) 'session end is blocked only while a real mutation is running'
+    Remove-Item -LiteralPath $pidFile, (Join-Path $root 'finished.txt') -Force -ErrorAction SilentlyContinue
     & $runner $root Finish
     Assert-True ($LASTEXITCODE -eq 0) 'the mutation fixture starts before its UI owner exits'
     $finishDeadline = [DateTime]::UtcNow.AddSeconds(10)
     while (-not (Test-Path (Join-Path $root 'finished.txt')) -and [DateTime]::UtcNow -lt $finishDeadline) { Start-Sleep -Milliseconds 100 }
     Assert-True (Test-Path (Join-Path $root 'finished.txt')) 'an already-started mutation finishes after its UI owner exits'
+    [IO.File]::WriteAllText((Join-Path $root 'src\TrayActions.ps1'), '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); [Console]::Error.WriteLine("failure: " + [char]0x03bb); exit 7')
+    & $runner $root CheckUnicode
+    Assert-True ($LASTEXITCODE -eq 0) 'Unicode error output survives the native and PowerShell result path'
     Write-Output 'PASS: native tray and pickers, Unicode actions, serialized mutations, profile commit/rollback, last-app protection, and cancellation containment.'
 } finally {
     if ($controller) { try { if (-not $controller.HasExited) { $controller.Kill(); $null = $controller.WaitForExit(5000) } } finally { $controller.Dispose() } }

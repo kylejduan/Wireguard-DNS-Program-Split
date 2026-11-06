@@ -76,12 +76,22 @@ if ($controllerServiceRecord -and -not (Test-ProgramSplitServiceOwnership `
     throw 'Refusing to remove a same-name foreign controller service.'
 }
 
+$trayMutationLock = Enter-ProgramSplitTrayMutationLock
+try {
 foreach ($taskName in @($plan.LegacyControllerTask, $plan.TrayTask)) {
     if ($ownedTasks.ContainsKey($taskName)) {
         Stop-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName $taskName -TaskPath '\' -Confirm:$false
     }
 }
+
+try { Stop-ProgramSplitTrayProcesses -Root $fullRoot }
+catch {
+    foreach ($taskName in $ownedTasks.Keys) {
+        if ($ownedTasks[$taskName].State -eq 'Running') { Start-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue }
+    }
+    throw
+}
+foreach ($taskName in $ownedTasks.Keys) { Unregister-ScheduledTask -TaskName $taskName -TaskPath '\' -Confirm:$false }
 
 $controllerService = if ($controllerServiceRecord) {
     Get-Service -Name $plan.ControllerServiceName -ErrorAction SilentlyContinue
@@ -152,3 +162,7 @@ if ($errors) { throw ($errors -join [Environment]::NewLine) }
 if (Test-Path -LiteralPath $fullRoot) { Remove-ProgramSplitTree -Path $fullRoot }
 
 Write-Output 'WireGuard Program Split was removed. The shared PIA WFP driver package was left installed.'
+
+} finally {
+    try { $trayMutationLock.ReleaseMutex() } finally { $trayMutationLock.Dispose() }
+}

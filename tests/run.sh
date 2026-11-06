@@ -34,6 +34,11 @@ compiler=${CXX:-x86_64-w64-mingw32-g++}
 "$compiler" -std=c++20 -O2 -Wall -Wextra -Werror -static -municode \
   "$repo_root/tests/native/tray-dialog.cpp" -o "$repo_root/build/test-tray-dialog.exe" -lcrypt32
 
+"$compiler" -std=c++20 -O2 -Wall -Wextra -Werror -static -municode \
+  "$repo_root/tests/native/tray-session.cpp" -o "$repo_root/build/test-tray-session.exe" -lshell32 -lcomdlg32 -luser32 -lcrypt32 -lole32
+"$compiler" -std=c++20 -O2 -Wall -Wextra -Werror -static -municode \
+  "$repo_root/tests/native/tray-stub.cpp" -o "$repo_root/build/test-tray-stub.exe"
+
 for executable in controller-service dns-dispatcher dns-probe wfp-probe tray; do
   "$repo_root/build/$executable.exe" --self-test
 done
@@ -104,6 +109,10 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
 
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
   -File "$(wslpath -w "$repo_root/tests/Test-Tray.ps1")" \
+  -RepositoryRoot "$(wslpath -w "$repo_root")"
+
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  -File "$(wslpath -w "$repo_root/tests/Test-TrayMaintenance.ps1")" \
   -RepositoryRoot "$(wslpath -w "$repo_root")"
 
 "$repo_root/tests/check-public-tree.sh"

@@ -44,6 +44,13 @@ inline std::wstring wide(const std::string& text) {
     MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), result.data(), count);
     return result;
 }
+inline std::wstring displayWide(const std::string& text) {
+    if (text.empty()) return {};
+    const int count = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    std::wstring result(count, 0);
+    if (count) MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), count);
+    return result;
+}
 inline std::string utf8(const std::wstring& text) {
     if (text.empty()) return {};
     const int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
@@ -121,7 +128,7 @@ inline std::string unbase64(const std::string& text) {
     return result;
 }
 struct Result { bool ok{}; std::wstring message; };
-inline Result resultFrame(const std::string& frame) {
+inline Result resultFrame(const std::string& frame, bool strictOutput = false) {
     std::map<std::string, std::string> fields;
     size_t start{};
     bool header{};
@@ -140,19 +147,20 @@ inline Result resultFrame(const std::string& frame) {
         if (end == std::string::npos) break;
         start = end + 1;
     }
-    if (const auto error = fields.find("error"); error != fields.end()) return {false, wide(error->second)};
+    if (const auto error = fields.find("error"); error != fields.end()) return {false, displayWide(error->second)};
     for (const auto* key : {"exit", "timedout", "stdout-truncated", "stderr-truncated", "stdout", "stderr"})
         if (!fields.contains(key)) throw std::runtime_error("Incomplete action result");
     if (fields["timedout"] != "0") return {false, L"The operation exceeded its deadline."};
     if (fields["stdout-truncated"] != "0" || fields["stderr-truncated"] != "0")
         return {false, L"The operation produced too much output."};
-    int code{};
+    uint32_t code{};
     const auto& exit = fields["exit"];
     const auto parsed = std::from_chars(exit.data(), exit.data() + exit.size(), code);
     if (parsed.ec != std::errc() || parsed.ptr != exit.data() + exit.size()) throw std::runtime_error("Invalid action exit code");
-    std::wstring message = wide(unbase64(fields[code ? "stderr" : "stdout"]));
-    if (message.empty()) message = wide(unbase64(fields[code ? "stdout" : "stderr"]));
-    return {code == 0, message.empty() ? (code ? L"The operation failed." : L"The operation completed.") : message};
+    const auto decode = [strictOutput](const std::string& text) { return strictOutput ? wide(text) : displayWide(text); };
+    std::wstring message = decode(unbase64(fields[code ? "stderr" : "stdout"]));
+    if (message.empty()) message = decode(unbase64(fields[code ? "stdout" : "stderr"]));
+    return {code == 0, message.empty() ? (code ? L"The operation failed (exit " + std::to_wstring(code) + L")." : L"The operation completed.") : message};
 }
 // Only one operation runs at a time. Its bounded runner owns the PowerShell
 // process tree. The UI thread performs no waits or pipe reads.
@@ -167,7 +175,7 @@ class Action {
     std::shared_ptr<State> state_;
     std::thread thread_;
     static Result run(const std::wstring& root, const std::wstring& child, DWORD timeout,
-                      const std::shared_ptr<State>& state) {
+                      const std::shared_ptr<State>& state, bool strictOutput = false) {
         if (state->stop) throw std::runtime_error("Tray action cancelled");
         const std::wstring runner = root + L"\\bin\\controller-service.exe";
         std::wstring command = quote(runner) + L" --run " + std::to_wstring(timeout) + L" " + base64(child);
@@ -211,13 +219,13 @@ class Action {
             throw;
         }
         if (overflow) throw std::runtime_error("Tray action result exceeds its limit");
-        return resultFrame(frame);
+        return resultFrame(frame, strictOutput);
     }
     static Result execute(const std::wstring& root, std::wstring action,
                           std::wstring value, const std::shared_ptr<State>& state) {
         if (action == L"PickAdd" || action == L"PickImport") {
             const auto selected = run(root, quote(root + L"\\bin\\tray.exe") +
-                (action == L"PickAdd" ? L" --pick-app" : L" --pick-profile"), 600000, state);
+                (action == L"PickAdd" ? L" --pick-app" : L" --pick-profile"), 600000, state, true);
             if (!selected.ok) return selected;
             if (selected.message == L"CANCEL") return {true, {}};
             if (!selected.message.starts_with(L"SELECT:") || selected.message.size() <= 7)
@@ -253,6 +261,11 @@ public:
         else thread_.detach(); // Shared state, never a borrowed UI pointer.
     }
     bool busy() const { return state_ && WaitForSingleObject(state_->done.value, 0) != WAIT_OBJECT_0; }
+    bool mutating() const {
+        if (!state_) return false;
+        std::lock_guard lock(state_->mutex);
+        return state_->finishMutation && busy();
+    }
     HANDLE event() const { return state_ ? state_->done.value : nullptr; }
     void start(std::wstring root, std::wstring action, std::wstring value) {
         if (busy()) throw std::runtime_error("Another tray operation is still running");
@@ -263,7 +276,7 @@ public:
             Result result{false, L"The operation failed."};
             try { result = execute(root, action, value, state); }
             catch (const std::exception& e) {
-                try { result = {false, wide(e.what())}; }
+                try { result = {false, displayWide(e.what())}; }
                 catch (...) { result.ok = false; }
             }
             catch (...) { result = {false, L"The operation failed."}; }

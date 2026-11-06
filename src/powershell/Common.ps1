@@ -102,6 +102,61 @@ function Test-ProgramSplitTrayTaskOwnership {
         ($null -eq $arguments -or [string]::IsNullOrEmpty([string] $arguments.Value))
 }
 
+function Enter-ProgramSplitTrayMutationLock {
+    param(
+        [ValidateRange(0, 600000)] [int] $TimeoutMilliseconds = 210000,
+        [string] $Name = 'Global\WireGuardProgramSplitTrayAction'
+    )
+    $mutex = [Threading.Mutex]::new($false, $Name)
+    try {
+        try { $held = $mutex.WaitOne($TimeoutMilliseconds) }
+        catch [Threading.AbandonedMutexException] { $held = $true }
+        if (-not $held) { throw 'A tray change is still running; no maintenance changes were made.' }
+        return $mutex
+    } catch { $mutex.Dispose(); throw }
+}
+
+function Stop-ProgramSplitTrayProcesses {
+    # Hold the tray mutation lock before calling. Kill only the exact native UI;
+    # wait for its helpers and bounded runners rather than cutting a write short.
+    param(
+        [Parameter(Mandatory)] [string] $Root,
+        [ValidateRange(100, 120000)] [int] $TimeoutMilliseconds = 65000
+    )
+    $image = Join-Path $Root 'bin\tray.exe'
+    $runner = Join-Path $Root 'bin\controller-service.exe'
+    $scripts = @('Tray.ps1', 'TrayActions.ps1', 'Prepare-Profile.ps1') |
+        ForEach-Object { Join-Path $Root "src\$_" }
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $records = @(Get-CimInstance Win32_Process -Filter "Name='tray.exe' OR Name='powershell.exe' OR Name='controller-service.exe'")
+        foreach ($record in @($records | Where-Object { $_.ExecutablePath -eq $image })) {
+            $process = Get-Process -Id $record.ProcessId -ErrorAction SilentlyContinue
+            if (-not $process) { continue }
+            try {
+                $null = $process.Handle
+                if ([Math]::Abs(($process.StartTime.ToUniversalTime() - $record.CreationDate.ToUniversalTime()).TotalMilliseconds) -gt 1 -or
+                    -not (Test-ProgramSplitProcessPath -ProcessId $record.ProcessId -ExpectedPath $image)) { continue }
+                try { $process.Kill() } catch { if (-not $process.WaitForExit(5000)) { throw } }
+                if (-not $process.WaitForExit(5000)) { throw 'The native tray did not stop.' }
+            } finally { $process.Dispose() }
+        }
+        $pending = @($records | Where-Object {
+            if ($_.ExecutablePath -eq $image) { return $true }
+            if ($_.ExecutablePath -eq $runner -and $_.CommandLine -match '(?i)(?:^|\s)--run(?:\s|$)') { return $true }
+            if ($_.Name -eq 'powershell.exe' -and $_.CommandLine) {
+                foreach ($script in $scripts) {
+                    if ($_.CommandLine.IndexOf($script, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+                }
+            }
+            return $false
+        })
+        if (-not $pending.Count) { return }
+        Start-Sleep -Milliseconds 200
+    } while ($timer.ElapsedMilliseconds -lt $TimeoutMilliseconds)
+    throw 'A tray or bounded helper remains; refusing to move or remove its files.'
+}
+
 function Get-ProgramSplitServiceCommand {
     param(
         [Parameter(Mandatory)] [string] $HostPath,
