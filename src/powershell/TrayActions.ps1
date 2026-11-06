@@ -103,6 +103,7 @@ function Import-Profile([string] $InputPath) {
         Write-Output 'The WireGuard profile passed validation.'
     } catch {
         $failure = $_.Exception.Message
+        $resumeConfirmed = $false
         if ($disableRequested) {
             $resumeRequested = $false
             Remove-Item -LiteralPath $enabledFile -Force -ErrorAction SilentlyContinue
