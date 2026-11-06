@@ -192,17 +192,22 @@ Assert-True ($controllerSource -match '\$networkRetryMilliseconds\s*=\s*250' -an
     $controllerSource -match 'Start-Sleep -Milliseconds \$loopWaitMilliseconds') `
     'controller checks network readiness quickly with bounded backoff only while waiting for the physical route'
 
-$probeOut = Join-Path ([IO.Path]::GetTempPath()) "wgps-exit-$([guid]::NewGuid()).out"
-$probeError = "$probeOut.err"
+$probe = $null
 try {
-    $probe = Start-Process cmd.exe -ArgumentList @('/d', '/c', 'exit', '7') `
-        -RedirectStandardOutput $probeOut -RedirectStandardError $probeError -WindowStyle Hidden -PassThru
+    # Retain the original handle even if this trivial child exits before Start
+    # returns. Start-Process -PassThru can lose that exit on Windows PowerShell.
+    $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\cmd.exe'), '/d /c exit 7')
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $probe = [Diagnostics.Process]::Start($start)
     $null = $probe.Handle
     Assert-True ($probe.WaitForExit(5000)) 'exit-code probe completes'
     $probe.WaitForExit()
     Assert-True ($probe.ExitCode -eq 7) 'Windows PowerShell reports the retained child exit code'
 } finally {
-    Remove-Item -LiteralPath $probeOut, $probeError -Force -ErrorAction SilentlyContinue
+    if ($probe) { $probe.Dispose() }
 }
 
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("WireGuardProgramSplit-test-{0}" -f [guid]::NewGuid())
