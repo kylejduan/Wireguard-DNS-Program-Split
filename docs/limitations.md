@@ -12,6 +12,14 @@
 - The filters own the PIA callout objects persistently. The Private Internet Access desktop client cannot add its own callouts while they exist; do not run both.
 - Non-owned NRPT rules for specific namespaces take precedence over the catch-all dispatcher rule. Selected applications resolve those namespaces through whatever server the rule names. The controller logs the namespaces once per distinct set and keeps running.
 - An explicit tray disable, `Stop-Service WireGuardProgramSplitController` and uninstallation remove the filters and restore ordinary direct access. While the project is enabled it acts as a per-application kill switch for payload.
+- Profile import uses preserved profile/settings backups and bounded rollback.
+  Ordinary tray closure does not kill an in-flight mutation, and a normal
+  session-end request is refused during one. Forced process-tree termination,
+  power loss, a stuck operating-system call or arbitrary sleep duration is not
+  a transaction guarantee. The controller's existing five-minute profile
+  filter hold uses its own clock; it can expire across a long sleep even though
+  the tray runner's operation deadline excludes sleep. If an import fails,
+  inspect its reported state and preserved backups before trying again.
 - DNS process attribution depends on an undocumented-in-this-project Windows DNS Client ETW event shape and can change in future Windows builds. Uncached executable paths are resolved by four workers with 16 fixed job slots; each job has a 150 ms wait deadline, and all identities share a 150 ms waiting budget per one-second window. A timeout, unavailable path or exhausted pool makes that query's name unknown and refuses direct routing for ten seconds. Late results only populate the cache. If all four workers remain stuck, uncached identities continue failing closed while cached identities remain available; this does not guarantee DNS availability for every new process during a filesystem or driver failure. See [DNS isolation](dns-isolation.md).
 - UDP queries and TCP clients share a 256-worker limit. At most 128 tunnel upstream exchanges can be outstanding, including UDP completion over TCP; excess selected queries receive `SERVFAIL` without a direct fallback. This preserves capacity during slow tunnel exchanges, but admission before classification and idle TCP clients still share the global limit. It does not guarantee availability against arbitrary ingress floods.
 - A query event whose process cannot be identified, typically because it exited before the event was read, may have come from a selected application, so for ten seconds no lookup of that name is routed or answered directly; tunnel evidence still routes to the tunnel, and other lookups of the name are refused meanwhile.

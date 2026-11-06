@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 - 2026-11-06
 
 - Windows: replace the resident PowerShell/Windows Forms tray with a native
   notification icon. File pickers use short-lived native children. Profile and application changes use a short-lived,
@@ -10,8 +10,16 @@
   PowerShell action.
 - Tests: exercise native tray lifecycle, Unicode application paths, failed
   last-app removal, profile commit/readiness rollback, bounded preparation,
-  preserved backups and action cancellation against
-  a disposable installation tree.
+  preserved backups, shutdown refusal during a mutation, maintenance ownership
+  and action cancellation against a disposable installation tree.
+- Windows: maintenance waits for tray transactions without confusing the
+  controller's own bounded checks with tray work. Routine UI closure leaves an
+  in-flight mutation with its independent bounded runner; stalled read-only
+  actions are cancelled. Import failures restore the previous enabled intent
+  when the original profile pair is intact.
+- Retain the isolated validation worker and the existing packet/DNS paths,
+  health intervals and driver settings. See [performance evidence and the
+  optimization stopping point](docs/performance.md#november-6-2026-native-tray-and-optimization-closeout).
 
 ## 0.4.0 - 2026-11-06
 

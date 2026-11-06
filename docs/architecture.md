@@ -22,6 +22,17 @@ unlisted executable ────────────────────
 - `Controller.ps1` owns startup, recovery, and 30-second tunnel plus end-to-end split-DNS health checks. The controller service is Automatic; the tunnel service is Manual. `Invoke-Tunnel.ps1` serializes stopped-service starts and completes orphan-adapter preflight before starting the host, while adopting a service already Running/StartPending.
 - `tray.exe`, running as the interactive installing user, displays the notification icon and reads desired state. File pickers run in short-lived copies of the native executable, so shell extensions do not stay loaded in the idle tray. It starts the short-lived `TrayActions.ps1` helper only for changes to the desired state, executable list, or profile. The helper retains the guarded profile replacement and rollback transaction. `Tray.ps1` remains a compatibility launcher for older task registrations.
 
+The native tray has no role in forwarding packets or resolving DNS. Its
+two-second timer reads small state files. A bounded runner supervises each
+helper, and a shared mutation mutex serializes changes with migration and
+uninstallation. Maintenance distinguishes tray helpers from the controller's
+own runners. File selection gets ten minutes, ordinary actions thirty seconds,
+and profile import four minutes. The outer tray deadline excludes sleep and
+hibernation, matching the runner's Windows wait semantics. Routine UI closure
+allows an already-started mutation to finish under its runner; read-only work
+is cancelled. A normal session-end request is refused while a mutation is in
+progress. See [the forced-termination and profile-hold limits](limitations.md).
+
 ## Payload filters
 
 Each included executable gets six persistent filters in the project sublayer: PIA callout redirects at the IPv4 bind and connect redirect layers; blocks at the IPv4 connect and receive-accept authorization layers for any local address other than the tunnel address; and blocks at the IPv6 connect and receive-accept authorization layers. Every block spares loopback, which never leaves the host. Selected applications therefore cannot use IPv6, fall back to IPv4, and are bound to the tunnel address. A redirect to that address needs neither the tunnel nor the dispatcher, so the filters are installed before both and stay through every repair: while the tunnel is down, selected applications fail instead of leaving on the physical route. Because the objects are persistent, BFE reloads them after a BFE restart and at boot, before the controller has rebuilt the stack. Each block also has a boot-time copy (`FWPM_FILTER_FLAG_BOOTTIME`), which TCP/IP enforces from its own start until BFE has loaded the persistent set. They are enforced before BFE has loaded the project sublayer, the PIA callouts or the provider context, so the copies are the blocks alone, flagged boot-time instead of persistent, in the default sublayer, under the same provider; install, replacement, verification and removal treat them like the rest of the set. BFE keeps their provider and places them in the universal sublayer, and an enumeration scoped to a layer returns them only with `FWP_FILTER_ENUM_FLAG_INCLUDE_BOOTTIME`, which `wfp-probe.exe` sets. CI proves they are added, verified, replaced and removed, not their enforcement before BFE, which only a reboot of the deployed workstation can show.

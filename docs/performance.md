@@ -637,3 +637,74 @@ not isolated. These are observations of this reboot, not a startup-time or
 long-term
 availability guarantee. Private host identifiers, keys, logs and rollback
 files are not part of this source release.
+
+## November 6, 2026: native tray and optimization closeout
+
+Release 0.5.0 replaces the resident Windows PowerShell/Windows Forms tray with a
+small native notification icon. File pickers run in short-lived native children;
+application-list and profile mutations use the existing bounded process runner
+and a short-lived PowerShell helper. Neither remains resident after the action.
+The tray is outside the packet and DNS query paths. This release changes no
+forwarding code, filter policy, resolver selection, health interval, offload
+setting or driver.
+
+### Scope and stopping point
+
+The independent architecture review and adversarial follow-up agreed to retain
+the isolated validation worker. Moving validation into a controller runspace
+could avoid a PowerShell process, but cancellation becomes cooperative. The
+current worker can be terminated with its descendants after its 45-second
+budget, with up to five seconds allowed for exit. In-process validation cannot
+preserve that contract while also containing a native crash, `Environment.Exit`
+or an uninterruptible call; escalation would restart the controller and widen
+the fault domain. No CPU or throughput benefit was demonstrated for that change.
+
+A disposable smaller-GC-generation experiment reduced private memory by about
+22.5 MiB at one endpoint, with extra collections and overlapping CPU results.
+That unsupported runtime setting was rejected. A native controller rewrite,
+new DNS caches or different kernel/network settings need a demonstrated
+bottleneck and their own correctness evidence. They are not justified solely
+by a desire to minimize a number in Task Manager. This is a reasonable stopping
+point for the measured workstation workload, not proof of a theoretical minimum.
+
+### Costs and validation boundaries
+
+One cold, isolated tray Status helper took 766 ms. Starting PowerShell for an
+infrequent UI action trades action latency and temporary memory for lower idle
+memory; it adds no per-packet or per-query work. A disposable picker experiment
+retained about 16 MiB when dialogs lived in the resident process, which motivated
+the separate picker processes.
+
+Native and PowerShell regression tests cover Unicode paths, unique include lists,
+last-app protection, profile commit and rollback, a controller too busy to stop,
+preparation timeouts, process-tree containment, ordinary tray closure during a
+mutation, simulated session-end handling, exact maintenance ownership and real
+Task Scheduler registration. Windows live SCM and DNS Client/ETW tests and
+Linux unit/native tests remain part of CI. Linux runtime is unchanged;
+privileged Linux VM acceptance is a separate, unrun gate. Long-sleep, forced
+shutdown and power-loss transaction guarantees are not claimed; see
+[limitations](limitations.md).
+
+### Deployment measurements
+
+The reference workstation's pre-update sixty-second sample measured 460.5 MiB
+of private memory across ten product processes and console children, including
+114.35 MiB for the old PowerShell tray. Its aggregate process CPU was 0.0285%
+of a 32-logical-processor machine. A disposable native tray/picker fixture
+started at 1.48 MiB; that is a fixture result, not the deployed result.
+
+The [0.5.0 release notes](https://github.com/kylejduan/Wireguard-DNS-Program-Split/releases/tag/v0.5.0)
+record the corresponding live post-activation sample and desktop checks. The
+activation procedure retains an independent local rollback, verifies the
+native task and icon, exercises recovery from termination of only the UI, and
+checks that the controller, dispatcher and tunnel keep their PIDs. It also
+compares saved profile/settings/application-list hashes and permissions, and
+performs bounded DNS and HTTPS checks.
+
+These process samples exclude system-wide kernel/driver, interrupt and DPC
+costs. PowerShell heap variation can change total memory between samples, and
+small CPU differences at this scale do not establish a performance gain.
+There is no new bulk-throughput or direct-versus-disabled A/B claim for the
+tray update. Ordinary direct traffic still incurs the documented split-DNS
+behavior, including the cache tradeoff; selected payload still pays the cost
+of encryption and its provider path.
