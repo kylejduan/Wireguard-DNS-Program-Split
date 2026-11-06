@@ -885,11 +885,15 @@ class NetworkTests(unittest.TestCase):
                 self.net.repair_missing(guard_blocked=True)
         recovered = network.Network(PROFILE, self.fd, runner=self.kernel, boot_id=BOOT,
             wireguard_root=self.wireguard, owner_uid=os.getuid(), receipt=ownership.read_receipt(self.fd))
-        self.assertIn('route:preferred', recovered.health().changed)
-        with self.assertRaises(network.NetworkError):
-            recovered.repair_missing(guard_blocked=True)
-        with self.assertRaises(network.NetworkError):
-            recovered.disable(guard_blocked=True)
+        self.assertFalse(recovered.health().ready)
+        self.assertFalse(recovered.health().changed)
+        self.kernel.calls.clear()
+        recovered.repair_missing(guard_blocked=True)
+        self.assertTrue(recovered.health().ready)
+        self.assertIn(recovered._route_argv('delete', 'preferred'), self.kernel.calls)
+        self.assertFalse(any(('delete' in c or '-D' in c or c[:2] == ('nft', '-f')) and
+                             c != recovered._route_argv('delete', 'preferred') for c in self.kernel.calls))
+        self.kernel.calls.clear()
         self._assert_anchors_retained()
 
     def test_repair_configuration_failure_retains_guarding_resources_and_private_evidence(self):

@@ -14,7 +14,7 @@ from unittest.mock import patch
 from wg_program_split.controller import Controller, ControllerError, Paths
 from wg_program_split.network import Allocation, Health
 from wg_program_split import ownership as own
-from wg_program_split.preflight import NativeGuard, validate_nss, restart_audit, readiness_probe
+from wg_program_split.preflight import NativeGuard, ProbeUnavailable, validate_nss, restart_audit, readiness_probe
 from wg_program_split.config import parse_profile
 
 

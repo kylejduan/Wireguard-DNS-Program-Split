@@ -9,6 +9,11 @@ requested Wi-Fi connection after a minute of failure. Hardware resets require a
 separate opt-in and five minutes of continuous fault evidence. Normal router/DNS
 outages do not authorize a physical reset.
 
+Linux can optionally recover from a failed VPN server using a bounded list of
+operator-supplied [backup peers](docs/linux.md#automatic-peer-failover).
+Switching retains the pinned application guard and requires fresh tunnel DNS
+and handshake verification before selected applications can connect again.
+
 ## What is different
 
 | Traffic | Selected executable | Unlisted executable |

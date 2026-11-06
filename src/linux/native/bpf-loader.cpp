@@ -857,12 +857,13 @@ void probe_dns(const fs::path &dir) {
     check(sendto(socket.value,query.data(),query.size(),0,reinterpret_cast<sockaddr *>(&target),sizeof(target))==static_cast<ssize_t>(query.size()),"send native DNS probe");
     std::array<unsigned char,4096> answer{}; sockaddr_in peer{}; socklen_t peer_size=sizeof(peer);
     ssize_t size=recvfrom(socket.value,answer.data(),answer.size(),0,reinterpret_cast<sockaddr *>(&peer),&peer_size);
+    check(size>=0 || errno==EAGAIN || errno==EWOULDBLOCK,"receive native DNS probe");
     if (size<static_cast<ssize_t>(query.size()+12) || peer_size!=sizeof(peer) || peer.sin_family!=AF_INET ||
         peer.sin_addr.s_addr!=target.sin_addr.s_addr || peer.sin_port!=target.sin_port ||
         answer[0]!=query[0] || answer[1]!=query[1] || (answer[2]&0xfa)!=0x80 || (answer[3]&0xf) ||
         answer[4] || answer[5]!=1 || (!answer[6] && !answer[7]) ||
         memcmp(answer.data()+12,query.data()+12,query.size()-12))
-        fail("native DNS probe timed out or returned an invalid original-peer answer");
+        { std::cout<<"{\"dns\":false}\n"; return; }
     std::cout<<"{\"dns\":true}\n";
 }
 // Read-only request loop over inherited anonymous pipes. Reopen and verify

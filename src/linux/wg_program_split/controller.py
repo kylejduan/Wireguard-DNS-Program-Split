@@ -16,10 +16,11 @@ import time
 import uuid
 
 from . import ownership as own
+from . import failover
 from .config import (Settings, canonical_executable, parse_policy, parse_profile,
                      policy_path, settings_json)
-from .network import Allocation, Network, allocate, inspect
-from .preflight import (ControllerError, NativeGuard, check_host, process_snapshot,
+from .network import Allocation, Network, UnderlayUnavailable, allocate, inspect
+from .preflight import (ControllerError, ProbeUnavailable, NativeGuard, check_host, process_snapshot,
                         read_private, readiness_probe, restart_audit)
 
 
@@ -87,6 +88,8 @@ class Controller:
         self.probe = probe or (lambda profile, allocation: readiness_probe(profile, allocation, self.kernel))
         self.processes = processes
         self._audited_at = None
+        self._peer_pool = ()
+        self._peer_pool_digest = None
 
     @contextmanager
     def _locked(self, *, create=True):
@@ -105,7 +108,15 @@ class Controller:
         keys = list(parse_policy(policy).included_executables)
         if str(self.paths.artifacts / 'bpf-loader') in keys:
             raise ControllerError('the management probe executable cannot be enrolled')
-        return parse_profile(raw), hashlib.sha256(raw.encode()).hexdigest(), keys, identity
+        profile = parse_profile(raw)
+        self._peer_pool = (profile,)
+        digest = hashlib.sha256(raw.encode())
+        if _present(config, 'failover.json'):
+            extra, _ = read_private(config, 'failover.json', 65536)
+            self._peer_pool = failover.parse_peers(extra, profile)
+            digest.update(b'\0failover\0' + extra.encode())
+        self._peer_pool_digest = digest.hexdigest()
+        return profile, self._peer_pool_digest, keys, identity
 
     def _journal(self, state):
         if not _present(state, 'controller.json'):
@@ -123,7 +134,7 @@ class Controller:
             required = {'schema', 'boot_id', 'generation', 'state', 'allocation',
                         'profile_digest', 'policy', 'pins', 'pending', 'restart_required',
                         'probe_at', 'reason', 'network_started', 'restart_boundary_unresolved'}
-            if (set(value) != required or type(value['schema']) is not int or value['schema'] != 1 or
+            if (set(value) not in (required, required | {'failover'}) or type(value['schema']) is not int or value['schema'] != 1 or
                     value['boot_id'] != own.current_boot_id() or
                     type(value['generation']) is not int or value['generation'] < 1 or
                     type(value['network_started']) is not bool or
@@ -133,6 +144,8 @@ class Controller:
                     not isinstance(value['policy'], list) or not isinstance(value['restart_required'], list) or
                     (value['pins'] is not None and not isinstance(value['pins'], dict))):
                 raise ValueError()
+            if 'failover' in value:
+                failover.validate_state(value['failover'])
             Allocation(**value['allocation'])
             parse_policy(_json({'schema_version': 1, 'included_executables': value['policy']}))
             pending = value['pending']
@@ -182,8 +195,74 @@ class Controller:
 
     def _network(self, state, profile, journal):
         receipt = own.read_receipt(state) if _present(state, 'receipt.json') else None
-        return self.network_factory(profile, state, owner_uid=self.owner_uid,
+        return self.network_factory(self._peer(profile, journal), state, owner_uid=self.owner_uid,
                                     allocation=Allocation(**journal['allocation']), receipt=receipt)
+
+    def _peer(self, profile, journal):
+        rotation = journal.get('failover')
+        if rotation is None:
+            return profile
+        if (self._peer_pool_digest != journal['profile_digest'] or
+                not 1 < len(self._peer_pool) or rotation['active'] >= len(self._peer_pool)):
+            raise ControllerError('configured failover pool does not match the journal')
+        return self._peer_pool[rotation['active']]
+
+    def _resume_peer_change(self, state, profile, journal, identity):
+        """Retarget only the tunnel while guard, drop rules and route anchors stay."""
+        rotation = journal['failover']
+        target = rotation['pending']
+        if target is None:
+            return identity
+        if target >= len(self._peer_pool) or journal['pending'] is not None:
+            raise ControllerError('invalid pending peer change')
+        self._block(journal)
+        if not _present(state, 'receipt.json') or not journal['network_started']:
+            raise ControllerError('peer change lost its ownership receipt')
+        network = self._network(state, profile, journal)
+        try:
+            network.switch_peer(self._peer_pool[target], guard_blocked=True)
+        except UnderlayUnavailable:
+            # The target binding and absence fences are durable. Commit that
+            # identity so later checks can repair it or try another peer.
+            if network.profile != self._peer_pool[target]:
+                raise
+        rotation.update(active=target, pending=None)
+        journal.update(state='degraded', probe_at=None)
+        return self._save(state, journal, identity)
+
+    def _failed_probe(self, state, profile, journal, identity, *, incomplete=False):
+        """Rotate only after repeated liveness failures with intact ownership."""
+        if journal['pending'] is not None:
+            raise ControllerError('finish the policy transaction before peer failover')
+        self._block(journal)
+        network = self._network(state, profile, journal)
+        health = network.health()
+        a = journal['allocation']
+        anchors = {'route:fallback', 'rule:vpn', 'nft_table:' + a['nft_table'], 'conntrack_zone:vpn'}
+        replaceable = {'route:preferred', 'interface:' + a['interface'], 'sysctl:route_localnet'}
+        safe_incomplete = incomplete and anchors.issubset(health.matching) and set(health.missing) <= replaceable
+        if health.changed or (not health.ready and not safe_incomplete) or (health.missing and not safe_incomplete):
+            raise ControllerError('ownership changed during failed readiness probe')
+        rotation = journal['failover']
+        rotation['failures'] = min(failover.FAILURES_BEFORE_SWITCH, rotation['failures'] + 1)
+        now = failover.boot_seconds()
+        rotation['retry_after'] = min(rotation['retry_after'], now + failover.SWITCH_INTERVAL)
+        journal.update(state='degraded', reason='VPN readiness probe failed', probe_at=None)
+        if rotation['failures'] >= failover.FAILURES_BEFORE_SWITCH and now >= rotation['retry_after']:
+            rotation['retry_after'] = now + failover.SWITCH_INTERVAL
+            for offset in range(1, len(self._peer_pool)):
+                target = (rotation['active'] + offset) % len(self._peer_pool)
+                try:
+                    network.preflight_peer(self._peer_pool[target])
+                except (OSError, ValueError, RuntimeError):
+                    continue
+                rotation.update(pending=target, failures=0)
+                journal['reason'] = 'switching configured VPN peer after repeated probe failures'
+                break
+        identity = self._save(state, journal, identity)
+        if rotation['pending'] is not None:
+            self._resume_peer_change(state, profile, journal, identity)
+        return self._result(journal, protection=True)
 
     def _forget_birth(self, state):
         if _present(state, _BIRTH):
@@ -284,6 +363,8 @@ class Controller:
                        'restart_required': previous['restart_required'] if previous else [],
                        'restart_boundary_unresolved': previous['restart_boundary_unresolved'] if previous else False,
                        'probe_at': None, 'reason': None, 'network_started': False}
+            if len(self._peer_pool) > 1:
+                journal['failover'] = failover.initial_state()
             self._audit(journal, policy)
             identity = self._save(state, journal, identity)
         if digest != journal['profile_digest']:
@@ -296,6 +377,8 @@ class Controller:
                 self.kernel.load(journal['policy'], Allocation(**journal['allocation']),
                                  record=self.paths.state / _BIRTH)
             identity = self._claim_birth(state, journal, identity)
+        if journal.get('failover', {}).get('pending') is not None:
+            identity = self._resume_peer_change(state, profile, journal, identity)
         if journal['pending'] is not None:
             identity = self._recover_edit(state, config, journal, identity, policy, settings_identity)
         self._block(journal)
@@ -339,13 +422,23 @@ class Controller:
             # interrupted repair left: repair under a blocked guard.
             self._block(journal)
             was_ready = False
-            network.repair_missing(guard_blocked=True)
+            try:
+                network.repair_missing(guard_blocked=True)
+            except UnderlayUnavailable:
+                if 'failover' not in journal:
+                    raise
+                return self._failed_probe(state, profile, journal, identity, incomplete=True)
             health = network.health()
         if not health.ready or health.changed or health.missing:
             raise ControllerError('owned network is incomplete or changed')
-        proof = self.probe(profile, Allocation(**journal['allocation']))
-        if proof.get('dns') is not True or proof.get('handshake_recent') is not True:
-            raise ControllerError('live readiness evidence is incomplete')
+        try:
+            proof = self.probe(self._peer(profile, journal), Allocation(**journal['allocation']))
+            if proof.get('dns') is not True or proof.get('handshake_recent') is not True:
+                raise ControllerError('live readiness evidence is incomplete')
+        except ProbeUnavailable:
+            if 'failover' not in journal:
+                raise
+            return self._failed_probe(state, profile, journal, identity)
         # A foreign rule clearing the reserved mark can appear during the
         # probe; the full inventory, not only owned state, gates ready.
         health = network.health()
@@ -358,6 +451,8 @@ class Controller:
         if observed['state'] != 'ready':
             raise ControllerError('ready state readback failed')
         journal.update(state='ready', reason=None, probe_at=time.time())
+        if 'failover' in journal:
+            journal['failover']['failures'] = 0
         # Health checks rescan /proc at most once a minute; enrollment, activation
         # and status keep their full audit.
         if (not periodic or self._audited_at is None or
@@ -419,7 +514,7 @@ class Controller:
             raise ControllerError('activation failed; guard and network protections were retained') from None
 
     def _result(self, journal, *, protection):
-        return {'state': journal['state'], 'generation': journal['generation'],
+        result = {'state': journal['state'], 'generation': journal['generation'],
                 'enforcement_state': journal['state'],
                 'protection_verified': protection and not journal['restart_boundary_unresolved'],
                 'restart_boundary_unresolved': journal['restart_boundary_unresolved'],
@@ -427,6 +522,9 @@ class Controller:
                 'restart_audit': 'Observed application trees require restart; unresolved descendants remain a boot-lifetime boundary',
                 'lineage_audit_complete': False, 'dns_last_checked': journal['probe_at'],
                 'reason': journal['reason']}
+        if 'failover' in journal:
+            result['failover'] = dict(journal['failover'])
+        return result
 
     def peek_state(self):
         """Unlocked journal read for progress observation only; never a status claim."""
@@ -475,7 +573,9 @@ class Controller:
             try:
                 self.host_check()
                 profile, digest, policy, _ = self._inputs(config)
-                if digest != journal['profile_digest'] or sorted(policy) != sorted(journal['policy']) or journal['pending']:
+                if (digest != journal['profile_digest'] or sorted(policy) != sorted(journal['policy']) or
+                        journal['pending'] or journal.get('failover', {}).get('pending') is not None or
+                        not journal['network_started']):
                     raise ControllerError('configuration needs guarded recovery')
                 return self._ready(state, profile, journal, identity, periodic=True)
             except (OSError, ValueError, RuntimeError):
@@ -594,9 +694,15 @@ class Controller:
                 identity = self._save(state, journal, identity)
                 if _present(state, 'receipt.json'):
                     network = self._network(state, profile, journal)
-                    if network.health().changed:
-                        raise ControllerError('changed network resources cannot be removed')
-                    receipt = network.disable(guard_blocked=True)
+                    target = journal.get('failover', {}).get('pending')
+                    if target is not None:
+                        if target >= len(self._peer_pool):
+                            raise ControllerError('pending peer is outside the configured pool')
+                        receipt = network.cancel_peer_change(self._peer_pool[target], guard_blocked=True)
+                    else:
+                        if network.health().changed:
+                            raise ControllerError('changed network resources cannot be removed')
+                        receipt = network.disable(guard_blocked=True)
                     if receipt.resources:
                         raise ControllerError('network cleanup is incomplete')
                     self._discard_receipt(state)
@@ -607,6 +713,8 @@ class Controller:
                 if self.kernel.exists():
                     raise ControllerError('guard removal did not complete')
                 journal.update(state='disabled', pins=None, pending=None, reason=None, probe_at=None)
+                if 'failover' in journal:
+                    journal['failover']['pending'] = None
                 self._save(state, journal, identity)
                 return self._result(journal, protection=False)
         except (OSError, ValueError, RuntimeError):
@@ -626,7 +734,8 @@ class Controller:
             journal, _ = self._journal(state)
             if journal is None:
                 return False
-            if journal['pending'] is not None or journal['pins'] is None or not journal['network_started']:
+            if (journal['pending'] is not None or journal.get('failover', {}).get('pending') is not None or
+                    journal['pins'] is None or not journal['network_started']):
                 return True
             # An acquisition interrupted by a death is rolled back by activation.
             return (_present(state, 'receipt.json') and

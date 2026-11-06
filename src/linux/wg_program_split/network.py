@@ -20,6 +20,10 @@ from .firewall import Firewall
 from . import ownership as own
 
 
+class UnderlayUnavailable(NetworkError):
+    """A peer currently has no compatible ordinary transport route."""
+
+
 @dataclass(frozen=True)
 class Allocation:
     mask: int
@@ -117,6 +121,13 @@ def _inspect(profile, *, runner, require_underlay):
 
 
 def _underlay(profile, links, runner):
+    try:
+        return _underlay_checked(profile, links, runner)
+    except NetworkError as error:
+        raise UnderlayUnavailable(str(error)) from None
+
+
+def _underlay_checked(profile, links, runner):
     tunnel_names = {link.get('ifname') for link in links if
                     link.get('linkinfo', {}).get('info_kind') in
                     ('wireguard', 'tun', 'ipip', 'gre', 'sit', 'vti', 'ip6tnl', 'xfrm')}
@@ -331,6 +342,8 @@ class Network:
             result = {'state': routes[0]}
             if name == 'fallback':
                 result['allocation'] = asdict(a)
+            if resource.identity.get('repair_pending') and _canonical(result['state']) == _canonical(resource.identity['state']):
+                result['repair_pending'] = True
             return result
         if kind == 'rule':
             rules = [r for r in snapshot['rules'] if r.get('priority') == a.priority]
@@ -352,10 +365,15 @@ class Network:
             result = {'ifindex': link['ifindex'], 'kind': link.get('linkinfo', {}).get('info_kind'),
                       'alias': link.get('ifalias', ''), 'mtu': link.get('mtu'),
                       'up': 'UP' in link.get('flags', [])}
-            if (result['kind'] != 'wireguard' or resource.identity and any(
-                    result[field] != resource.identity.get(field) for field in ('ifindex', 'alias'))):
+            aliases = {resource.identity.get('alias')}
+            if resource.identity.get('provisional'):
+                aliases.add('wgps:' + self.receipt.attempt_id)
+            if (result['kind'] != 'wireguard' or resource.identity and
+                    (result['ifindex'] != resource.identity.get('ifindex') or result['alias'] not in aliases)):
                 # Never request key-bearing output for a known replacement.
                 return result
+            if resource.identity.get('provisional'):
+                return dict(resource.identity)  # Same ifindex/kind and recorded-or-planned alias; never readiness.
             addresses = _json(self.runner, 'ip', '-j', '-4', 'address', 'show', 'dev', a.interface)
             result['addresses'] = sorted(f"{x['local']}/{x['prefixlen']}" for dev in addresses
                                          for x in dev.get('addr_info', []) if x.get('family') == 'inet')
@@ -389,10 +407,16 @@ class Network:
                 os.close(fd)
         raise NetworkError('receipt contains a resource outside the network adapter scope')
 
-    def _capture(self, kind, name):
+    def _capture(self, kind, name, *, provisional=None):
         identity = self._observe(own.ResourceIdentity(kind, name, {}), self._snapshot())
         if identity is None:
             raise NetworkError('newly acquired network resource is missing during readback')
+        previous = next((r.identity for r in self.receipt.resources if (r.kind, r.name) == (kind, name)), {})
+        if (kind == 'interface' and previous and provisional is not True and
+                identity.get('ifindex') != previous.get('ifindex')):
+            raise NetworkError('interface was replaced during configuration')
+        if kind == 'interface' and (provisional is True or (provisional is None and previous.get('provisional'))):
+            identity['provisional'] = True
         if kind == 'nft_table' and (type(identity['handle']) is not int or identity['handle'] <= 0 or
                                    identity['comment'] != 'wgps:' + self.receipt.attempt_id):
             raise NetworkError('new nft table lacks its required handle and attempt marker')
@@ -436,7 +460,7 @@ class Network:
         # A timeout/death between them must not turn into name-only adoption.
         self.uncertain = True
         self._run(*argv, input=input)
-        result = self._capture(kind, name)
+        result = self._capture(kind, name, provisional=kind == 'interface')
         self.uncertain = False
         return result
 
@@ -448,6 +472,17 @@ class Network:
         if name == 'preferred':
             args += ('dev', a.interface, 'src', self.profile.address.split('/')[0])
         return args
+
+    def _firewall(self, profile):
+        a = self.allocation
+        return Firewall(profile.address.split('/')[0], profile.resolver,
+                        interface=a.interface, table=a.nft_table, mask=a.mask, mark=a.mark, zone=a.zone)
+
+    def preflight_peer(self, target):
+        """Reject incompatible firewall inputs or underlay before switch intent."""
+        if self._firewall(self.profile).render() != self._firewall(target).render():
+            raise NetworkError('peer switch would change packet-level safety rules')
+        _underlay(target, self._snapshot()['links'], self.runner)
 
     def _rule_argv(self, action):
         a = self.allocation
@@ -500,7 +535,7 @@ class Network:
         self._run('sysctl', '-w', 'net.ipv4.conf.wgps0.route_localnet=1')
         self._capture('sysctl', 'route_localnet')
         self._run('ip', 'link', 'set', 'dev', a.interface, 'up')
-        self._capture('interface', a.interface)
+        self._capture('interface', a.interface, provisional=False)
 
     def prepare(self, *, guard_blocked, on_receipt=None):
         """on_receipt runs once the new empty receipt is durable, before any mutation."""
@@ -521,8 +556,7 @@ class Network:
         a = self.allocation
         self._acquire('route', 'fallback', *self._route_argv('add', 'fallback'))
         self._acquire('rule', 'vpn', *self._rule_argv('add'))
-        firewall = Firewall(self.profile.address.split('/')[0], self.profile.resolver,
-                            interface=a.interface, table=a.nft_table, mask=a.mask, mark=a.mark, zone=a.zone)
+        firewall = self._firewall(self.profile)
         marker = 'wgps:' + self.receipt.attempt_id
         script = firewall.render().replace(
             f'table inet {a.nft_table} {{', f'create table inet {a.nft_table} {{\n comment "{marker}";', 1)
@@ -573,7 +607,8 @@ class Network:
             changed.append('allocation:foreign')
         required = {kind + ':' + name for kind, name in self._required()}
         private_pending = any(r.kind in ('private_file', 'private_directory') for r in self.receipt.resources)
-        ready = self._configured_interface() and required.issubset(matching) and not missing and not changed and not private_pending
+        pending = any(r.identity.get('repair_pending') for r in self.receipt.resources)
+        ready = self._configured_interface() and required.issubset(matching) and not missing and not changed and not private_pending and not pending
         return Health(tuple(matching), tuple(missing), tuple(changed), ready)
 
     def _required(self):
@@ -621,6 +656,8 @@ class Network:
     def _configured_interface(self):
         a, p = self.allocation, self.profile
         interface = next((r.identity for r in self.receipt.resources if r.kind == 'interface'), {})
+        if interface.get('provisional'):
+            return False
         expected = {'kind': 'wireguard', 'alias': 'wgps:' + self.receipt.attempt_id,
                     'mtu': p.mtu, 'up': True, 'addresses': [p.address], 'prefix_route_flags': [True],
                     'fwmark': a.outer_mark, 'peers': [[p.public_key]],
@@ -645,7 +682,7 @@ class Network:
         if health.ready:
             return self.receipt
         temporary = [r for r in self.receipt.resources if r.kind in ('private_file', 'private_directory')]
-        if temporary and not health.changed:
+        if not health.changed:
             # An interrupted repair left its temporary configuration; remove
             # exactly that (verified), then repair what is still missing.
             for kind in ('private_file', 'private_directory'):
@@ -672,6 +709,12 @@ class Network:
                                 self._observe(resource, self._snapshot()),
                                 boot_id=self.boot_id, attempt_id=self.receipt.attempt_id)
             self._run('ip', 'link', 'delete', 'dev', a.interface)
+            health = self.health()
+        preferred = next((r for r in self.receipt.resources if r.kind == 'route' and r.name == 'preferred'), None)
+        if preferred and preferred.identity.get('repair_pending') and 'route:preferred' in health.matching:
+            own.verify_resource(self.receipt, 'route', 'preferred', self._observe(preferred, self._snapshot()),
+                                boot_id=self.boot_id, attempt_id=self.receipt.attempt_id)
+            self._run(*self._route_argv('delete', 'preferred'))
             health = self.health()
         missing = set(health.missing)
         if (health.changed or not anchors.issubset(health.matching) or
@@ -710,6 +753,85 @@ class Network:
         if self._run('conntrack', '-L', '--zone', str(a.zone), '-o', 'extended').strip():
             raise NetworkError('owned conntrack zone still contains flows after cleanup')
 
+    def switch_peer(self, target, *, guard_blocked):
+        """Keep packet-level safety anchors, including across interrupted switches.
+
+        A blocked LSM guard does not stop already-queued TCP retransmissions.
+        Therefore the rule, unreachable route, nft drop rules and zone binding
+        must never disappear. Only the preferred route and WG interface change.
+        Their old records remain as absence/replacement fences for repair_missing.
+        The nft receipt's profile digest is rebound only after verifying its exact
+        unchanged kernel identity; that digest records which configuration is
+        being installed if the controller dies before committing its peer index.
+        """
+        if guard_blocked is not True or self.uncertain or self.receipt is None:
+            raise NetworkError('peer switch requires a blocked guard and owned network')
+        bound, target_digest = self._bind_pending_peer(target)
+        health = self.health()
+        a = self.allocation
+        anchors = {'route:fallback', 'rule:vpn', 'nft_table:' + a.nft_table, 'conntrack_zone:vpn'}
+        replaceable = {'route:preferred', 'interface:' + a.interface, 'sysctl:route_localnet'}
+        temporary = {r.kind + ':' + r.name for r in self.receipt.resources
+                     if r.kind in ('private_file', 'private_directory')}
+        if health.changed or not anchors.issubset(health.matching) or not set(health.missing) <= replaceable | temporary:
+            raise NetworkError('peer switch requires intact packet-level safety anchors')
+        if bound == target_digest and health.ready:
+            return self.receipt  # Repair completed before the controller committed.
+        for kind in ('private_file', 'private_directory'):
+            for resource in [r for r in self.receipt.resources if r.kind == kind]:
+                self._remove(resource)
+        self._sweep_private(self.receipt.attempt_id)
+        # Keep each record so a death after delete is a provable missing object.
+        for kind, name, argv in (
+                ('route', 'preferred', self._route_argv('delete', 'preferred')),
+                ('interface', a.interface, ('ip', 'link', 'delete', 'dev', a.interface))):
+            resource = next((r for r in self.receipt.resources if (r.kind, r.name) == (kind, name)), None)
+            if resource is None:
+                raise NetworkError('peer switch lost a tunnel ownership fence')
+            live = self._observe(resource, self._snapshot())
+            if live is not None:
+                own.verify_resource(self.receipt, kind, name, live,
+                                    boot_id=self.boot_id, attempt_id=self.receipt.attempt_id)
+                self._run(*argv)
+        self._flush_zone()
+        health = self.health()
+        if health.changed or not anchors.issubset(health.matching) or set(health.missing) != replaceable:
+            raise NetworkError('peer switch did not preserve its safety anchors')
+        table = next(r for r in self.receipt.resources if r.kind == 'nft_table')
+        self._record('nft_table', table.name, {**table.identity, 'profile_sha256': target_digest})
+        self.profile = target
+        self.repair_missing(guard_blocked=True)
+        return self.receipt
+
+    def _bind_pending_peer(self, target):
+        """Interpret only the two configurations named by durable switch intent."""
+        old = asdict(self.profile)
+        new = asdict(target)
+        for field in ('public_key', 'endpoint_host', 'endpoint_port'):
+            old.pop(field)
+            new.pop(field)
+        if old != new:
+            raise NetworkError('peer switch cannot change client identity or firewall inputs')
+        if self._firewall(self.profile).render() != self._firewall(target).render():
+            raise NetworkError('peer switch would change packet-level safety rules')
+        table = next((r for r in self.receipt.resources if r.kind == 'nft_table'), None)
+        if table is None:
+            raise NetworkError('peer switch lost its firewall receipt')
+        target_digest = _digest(asdict(target))
+        bound = table.identity.get('profile_sha256')
+        if bound == target_digest:
+            self.profile = target
+        elif bound != _digest(asdict(self.profile)):
+            raise NetworkError('peer switch has an unrecognized profile binding')
+        return bound, target_digest
+
+    def cancel_peer_change(self, target, *, guard_blocked):
+        """Explicit disable may cancel a switch without repairing a dead tunnel."""
+        if guard_blocked is not True or self.uncertain or self.receipt is None:
+            raise NetworkError('cancel requires a blocked guard and owned network')
+        self._bind_pending_peer(target)
+        return self.disable(guard_blocked=True)
+
     def _sweep_private(self, attempt_id):
         """Remove a private configuration orphaned by a crash before its scoped removal."""
         name = 'wgps-' + attempt_id
@@ -723,9 +845,13 @@ class Network:
                 directory = own.open_private_dir(self.wireguard_root / name, owner_uid=self.owner_uid)
                 try:
                     try:
-                        os.unlink('wg.conf', dir_fd=directory)
+                        os.stat('wg.conf', dir_fd=directory, follow_symlinks=False)
                     except FileNotFoundError:
                         pass
+                    else:
+                        identity = own.file_identity(directory, 'wg.conf')
+                        own.verify_file(directory, 'wg.conf', identity)
+                        os.unlink('wg.conf', dir_fd=directory)
                     os.fsync(directory)
                 finally:
                     os.close(directory)
@@ -758,6 +884,18 @@ class Network:
                 os.close(fd)
         elif kind == 'private_directory':
             path = Path(resource.identity['path'])
+            directory = own.open_private_dir(path, owner_uid=self.owner_uid)
+            try:
+                try:
+                    os.stat('wg.conf', dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    identity = own.file_identity(directory, 'wg.conf')
+                    own.verify_file(directory, 'wg.conf', identity)
+                    os.unlink('wg.conf', dir_fd=directory)
+            finally:
+                os.close(directory)
             fd = own.open_private_dir(path.parent, owner_uid=self.owner_uid)
             try:
                 os.rmdir(path.name, dir_fd=fd)

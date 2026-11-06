@@ -17,6 +17,10 @@ class ControllerError(RuntimeError):
     """Lifecycle failure with no private input or subprocess output in diagnostics."""
 
 
+class ProbeUnavailable(ControllerError):
+    """The probe ran successfully but observed no usable VPN response."""
+
+
 def command(*argv, input=None):
     try:
         return capture(argv, input=input, timeout=30)
@@ -198,12 +202,13 @@ class NativeGuard:
         for attempt in range(attempts):
             try:
                 result = json.loads(self._run('probe-dns', self.pins))
-                if not isinstance(result, dict) or set(result) != {'dns'} or result['dns'] is not True:
+                if not isinstance(result, dict) or set(result) != {'dns'} or type(result['dns']) is not bool:
                     raise ValueError()
-                return
             except (ValueError, TypeError, ControllerError):
-                if attempt == attempts - 1:
-                    raise ControllerError('native DNS readiness probe failed') from None
+                raise ControllerError('native DNS probe could not execute') from None
+            if result['dns']:
+                return
+        raise ProbeUnavailable('native DNS readiness probe received no usable answer')
 
 
 def process_snapshot():
@@ -252,5 +257,5 @@ def readiness_probe(profile, allocation, guard):
         raise ControllerError('WireGuard peer readiness observation failed')
     age = time.time() - int(entries[0][1])
     if not 0 <= age <= 180:
-        raise ControllerError('WireGuard handshake is not recent')
+        raise ProbeUnavailable('WireGuard handshake is not recent')
     return {'dns': True, 'handshake_recent': True, 'handshake_age_seconds': int(age)}
