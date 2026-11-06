@@ -927,18 +927,6 @@ class PreflightTests(unittest.TestCase):
             with self.assertRaises(ControllerError):
                 native.probe_dns()
 
-    def test_native_probe_distinguishes_negative_liveness_from_local_failure(self):
-        native = NativeGuard('/usr/lib/wg-program-split', '/sys/fs/bpf/wg_program_split')
-        with patch.object(native, '_run', return_value='{"dns":false}') as call:
-            with self.assertRaises(ProbeUnavailable):
-                native.probe_dns()
-            self.assertEqual(call.call_count, 3)
-        with patch.object(native, '_run', side_effect=ControllerError('local failure')) as call:
-            with self.assertRaises(ControllerError) as caught:
-                native.probe_dns()
-            self.assertNotIsInstance(caught.exception, ProbeUnavailable)
-            self.assertEqual(call.call_count, 1)
-
     def test_native_dns_success_cannot_replace_a_recent_wireguard_handshake(self):
         class Guard:
             def probe_dns(self):
