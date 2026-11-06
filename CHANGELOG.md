@@ -17,7 +17,8 @@
   works from Explorer, while keeping configuration, keys and state protected.
   Add the manually invoked read-only `Get-PerformanceState.ps1` diagnostic.
 - Tests: exercise real DNS Client/ETW tunnel outages, image-resolution stalls,
-  receiver-side selected-name isolation, recovery, log contention and lifetime
+  receiver-side selected-name isolation, isolated retries after intentional
+  same-name answer withholding, recovery, log contention and lifetime
   handling. The unchanged baseline fails the outage test while direct DNS stays
   available with the new dispatcher. See [measurements and limits](docs/performance.md#november-6-2026-dns-isolation-and-reboot-verification).
 - Windows: reduce supervision polling and wait for a usable physical route at

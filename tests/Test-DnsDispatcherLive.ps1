@@ -99,6 +99,7 @@ try {
     $rounds = 60
     $selectedLanes = @{}
     $directLanes = @{}
+    $failedSelected = [Collections.Generic.List[int]]::new()
     foreach ($index in 1..$rounds) {
         $name = "pair-$index.$zone"
         $order = if ($index % 2) { @('selected', 'direct') } else { @('direct', 'selected') }
@@ -113,11 +114,39 @@ try {
             $counts = if ($probe.Lane -eq 'selected') { $selectedLanes } else { $directLanes }
             $counts[$answer] = 1 + [int]$counts[$answer]
             if ($probe.Lane -eq 'selected' -and $answer -eq '192.0.2.2') { throw "Selected DNS took the direct lane for $name." }
+            if ($probe.Lane -eq 'selected' -and $answer -eq 'failed') { $failedSelected.Add($index) }
         }
     }
     $describe = { param($Counts) ($Counts.Keys | Sort-Object | ForEach-Object { "$_ x$($Counts[$_])" }) -join ', ' }
     Write-Output "OBSERVED: $rounds concurrent same-name pairs; selected answers $(& $describe $selectedLanes); unlisted answers $(& $describe $directLanes)."
-    if ([int]$selectedLanes['192.0.2.1'] -lt $rounds * 0.9) { throw 'Too few selected lookups were answered in the tunnel lane.' }
+    if ([int]$selectedLanes['192.0.2.1'] + $failedSelected.Count -ne $rounds) { throw 'A selected lookup returned an unexpected answer.' }
+    # Windows may merge the selected lookup into an already in-flight direct
+    # query. Withholding that answer is the required privacy behavior, and the
+    # caller receives SERVFAIL. Scheduling therefore controls the success ratio;
+    # require explicit withholding evidence and a successful isolated retry.
+    foreach ($index in $failedSelected) {
+        $name = "pair-$index.$zone"
+        $escaped = [regex]::Escape($name)
+        $drain = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $raceLog = Read-SharedText (Join-Path $root 'dispatcher.log')
+            $withheld = $raceLog -match "(?m)^DNS $escaped type=1 -> DIRECT[^\r\n]* WITHHELD \(selected lookup of the same name\)"
+            if ($withheld) { break }
+            Start-Sleep -Milliseconds 25
+        } while ($drain.Elapsed.TotalSeconds -lt 2)
+        if (-not $withheld) {
+            [regex]::Matches($raceLog, "(?m)^(HINT|DNS) $escaped [^\r\n]*") | ForEach-Object { Write-Output "DETAIL: $($_.Value)" }
+            throw "Selected lookup failed without a withholding decision for $name."
+        }
+        $retry = Launch $selectedLane @('system-dns', $name) "selected-retry-$index"
+        if (-not $retry.WaitForExit(15000)) { throw 'An isolated selected retry timed out.' }
+        $retryText = Read-SharedText (Join-Path $root "selected-retry-$index.out")
+        if ($retry.ExitCode -ne 0 -or $retryText -notmatch 'ANSWER 192\.0\.2\.1') {
+            throw "Selected DNS did not recover through the tunnel on retry for $name."
+        }
+    }
+    Write-Output "OBSERVED: $($failedSelected.Count) selected race refusals had explicit withholding evidence and successful tunnel retries."
+
 
     # Truncated UDP answers while unlisted lookups of the same name keep raising events. For "tc-" names the
     # dispatcher completes the answer over TCP on the route it chose and returns it over UDP, so the client
