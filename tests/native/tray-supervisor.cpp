@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../../src/native/tray-supervisor.h"
+#include <cwchar>
 #include <fstream>
 #include <iostream>
 int wmain(int argc, wchar_t** argv) {
     using namespace wgps::tray;
-    if (argc == 4 && std::wstring(argv[1]) == L"--child") {
+    if (argc == 4 && std::wcscmp(argv[1], L"--child") == 0) {
         const std::filesystem::path marker(argv[3]);
         unsigned count{}; { std::ifstream input(marker); input >> count; }
         { std::ofstream output(marker); output << count + 1; }
-        const std::wstring mode(argv[2]);
-        return mode == L"clean" || (mode == L"once" && count) ? 0 : 7;
+        return std::wcscmp(argv[2], L"clean") == 0 ||
+            (std::wcscmp(argv[2], L"once") == 0 && count) ? 0 : 7;
     }
     if (argc != 2) return 2;
     try {
@@ -19,9 +20,11 @@ int wmain(int argc, wchar_t** argv) {
         for (const auto* mode : {L"clean", L"once", L"always"}) {
             const auto marker = root + L"\\supervisor-" + mode + L".txt";
             DeleteFileW(marker.c_str());
-            const DWORD code = supervise(image, L"--child " + std::wstring(mode) + L" " + quote(marker), root, 10);
+            std::wstring arguments = L"--child "; arguments += mode;
+            arguments += L" "; arguments += quote(marker);
+            const DWORD code = supervise(image, arguments, root, 10);
             unsigned count{}; { std::ifstream input{std::filesystem::path(marker)}; input >> count; }
-            const unsigned expected = std::wstring(mode) == L"clean" ? 1 : std::wstring(mode) == L"once" ? 2 : 4;
+            const unsigned expected = std::wcscmp(mode, L"clean") == 0 ? 1 : std::wcscmp(mode, L"once") == 0 ? 2 : 4;
             if (count != expected || (code == 0) != (expected != 4))
                 throw std::runtime_error("supervisor retry/clean-exit contract");
         }
