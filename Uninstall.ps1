@@ -52,8 +52,10 @@ $taskScripts = @{
 $ownedTasks = @{}
 foreach ($taskName in @($plan.LegacyControllerTask, $plan.TrayTask)) {
     $task = Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
-    if ($task -and -not (Test-ProgramSplitTaskOwnership -Task $task -PowerShellPath $powerShell `
-            -ScriptPath $taskScripts[$taskName])) {
+    $owned = if (-not $task) { $true }
+        elseif ($taskName -eq $plan.TrayTask) { Test-ProgramSplitTrayTaskOwnership -Task $task -Root $fullRoot }
+        else { Test-ProgramSplitTaskOwnership -Task $task -PowerShellPath $powerShell -ScriptPath $taskScripts[$taskName] }
+    if (-not $owned) {
         throw "Refusing to remove the same-name foreign scheduled task: $taskName"
     }
     if ($task) { $ownedTasks[$taskName] = $task }

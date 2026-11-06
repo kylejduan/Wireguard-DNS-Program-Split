@@ -58,7 +58,7 @@ if (-not $applicationPaths) { throw 'At least one application is required.' }
 $runtimeFiles = @('tunnel.dll', 'wireguard.dll')
 $driverFiles = @('PiaWFPCallout.inf', 'PiaWfpCallout.sys', 'piawfpcallout.cat')
 $projectExecutables = @('controller-service.exe', 'dns-dispatcher.exe', 'dns-probe.exe',
-    'tunnel-host.exe', 'wfp-probe.exe')
+    'tunnel-host.exe', 'wfp-probe.exe', 'tray.exe')
 foreach ($path in @(
     $runtimeFiles | ForEach-Object { Join-Path $WireGuardRuntimeDirectory $_ }
     $driverFiles | ForEach-Object { Join-Path $PiaDriverDirectory $_ }
@@ -179,10 +179,8 @@ try {
     & sc.exe failureflag $plan.ControllerServiceName 1 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to enable controller recovery for non-crash failures.' }
 
-    $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $trayAction = New-ScheduledTaskAction -Execute $powerShell -Argument (
-        Get-ProgramSplitTaskArguments -ScriptPath (Join-Path $DestinationRoot 'src\Tray.ps1'))
+    $trayAction = New-ScheduledTaskAction -Execute (Join-Path $DestinationRoot 'bin\tray.exe')
     $traySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries

@@ -127,9 +127,7 @@ try {
         throw 'Upgrade the legacy controller scheduled task to a service before relocating.'
     }
     $tray = Get-ScheduledTask -TaskName $trayName -TaskPath '\'
-    $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    if (-not (Test-ProgramSplitTaskOwnership -Task $tray -PowerShellPath $powerShell `
-            -ScriptPath (Join-Path $SourceRoot 'src\Tray.ps1'))) { throw 'Tray task ownership mismatch.' }
+    if (-not (Test-ProgramSplitTrayTaskOwnership -Task $tray -Root $SourceRoot)) { throw 'Tray task ownership mismatch.' }
     $hashes = @{}
     foreach ($relative in @('config\settings.json', 'profiles\WireGuardSplit.conf',
             'state\included-apps.txt', 'state\enabled', 'state\installation.json')) {
@@ -145,7 +143,7 @@ try {
     # against components it does not match, so a different release is refused before anything changes.
     $mismatches = @(Get-ProgramSplitMigrationMismatches -InstalledRoot $SourceRoot -RepositoryRoot $PSScriptRoot `
         -BuildDirectory $BuildDirectory -ReplacedScripts $scriptNames -Executables @(
-            'controller-service.exe', 'dns-dispatcher.exe', 'dns-probe.exe', 'tunnel-host.exe', 'wfp-probe.exe'))
+            'controller-service.exe', 'dns-dispatcher.exe', 'dns-probe.exe', 'tunnel-host.exe', 'wfp-probe.exe', 'tray.exe'))
     if ($mismatches.Count) {
         throw ("Migration only relocates an installation of this release and replaces $($scriptNames -join ', '). " +
             "These installed files differ from this repository and its build: $($mismatches -join ', '). " +
@@ -174,8 +172,7 @@ try {
         -HostPath (Join-Path $activeRoot 'bin\controller-service.exe') -ArgumentPath (Join-Path $activeRoot 'src\Controller.ps1'))
     Set-ServiceCommand $tunnelName (Get-ProgramSplitServiceCommand `
         -HostPath (Join-Path $activeRoot 'bin\tunnel-host.exe') -ArgumentPath (Join-Path $activeRoot 'profiles\WireGuardSplit.conf'))
-    $action = New-ScheduledTaskAction -Execute $powerShell -Argument (
-        Get-ProgramSplitTaskArguments -ScriptPath (Join-Path $activeRoot 'src\Tray.ps1'))
+    $action = New-ScheduledTaskAction -Execute (Join-Path $activeRoot 'bin\tray.exe')
     Set-ScheduledTask -TaskName $trayName -TaskPath '\' -Action $action | Out-Null
     foreach ($relative in $hashes.Keys) {
         if ((Get-FileHash -LiteralPath (Join-Path $activeRoot $relative)).Hash -ne $hashes[$relative]) {

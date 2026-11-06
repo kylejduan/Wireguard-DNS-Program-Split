@@ -18,3 +18,5 @@ mkdir -p "$output"
   -o "$output/controller-service.exe" -lws2_32
 "$compiler" "${common[@]}" -municode "$repo_root/src/native/wfp-probe.cpp" \
   -o "$output/wfp-probe.exe" -lfwpuclnt -lrpcrt4 -lole32 -lws2_32
+"$compiler" "${common[@]}" -municode -mwindows "$repo_root/src/native/tray.cpp" \
+  -o "$output/tray.exe" -lshell32 -lcomdlg32 -luser32 -lcrypt32

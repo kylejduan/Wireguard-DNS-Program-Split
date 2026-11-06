@@ -16,7 +16,7 @@ $encodingRoot = Join-Path ([IO.Path]::GetTempPath()) ("wgps-encoding-test-{0}" -
 [IO.Directory]::CreateDirectory($encodingRoot) | Out-Null
 try {
     $definitions = @{}
-    foreach ($entry in @(@('Tray.ps1', 'Get-IncludedApps'), @('Tray.ps1', 'Save-IncludedApps'), @('Invoke-WfpFilters.ps1', 'Get-IncludedPaths'))) {
+    foreach ($entry in @(@('TrayActions.ps1', 'Get-IncludedApps'), @('TrayActions.ps1', 'Save-IncludedApps'), @('Invoke-WfpFilters.ps1', 'Get-IncludedPaths'))) {
         $tokens = $null
         $errors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $RepositoryRoot "src\powershell\$($entry[0])"), [ref]$tokens, [ref]$errors)

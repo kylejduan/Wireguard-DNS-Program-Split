@@ -25,7 +25,7 @@ try {
         (Join-Path $driver 'PiaWFPCallout.inf'), (Join-Path $driver 'PiaWfpCallout.sys'),
         (Join-Path $driver 'piawfpcallout.cat'),
         (Join-Path $build 'controller-service.exe'), (Join-Path $build 'dns-dispatcher.exe'), (Join-Path $build 'dns-probe.exe'),
-        (Join-Path $build 'tunnel-host.exe'), (Join-Path $build 'wfp-probe.exe')
+        (Join-Path $build 'tunnel-host.exe'), (Join-Path $build 'wfp-probe.exe'), (Join-Path $build 'tray.exe')
     )) { [IO.File]::WriteAllText($path, 'test') }
 
     $dummyKey = ('A' * 43) + '='

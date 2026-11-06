@@ -87,6 +87,21 @@ function Test-ProgramSplitTaskOwnership {
         [string] $arguments.Value -eq (Get-ProgramSplitTaskArguments -ScriptPath $ScriptPath)
 }
 
+function Test-ProgramSplitTrayTaskOwnership {
+    param([Parameter(Mandatory)] $Task, [Parameter(Mandatory)] [string] $Root)
+
+    $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    if (Test-ProgramSplitTaskOwnership -Task $Task -PowerShellPath $powerShell `
+            -ScriptPath (Join-Path $Root 'src\Tray.ps1')) { return $true }
+    $actions = @($Task.Actions)
+    if ($actions.Count -ne 1) { return $false }
+    $execute = $actions[0].PSObject.Properties['Execute']
+    $arguments = $actions[0].PSObject.Properties['Arguments']
+    if ($null -eq $execute) { return $false }
+    return [Environment]::ExpandEnvironmentVariables([string] $execute.Value) -eq (Join-Path $Root 'bin\tray.exe') -and
+        ($null -eq $arguments -or [string]::IsNullOrEmpty([string] $arguments.Value))
+}
+
 function Get-ProgramSplitServiceCommand {
     param(
         [Parameter(Mandatory)] [string] $HostPath,

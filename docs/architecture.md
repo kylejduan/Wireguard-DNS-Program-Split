@@ -20,7 +20,7 @@ unlisted executable ────────────────────
 - A narrowly owned NRPT `.` rule sends ordinary Windows resolver queries to the dispatcher.
 - `controller-service.exe` starts `Controller.ps1` as an automatic SYSTEM service, cooperates with ordered service stop, accepts shutdown and pre-shutdown so that a controller ended by system shutdown is reported as a clean stop, records which path ended it in `controller-service.log`, and lets Service Control Manager restart a failed controller.
 - `Controller.ps1` owns startup, recovery, and 30-second tunnel plus end-to-end split-DNS health checks. The controller service is Automatic; the tunnel service is Manual. `Invoke-Tunnel.ps1` serializes stopped-service starts and completes orphan-adapter preflight before starting the host, while adopting a service already Running/StartPending.
-- `Tray.ps1`, running as the interactive user, changes the desired state, executable list, and profile.
+- `tray.exe`, running as the interactive installing user, displays the notification icon and reads desired state. It starts the short-lived `TrayActions.ps1` helper only for changes to the desired state, executable list, or profile. The helper retains the guarded profile replacement and rollback transaction. `Tray.ps1` remains a compatibility launcher for older task registrations.
 
 ## Payload filters
 

@@ -28,7 +28,10 @@ compiler=${CXX:-x86_64-w64-mingw32-g++}
 "$compiler" -std=c++20 -O2 -Wall -Wextra -Werror -static \
   "$repo_root/tests/native/net-probe.cpp" -o "$repo_root/build/test-net-probe.exe" -lws2_32 -ldnsapi
 
-for executable in controller-service dns-dispatcher dns-probe wfp-probe; do
+"$compiler" -std=c++20 -O2 -Wall -Wextra -Werror -static -municode \
+  "$repo_root/tests/native/tray-action.cpp" -o "$repo_root/build/test-tray-action.exe" -lcrypt32
+
+for executable in controller-service dns-dispatcher dns-probe wfp-probe tray; do
   "$repo_root/build/$executable.exe" --self-test
 done
 
@@ -94,6 +97,10 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
 
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
   -File "$(wslpath -w "$repo_root/tests/Test-ValidationWorker.ps1")" \
+  -RepositoryRoot "$(wslpath -w "$repo_root")"
+
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  -File "$(wslpath -w "$repo_root/tests/Test-Tray.ps1")" \
   -RepositoryRoot "$(wslpath -w "$repo_root")"
 
 "$repo_root/tests/check-public-tree.sh"

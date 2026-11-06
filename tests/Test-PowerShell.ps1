@@ -377,6 +377,16 @@ try {
     Assert-True (-not (Test-ProgramSplitTaskOwnership -Task $malformedTask -PowerShellPath $powerShell `
         -ScriptPath $controller)) 'task ownership rejects an action without an executable'
 
+    $trayRoot = 'C:\Program Files\WireGuardProgramSplit'
+    $nativeTray = [pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = "$trayRoot\bin\tray.exe"; Arguments = '' }) }
+    Assert-True (Test-ProgramSplitTrayTaskOwnership -Task $nativeTray -Root $trayRoot) 'native tray task belongs to its exact installation'
+    $nativeTray.Actions[0].Arguments = '--unexpected'
+    Assert-True (-not (Test-ProgramSplitTrayTaskOwnership -Task $nativeTray -Root $trayRoot)) 'native tray with extra arguments is foreign'
+    $nativeTray.Actions[0].Arguments = ''; $nativeTray.Actions[0].Execute = 'C:\Other\tray.exe'
+    Assert-True (-not (Test-ProgramSplitTrayTaskOwnership -Task $nativeTray -Root $trayRoot)) 'same-name tray in another directory is foreign'
+    $legacyTray = [pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = $powerShell; Arguments = (Get-ProgramSplitTaskArguments -ScriptPath "$trayRoot\src\Tray.ps1") }) }
+    Assert-True (Test-ProgramSplitTrayTaskOwnership -Task $legacyTray -Root $trayRoot) 'exact legacy tray task stays recognizable'
+
     $hostExe = 'C:\ProgramData\WireGuardProgramSplit\bin\tunnel-host.exe'
     $profilePath = 'C:\ProgramData\WireGuardProgramSplit\profiles\WireGuardSplit.conf'
     $ownedService = [pscustomobject]@{ PathName = "$hostExe /service $profilePath" }
@@ -744,7 +754,7 @@ try {
     Clear-ProgramSplitStoppedMarker -Path $lockedMarker
     Assert-True (-not (Test-Path -LiteralPath $lockedMarker)) 'stopped-marker clearing confirms absence'
 
-    $traySource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Tray.ps1'))
+    $traySource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\TrayActions.ps1'))
     $controllerSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\Controller.ps1'))
     Assert-True ($traySource -match '(?s)catch \{.*Restore-ProgramSplitProfilePair.*-StoppedMarker \$stackStoppedFile') `
         'tray delegates rollback to the stopped-controller profile-pair restore'
