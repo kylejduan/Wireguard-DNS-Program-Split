@@ -66,6 +66,7 @@ function Import-Profile([string] $InputPath) {
         while (-not (Test-Path -LiteralPath $stackStoppedFile -PathType Leaf) -and $stopWait.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Milliseconds 250 }
         if (-not (Test-Path -LiteralPath $stackStoppedFile -PathType Leaf)) { throw 'The controller did not stop the managed stack.' }
         $stopConfirmed = $true
+        if (Test-Path -LiteralPath $activeFile) { throw 'The stopped stack still has an active marker; the profile was not changed.' }
 
         $prepared = "$activeProfile.new"
         $preparedSettings = "$activeSettings.new"

@@ -78,7 +78,7 @@ while([DateTime]::UtcNow -lt $until){
    if($settings.TunnelAddress -eq '192.0.2.254') {Remove-Item $active -Force -ErrorAction SilentlyContinue}
    elseif(-not (Test-Path $active)){[IO.File]::WriteAllText($active,'fixture')}
   }else{
-   Remove-Item $active -Force -ErrorAction SilentlyContinue
+   if(-not (Test-Path (Join-Path $state 'stale-active'))){Remove-Item $active -Force -ErrorAction SilentlyContinue}
    if(-not (Test-Path $stopped)){[IO.File]::WriteAllText($stopped,'fixture')}
   }
  }catch{}
@@ -102,6 +102,13 @@ while([DateTime]::UtcNow -lt $until){
         (Get-FileHash (Join-Path $root 'profiles\WireGuardSplit.conf')).Hash -eq $beforeBusyProfile -and
         (Get-FileHash (Join-Path $root 'config\settings.json')).Hash -eq $beforeBusySettings) 'a busy controller leaves the unchanged pair and restores the original enabled intent'
     Remove-Item (Join-Path $root 'state\block-stop')
+    [IO.File]::WriteAllText((Join-Path $root 'state\stale-active'), 'fixture')
+    [IO.File]::WriteAllText((Join-Path $root 'state\active'), 'stale')
+    & $runner $root Import $profileInput
+    Assert-True ($LASTEXITCODE -ne 0 -and (Test-Path (Join-Path $root 'state\enabled')) -and
+        (Get-FileHash (Join-Path $root 'profiles\WireGuardSplit.conf')).Hash -eq $beforeBusyProfile -and
+        (Get-FileHash (Join-Path $root 'config\settings.json')).Hash -eq $beforeBusySettings) 'a stale active marker cannot fake imported-profile readiness'
+    Remove-Item (Join-Path $root 'state\stale-active')
     & $runner $root Import $profileInput
     Assert-True ($LASTEXITCODE -eq 0 -and ([IO.File]::ReadAllText((Join-Path $root 'config\settings.json')) | ConvertFrom-Json).TunnelAddress -eq '192.0.2.3') 'the real profile transaction commits after the fixture confirms readiness'
     Assert-True (-not (Test-Path (Join-Path $root 'profiles\WireGuardSplit.conf.previous')) -and -not (Test-Path (Join-Path $root 'state\keep-filters.request'))) 'successful import clears the temporary hold after confirmed readiness'
