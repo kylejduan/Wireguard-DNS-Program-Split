@@ -161,12 +161,14 @@ class Action {
         Handle done{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
         std::atomic_bool stop{};
         std::mutex mutex;
+        bool finishMutation{};
         Result result;
     };
     std::shared_ptr<State> state_;
     std::thread thread_;
     static Result run(const std::wstring& root, const std::wstring& child, DWORD timeout,
                       const std::shared_ptr<State>& state) {
+        if (state->stop) throw std::runtime_error("Tray action cancelled");
         const std::wstring runner = root + L"\\bin\\controller-service.exe";
         std::wstring command = quote(runner) + L" --run " + std::to_wstring(timeout) + L" " + base64(child);
         SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
@@ -223,6 +225,11 @@ class Action {
             value = selected.message.substr(7);
             action = action == L"PickAdd" ? L"Add" : L"Import";
         }
+        if (action != L"Status") {
+            std::lock_guard lock(state->mutex);
+            if (state->stop) throw std::runtime_error("Tray action cancelled");
+            state->finishMutation = true;
+        }
         wchar_t system[MAX_PATH]{};
         if (!GetSystemDirectoryW(system, MAX_PATH)) throw std::runtime_error("Cannot find Windows PowerShell");
         const std::wstring ps = std::wstring(system) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
@@ -235,7 +242,13 @@ class Action {
 public:
     ~Action() {
         if (!thread_.joinable()) return;
-        state_->stop = true;
+        {
+            std::lock_guard lock(state_->mutex);
+            // Closing the UI must not interrupt a profile swap or a list write.
+            // The separate runner keeps its own deadline and process-tree job.
+            if (state_->finishMutation && busy()) { thread_.detach(); return; }
+            state_->stop = true;
+        }
         if (WaitForSingleObject(state_->done.value, 6000) == WAIT_OBJECT_0) thread_.join();
         else thread_.detach(); // Shared state, never a borrowed UI pointer.
     }

@@ -141,6 +141,13 @@ Start-Sleep -Seconds 60
     } while ([DateTime]::UtcNow -lt $deadline)
     Assert-True (-not $child -or $child.HasExited) 'closing the action kills its PowerShell descendant'
     if ($child) { $child.Dispose() }
+    Remove-Item -LiteralPath $pidFile
+    [IO.File]::WriteAllText((Join-Path $root 'src\TrayActions.ps1'), '$PID | Set-Content -LiteralPath (Join-Path $PSScriptRoot ''..\child-pid.txt'')' + "`r`nStart-Sleep -Seconds 2`r`n" + '[IO.File]::WriteAllText((Join-Path $PSScriptRoot ''..\finished.txt''), ''done'')')
+    & $runner $root Finish
+    Assert-True ($LASTEXITCODE -eq 0) 'the mutation fixture starts before its UI owner exits'
+    $finishDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not (Test-Path (Join-Path $root 'finished.txt')) -and [DateTime]::UtcNow -lt $finishDeadline) { Start-Sleep -Milliseconds 100 }
+    Assert-True (Test-Path (Join-Path $root 'finished.txt')) 'an already-started mutation finishes after its UI owner exits'
     Write-Output 'PASS: native tray and pickers, Unicode actions, serialized mutations, profile commit/rollback, last-app protection, and cancellation containment.'
 } finally {
     if ($controller) { try { if (-not $controller.HasExited) { $controller.Kill(); $null = $controller.WaitForExit(5000) } } finally { $controller.Dispose() } }
