@@ -12,6 +12,13 @@ using namespace wgps::tray;
 constexpr UINT callback = WM_APP + 1;
 constexpr UINT toggle = 1, add = 2, importProfile = 3, logs = 4, lastError = 5, quit = 6, removeBase = 100;
 const wchar_t* title = L"WireGuard Program Split";
+#ifdef WGPS_TRAY_TEST_INSTANCE
+constexpr const wchar_t* uiMutexName = nullptr;
+constexpr const wchar_t* hostMutexName = nullptr;
+#else
+constexpr const wchar_t* uiMutexName = L"Global\\WireGuardProgramSplitTray";
+constexpr const wchar_t* hostMutexName = L"Global\\WireGuardProgramSplitTrayHost";
+#endif
 struct ComScope {
     HRESULT status{CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)};
     ComScope() { if (FAILED(status)) throw std::runtime_error("Cannot initialize the Windows shell"); }
@@ -161,6 +168,9 @@ struct Tray {
             if (taskbarCreated && !ChangeWindowMessageFilterEx(window, taskbarCreated, MSGFLT_ALLOW, nullptr)) return -1;
             update(true);
             if (!SetTimer(window, 1, smoke ? 100 : 2000, nullptr)) return -1;
+#ifdef WGPS_TRAY_TEST_INSTANCE
+            if (!smoke) start(L"Status");
+#endif
             return 0;
         case WM_TIMER:
             if (smoke) { DestroyWindow(window); return 0; }
@@ -261,7 +271,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                 if (!exists(root + path)) throw std::runtime_error("Missing tray installation input");
         }
         if (command.empty()) {
-            Handle host(CreateMutexW(nullptr, FALSE, L"Global\\WireGuardProgramSplitTrayHost"));
+            Handle host(CreateMutexW(nullptr, FALSE, hostMutexName));
             if (!host.value) throw std::runtime_error("Cannot open tray supervisor mutex");
             const DWORD held = WaitForSingleObject(host.value, 0);
             if (held == WAIT_TIMEOUT) return 0;
@@ -272,7 +282,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             if (code) throw std::runtime_error("The tray UI repeatedly failed. Start it again after resolving the failure.");
             return 0;
         }
-        Handle mutex(CreateMutexW(nullptr, FALSE, smoke ? nullptr : L"Global\\WireGuardProgramSplitTray"));
+        Handle mutex(CreateMutexW(nullptr, FALSE, smoke ? nullptr : uiMutexName));
         if (!mutex.value) throw std::runtime_error("Cannot open tray instance mutex");
         const DWORD held = WaitForSingleObject(mutex.value, 0);
         if (held == WAIT_TIMEOUT) return 0;

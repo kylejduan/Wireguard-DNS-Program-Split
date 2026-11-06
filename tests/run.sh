@@ -43,6 +43,10 @@ compiler=${CXX:-x86_64-w64-mingw32-g++}
   "$repo_root/tests/native/tray-backstop.cpp" -o "$repo_root/build/test-tray-backstop.exe" -lcrypt32
 "$compiler" -std=c++20 -O2 -Wall -Wextra -Werror -static -municode \
   "$repo_root/tests/native/tray-supervisor.cpp" -o "$repo_root/build/test-tray-supervisor.exe" -lcrypt32
+"$compiler" -std=c++20 -O2 -Wall -Wextra -Werror -static -municode \
+  "$repo_root/tests/native/tray-host-lifecycle.cpp" -o "$repo_root/build/test-tray-host-lifecycle.exe" -lcrypt32
+"$compiler" -std=c++20 -O2 -Wall -Wextra -Werror -static -municode -mwindows -DWGPS_TRAY_TEST_INSTANCE \
+  "$repo_root/src/native/tray.cpp" -o "$repo_root/build/test-tray-ui.exe" -lshell32 -lcomdlg32 -luser32 -lcrypt32 -lole32
 
 for executable in controller-service dns-dispatcher dns-probe wfp-probe tray; do
   "$repo_root/build/$executable.exe" --self-test

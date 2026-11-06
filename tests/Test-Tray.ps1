@@ -12,7 +12,7 @@ try {
     foreach ($dir in @('bin', 'src', 'config', 'profiles', 'state')) {
         [IO.Directory]::CreateDirectory((Join-Path $root $dir)) | Out-Null
     }
-    foreach ($name in @('controller-service.exe', 'tray.exe', 'test-tray-action.exe', 'test-tray-dialog.exe', 'test-tray-session.exe', 'test-tray-backstop.exe', 'test-tray-supervisor.exe', 'test-tray-stub.exe')) {
+    foreach ($name in @('controller-service.exe', 'tray.exe', 'test-tray-action.exe', 'test-tray-dialog.exe', 'test-tray-session.exe', 'test-tray-backstop.exe', 'test-tray-supervisor.exe', 'test-tray-host-lifecycle.exe', 'test-tray-stub.exe')) {
         Copy-Item -LiteralPath (Join-Path $RepositoryRoot "build\$name") -Destination (Join-Path $root 'bin')
     }
     foreach ($name in @('Common.ps1', 'Tray.ps1', 'TrayActions.ps1', 'Prepare-Profile.ps1')) {
@@ -186,6 +186,14 @@ Start-Sleep -Seconds 60
     [IO.File]::WriteAllText((Join-Path $root 'src\TrayActions.ps1'), '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); [Console]::Error.WriteLine("failure: " + [char]0x03bb); exit 7')
     & $runner $root CheckUnicode
     Assert-True ($LASTEXITCODE -eq 0) 'Unicode error output survives the native and PowerShell result path'
+    # Exercise the real host and UI on an invisible desktop. The test build uses
+    # anonymous instance mutexes, so it cannot interfere with an installed tray.
+    $helperSource = [IO.File]::ReadAllText((Join-Path $RepositoryRoot 'src\powershell\TrayActions.ps1')).Replace('Global\WireGuardProgramSplitTrayAction', $mutexName)
+    $helperSource = $helperSource.Replace("Write-Output 'PASS: tray inputs and include list.'", "[IO.File]::WriteAllText((Join-Path `$PSScriptRoot '..\status-completed'), 'done')`nWrite-Output 'PASS: tray inputs and include list.'")
+    [IO.File]::WriteAllText((Join-Path $root 'src\TrayActions.ps1'), $helperSource)
+    Copy-Item (Join-Path $RepositoryRoot 'build\test-tray-ui.exe') (Join-Path $root 'bin\tray.exe') -Force
+    & (Join-Path $root 'bin\test-tray-host-lifecycle.exe') $root
+    Assert-True ($LASTEXITCODE -eq 0) 'a clean UI close after an action ends the real supervisor without resurrection'
     Write-Output 'PASS: native tray and pickers, Unicode actions, serialized mutations, profile commit/rollback, last-app protection, and cancellation containment.'
 } finally {
     if ($controller) { try { if (-not $controller.HasExited) { $controller.Kill(); $null = $controller.WaitForExit(5000) } } finally { $controller.Dispose() } }
