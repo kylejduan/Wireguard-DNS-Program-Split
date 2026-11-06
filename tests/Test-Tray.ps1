@@ -52,7 +52,7 @@ try {
     $smoke.Dispose()
     # Interrupt a real action while its PowerShell child is blocked. The runner's job must kill it.
     $pidFile = Join-Path $root 'child-pid.txt'
-    [IO.File]::WriteAllText((Join-Path $root 'src\TrayActions.ps1'), ('$PID | Set-Content -LiteralPath ' + "'$pidFile'" + "`r`nStart-Sleep -Seconds 60"))
+    [IO.File]::WriteAllText((Join-Path $root 'src\TrayActions.ps1'), '$PID | Set-Content -LiteralPath (Join-Path $PSScriptRoot ''..\child-pid.txt'')' + "`r`nStart-Sleep -Seconds 60")
     & $runner $root Cancel
     Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $pidFile)) 'cancellation fixture started a real PowerShell child'
     $childId = [int][IO.File]::ReadAllText($pidFile).Trim()
