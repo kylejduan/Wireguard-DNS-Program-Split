@@ -25,7 +25,8 @@ unlisted executable ────────────────────
 The native tray has no role in forwarding packets or resolving DNS. Its
 small parent process waits for the UI to exit without polling, and retries an
 abnormal exit at most three times with 2/4/8-second backoff. A clean UI exit
-also exits its parent. Task Scheduler launches the parent at logon; the
+also exits its parent. Ten awake minutes of UI uptime reset the retry budget, and
+the parent suppresses relaunch when Windows reports shutdown. Task Scheduler launches the parent at logon; the
 parent provides UI crash recovery because scheduled-action failures did not
 trigger the configured restart policy on the tested Windows host. The UI's
 two-second timer reads small state files. A bounded runner supervises each
