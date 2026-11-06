@@ -120,25 +120,56 @@ try {
     $describe = { param($Counts) ($Counts.Keys | Sort-Object | ForEach-Object { "$_ x$($Counts[$_])" }) -join ', ' }
     Write-Output "OBSERVED: $rounds concurrent same-name pairs; selected answers $(& $describe $selectedLanes); unlisted answers $(& $describe $directLanes)."
     if ([int]$selectedLanes['192.0.2.1'] + $failedSelected.Count -ne $rounds) { throw 'A selected lookup returned an unexpected answer.' }
-    # Windows may merge the selected lookup into an already in-flight direct
-    # query. Withholding that answer is the required privacy behavior, and the
-    # caller receives SERVFAIL. Scheduling therefore controls the success ratio;
-    # require explicit withholding evidence and a successful isolated retry.
+    # Windows may merge the selected lookup into an in-flight direct query.
+    # Accept a refusal only when the timeline proves that overlap, with no
+    # later DIRECT decision or separate failed tunnel exchange hidden by it.
+    $drain = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $raceLog = Read-SharedText (Join-Path $root 'dispatcher.log')
+        $seen = 0
+        foreach ($index in 1..$rounds) {
+            $escaped = [regex]::Escape("pair-$index.$zone")
+            if ($raceLog -match "(?m)^HINT $escaped type=1 [^\r\n]*selected=1 [^\r\n]*identity=known" -and
+                $raceLog -match "(?m)^DNS $escaped type=1 ->") { $seen++ }
+        }
+        if ($seen -eq $rounds) { break }
+        Start-Sleep -Milliseconds 25
+    } while ($drain.Elapsed.TotalSeconds -lt 2)
+    if ($seen -ne $rounds) { throw 'Not every race pair has known selected attribution and a decision.' }
+    if ($raceLog -match '(?m)^(BARRIER INCOMPLETE|ETW LOST|LOG QUEUE DROPPED|WORKERS EXHAUSTED)') {
+        throw 'The race fixture lost attribution or exhausted capacity.'
+    }
+    $raceWindow = 3 * [Diagnostics.Stopwatch]::Frequency
+    $selectedAt = @{}
+    foreach ($index in 1..$rounds) {
+        $escaped = [regex]::Escape("pair-$index.$zone")
+        $events = @([regex]::Matches($raceLog, "(?m)^HINT $escaped type=1 [^\r\n]*selected=1 [^\r\n]*event-qpc=(\d+)[^\r\n]*identity=known") |
+            ForEach-Object { [int64]$_.Groups[1].Value })
+        if (-not $events.Count) { throw "No known selected event for pair $index." }
+        $selectedAt[$index] = ($events | Measure-Object -Minimum).Minimum
+        foreach ($decision in [regex]::Matches($raceLog, "(?m)^DNS $escaped type=1 -> (TUNNEL|DIRECT)([^\r\n]*?) classify=\S+ query-qpc=(\d+)")) {
+            $arrival = [int64]$decision.Groups[3].Value
+            if ($decision.Groups[1].Value -eq 'DIRECT' -and $arrival -ge $selectedAt[$index] -and
+                $arrival -le $selectedAt[$index] + $raceWindow) {
+                throw "A race query went direct after its selected event: $($decision.Value)"
+            }
+        }
+    }
     foreach ($index in $failedSelected) {
         $name = "pair-$index.$zone"
         $escaped = [regex]::Escape($name)
-        $drain = [Diagnostics.Stopwatch]::StartNew()
-        do {
-            $raceLog = Read-SharedText (Join-Path $root 'dispatcher.log')
-            $withheld = $raceLog -match "(?m)^DNS $escaped type=1 -> DIRECT[^\r\n]* WITHHELD \(selected lookup of the same name\)"
-            $knownSelected = $raceLog -match "(?m)^HINT $escaped type=1 [^\r\n]*selected=1 [^\r\n]*identity=known"
-            if ($withheld -and $knownSelected) { break }
-            Start-Sleep -Milliseconds 25
-        } while ($drain.Elapsed.TotalSeconds -lt 2)
-        if (-not $withheld -or -not $knownSelected) {
-            [regex]::Matches($raceLog, "(?m)^(HINT|DNS) $escaped [^\r\n]*") | ForEach-Object { Write-Output "DETAIL: $($_.Value)" }
-            throw "Selected lookup failed without known selected attribution and withholding for $name."
+        $evidence = @([regex]::Matches($raceLog, "(?m)^(HINT|DNS) $escaped [^\r\n]*") |
+            ForEach-Object { $_.Value })
+        $evidence | ForEach-Object { Write-Output "RACE EVIDENCE: $_" }
+        $original = Read-SharedText (Join-Path $root "selected-pair-$index.out")
+        if ($original -notmatch 'system DNS query error 9002') { throw "Non-SERVFAIL selected error for $name." }
+        if ($raceLog -match "(?m)^DNS $escaped [^\r\n]*(?:-> (?:TUNNEL|BLOCKED)|\bFAILED\b|tunnel lane full)" -or
+            $raceLog -match "(?m)^HINT $escaped type=1 [^\r\n]*identity=(?:none|pending)") {
+            throw "A separate routing or identity failure affected $name."
         }
+        $withheldBefore = @([regex]::Matches($raceLog, "(?m)^DNS $escaped type=1 -> DIRECT[^\r\n]* WITHHELD \(selected lookup of the same name\)[^\r\n]*query-qpc=(\d+)") |
+            Where-Object { [int64]$_.Groups[1].Value -lt $selectedAt[$index] })
+        if (-not $withheldBefore.Count) { throw "No pre-selected-event withheld exchange explains $name." }
         $retry = Launch $selectedLane @('system-dns', $name) "selected-retry-$index"
         if (-not $retry.WaitForExit(15000)) { throw 'An isolated selected retry timed out.' }
         $retryText = Read-SharedText (Join-Path $root "selected-retry-$index.out")
@@ -146,8 +177,7 @@ try {
             throw "Selected DNS did not recover through the tunnel on retry for $name."
         }
     }
-    Write-Output "OBSERVED: $($failedSelected.Count) selected race refusals had known selected attribution, explicit withholding evidence and successful tunnel retries."
-
+    Write-Output "OBSERVED: $($failedSelected.Count) selected race refusals were explained by pre-event withholding only, then recovered on isolated tunnel retries."
 
     # Truncated UDP answers while unlisted lookups of the same name keep raising events. For "tc-" names the
     # dispatcher completes the answer over TCP on the route it chose and returns it over UDP, so the client
