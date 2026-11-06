@@ -449,6 +449,17 @@ class Network:
             args += ('dev', a.interface, 'src', self.profile.address.split('/')[0])
         return args
 
+    def _firewall(self, profile):
+        a = self.allocation
+        return Firewall(profile.address.split('/')[0], profile.resolver,
+                        interface=a.interface, table=a.nft_table, mask=a.mask, mark=a.mark, zone=a.zone)
+
+    def preflight_peer(self, target):
+        """Reject incompatible firewall inputs or underlay before switch intent."""
+        if self._firewall(self.profile).render() != self._firewall(target).render():
+            raise NetworkError('peer switch would change packet-level safety rules')
+        _underlay(target, self._snapshot()['links'], self.runner)
+
     def _rule_argv(self, action):
         a = self.allocation
         return ('ip', '-4', 'rule', action, 'priority', str(a.priority),
@@ -521,8 +532,7 @@ class Network:
         a = self.allocation
         self._acquire('route', 'fallback', *self._route_argv('add', 'fallback'))
         self._acquire('rule', 'vpn', *self._rule_argv('add'))
-        firewall = Firewall(self.profile.address.split('/')[0], self.profile.resolver,
-                            interface=a.interface, table=a.nft_table, mask=a.mask, mark=a.mark, zone=a.zone)
+        firewall = self._firewall(self.profile)
         marker = 'wgps:' + self.receipt.attempt_id
         script = firewall.render().replace(
             f'table inet {a.nft_table} {{', f'create table inet {a.nft_table} {{\n comment "{marker}";', 1)
@@ -767,6 +777,8 @@ class Network:
             new.pop(field)
         if old != new:
             raise NetworkError('peer switch cannot change client identity or firewall inputs')
+        if self._firewall(self.profile).render() != self._firewall(target).render():
+            raise NetworkError('peer switch would change packet-level safety rules')
         table = next((r for r in self.receipt.resources if r.kind == 'nft_table'), None)
         if table is None:
             raise NetworkError('peer switch lost its firewall receipt')

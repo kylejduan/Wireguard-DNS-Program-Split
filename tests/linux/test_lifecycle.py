@@ -14,7 +14,7 @@ from unittest.mock import patch
 from wg_program_split.controller import Controller, ControllerError, Paths
 from wg_program_split.network import Allocation, Health
 from wg_program_split import ownership as own
-from wg_program_split.preflight import NativeGuard, validate_nss, restart_audit, readiness_probe
+from wg_program_split.preflight import NativeGuard, ProbeUnavailable, validate_nss, restart_audit, readiness_probe
 from wg_program_split.config import parse_profile
 
 
@@ -926,6 +926,18 @@ class PreflightTests(unittest.TestCase):
         with patch.object(native, '_run', return_value='{"dns":1}'):
             with self.assertRaises(ControllerError):
                 native.probe_dns()
+
+    def test_native_probe_distinguishes_negative_liveness_from_local_failure(self):
+        native = NativeGuard('/usr/lib/wg-program-split', '/sys/fs/bpf/wg_program_split')
+        with patch.object(native, '_run', return_value='{"dns":false}') as call:
+            with self.assertRaises(ProbeUnavailable):
+                native.probe_dns()
+            self.assertEqual(call.call_count, 3)
+        with patch.object(native, '_run', side_effect=ControllerError('local failure')) as call:
+            with self.assertRaises(ControllerError) as caught:
+                native.probe_dns()
+            self.assertNotIsInstance(caught.exception, ProbeUnavailable)
+            self.assertEqual(call.call_count, 1)
 
     def test_native_dns_success_cannot_replace_a_recent_wireguard_handshake(self):
         class Guard:

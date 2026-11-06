@@ -11,6 +11,7 @@ from unittest.mock import patch
 import test_lifecycle as lifecycle
 from test_lifecycle import ALLOCATION, PROFILE, Died
 from wg_program_split.controller import Controller, ControllerError
+from wg_program_split.preflight import ProbeUnavailable
 from wg_program_split import failover
 from wg_program_split.config import parse_profile, ConfigError
 
@@ -66,7 +67,7 @@ class RecoveryTests(unittest.TestCase):
             self.kernel.events.append('probe')
             self.seen.append(profile)
             if profile.endpoint_host in self.dead:
-                raise RuntimeError('simulated peer outage')
+                raise ProbeUnavailable('simulated peer outage')
             return {'dns': True, 'handshake_recent': True}
         return Controller(paths=self.paths, owner_uid=os.getuid(), kernel=self.kernel,
                           network_factory=self.network_factory, host_check=lambda: None,
@@ -84,6 +85,7 @@ class RecoveryTests(unittest.TestCase):
 
         instance.switch_peer = switch_peer
         instance.cancel_peer_change = lambda target, guard_blocked: instance.disable(guard_blocked=guard_blocked)
+        instance.preflight_peer = lambda target: None
         return instance
 
     def journal(self):
@@ -151,6 +153,51 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(result['protection_verified'])
         self.assertEqual(self.journal()['failover']['active'], 0)
         self.assertNotIn('network-disable', self.kernel.events)
+
+    def test_unusable_backup_underlay_does_not_retire_working_resources(self):
+        self.controller.activate()
+        self.dead.add('192.0.2.1')
+        factory = self.controller.network_factory
+
+        def unusable(*args, **kwargs):
+            instance = factory(*args, **kwargs)
+            def reject(target):
+                raise RuntimeError('backup has no ordinary underlay')
+            instance.preflight_peer = reject
+            return instance
+
+        self.controller.network_factory = unusable
+        for _ in range(3):
+            self.controller.check()
+        self.assertIsNone(self.journal()['failover']['pending'])
+        self.assertEqual(self.journal()['failover']['active'], 0)
+        self.assertNotIn('network-switch', self.kernel.events)
+
+    def test_pool_in_memory_must_match_verified_digest(self):
+        self.controller.activate()
+        self.controller._peer_pool_digest = '0' * 64
+        with self.assertRaises(ControllerError):
+            self.controller._peer(parse_profile(PROFILE), self.journal())
+
+    def test_local_probe_failure_does_not_rotate_peers(self):
+        self.controller.activate()
+        def local_fault(*args):
+            raise ControllerError('native worker could not start')
+        self.controller.probe = local_fault
+        for _ in range(4):
+            self.controller.check()
+        self.assertEqual(self.journal()['failover']['failures'], 0)
+        self.assertNotIn('network-switch', self.kernel.events)
+
+    def test_excessive_retry_deadline_is_bounded(self):
+        self.controller.activate()
+        path = self.paths.state / 'controller.json'
+        journal = self.journal()
+        journal['failover']['retry_after'] = 10**12
+        path.write_text(json.dumps(journal))
+        self.dead.add('192.0.2.1')
+        self.controller.check()
+        self.assertLessEqual(self.journal()['failover']['retry_after'], self.now + failover.SWITCH_INTERVAL)
 
     def test_changed_pool_requires_explicit_reconfiguration(self):
         self.controller.activate()

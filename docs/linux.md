@@ -546,7 +546,9 @@ ownership evidence blocks recovery instead of adopting or deleting foreign
 resources. An explicit disable can cancel a pending switch using its recorded
 old-or-target binding without first bringing the tunnel online. All peers
 unavailable means selected applications remain blocked
-and bounded retries continue. A provider-wide outage, expired client credential
+and bounded retries continue. Local probe execution failures (for example, an
+unavailable native helper) degrade health without cycling through peers. A
+provider-wide outage, expired client credential
 or every configured server being retired still requires provider/operator
 attention. The JSON status includes the zero-based active peer index, pending
 index, failure count and boot-clock retry deadline under `failover`.

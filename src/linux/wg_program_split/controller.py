@@ -20,7 +20,7 @@ from . import failover
 from .config import (Settings, canonical_executable, parse_policy, parse_profile,
                      policy_path, settings_json)
 from .network import Allocation, Network, allocate, inspect
-from .preflight import (ControllerError, NativeGuard, check_host, process_snapshot,
+from .preflight import (ControllerError, ProbeUnavailable, NativeGuard, check_host, process_snapshot,
                         read_private, readiness_probe, restart_audit)
 
 
@@ -89,6 +89,7 @@ class Controller:
         self.processes = processes
         self._audited_at = None
         self._peer_pool = ()
+        self._peer_pool_digest = None
 
     @contextmanager
     def _locked(self, *, create=True):
@@ -114,7 +115,8 @@ class Controller:
             extra, _ = read_private(config, 'failover.json', 65536)
             self._peer_pool = failover.parse_peers(extra, profile)
             digest.update(b'\0failover\0' + extra.encode())
-        return profile, digest.hexdigest(), keys, identity
+        self._peer_pool_digest = digest.hexdigest()
+        return profile, self._peer_pool_digest, keys, identity
 
     def _journal(self, state):
         if not _present(state, 'controller.json'):
@@ -200,7 +202,8 @@ class Controller:
         rotation = journal.get('failover')
         if rotation is None:
             return profile
-        if not 1 < len(self._peer_pool) or rotation['active'] >= len(self._peer_pool):
+        if (self._peer_pool_digest != journal['profile_digest'] or
+                not 1 < len(self._peer_pool) or rotation['active'] >= len(self._peer_pool)):
             raise ControllerError('configured failover pool does not match the journal')
         return self._peer_pool[rotation['active']]
 
@@ -224,17 +227,26 @@ class Controller:
     def _failed_probe(self, state, profile, journal, identity):
         """Rotate only after repeated liveness failures with intact ownership."""
         self._block(journal)
-        health = self._network(state, profile, journal).health()
+        network = self._network(state, profile, journal)
+        health = network.health()
         if not health.ready or health.changed or health.missing:
             raise ControllerError('ownership changed during failed readiness probe')
         rotation = journal['failover']
         rotation['failures'] = min(failover.FAILURES_BEFORE_SWITCH, rotation['failures'] + 1)
         now = failover.boot_seconds()
+        rotation['retry_after'] = min(rotation['retry_after'], now + failover.SWITCH_INTERVAL)
         journal.update(state='degraded', reason='VPN readiness probe failed', probe_at=None)
         if rotation['failures'] >= failover.FAILURES_BEFORE_SWITCH and now >= rotation['retry_after']:
-            rotation.update(pending=(rotation['active'] + 1) % len(self._peer_pool), failures=0,
-                            retry_after=now + failover.SWITCH_INTERVAL)
-            journal['reason'] = 'switching configured VPN peer after repeated probe failures'
+            rotation['retry_after'] = now + failover.SWITCH_INTERVAL
+            for offset in range(1, len(self._peer_pool)):
+                target = (rotation['active'] + offset) % len(self._peer_pool)
+                try:
+                    network.preflight_peer(self._peer_pool[target])
+                except (OSError, ValueError, RuntimeError):
+                    continue
+                rotation.update(pending=target, failures=0)
+                journal['reason'] = 'switching configured VPN peer after repeated probe failures'
+                break
         identity = self._save(state, journal, identity)
         if rotation['pending'] is not None:
             self._resume_peer_change(state, profile, journal, identity)
@@ -406,7 +418,7 @@ class Controller:
             proof = self.probe(self._peer(profile, journal), Allocation(**journal['allocation']))
             if proof.get('dns') is not True or proof.get('handshake_recent') is not True:
                 raise ControllerError('live readiness evidence is incomplete')
-        except (OSError, ValueError, RuntimeError):
+        except ProbeUnavailable:
             if 'failover' not in journal:
                 raise
             return self._failed_probe(state, profile, journal, identity)
