@@ -644,6 +644,9 @@ Release 0.5.0 replaces the resident Windows PowerShell/Windows Forms tray with a
 small native notification icon. File pickers run in short-lived native children;
 application-list and profile mutations use the existing bounded process runner
 and a short-lived PowerShell helper. Neither remains resident after the action.
+One additional small native parent remains blocked on the UI process handle;
+it provides bounded UI crash recovery, without polling, and exits when the UI
+exits cleanly. Both native processes are included in the deployment measurement.
 The tray is outside the packet and DNS query paths. This release changes no
 forwarding code, filter policy, resolver selection, health interval, offload
 setting or driver.

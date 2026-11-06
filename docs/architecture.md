@@ -23,6 +23,11 @@ unlisted executable ────────────────────
 - `tray.exe`, running as the interactive installing user, displays the notification icon and reads desired state. File pickers run in short-lived copies of the native executable, so shell extensions do not stay loaded in the idle tray. It starts the short-lived `TrayActions.ps1` helper only for changes to the desired state, executable list, or profile. The helper retains the guarded profile replacement and rollback transaction. `Tray.ps1` remains a compatibility launcher for older task registrations.
 
 The native tray has no role in forwarding packets or resolving DNS. Its
+small parent process waits for the UI to exit without polling, and retries an
+abnormal exit at most three times with 2/4/8-second backoff. A clean UI exit
+also exits its parent. Task Scheduler launches the parent at logon; the
+parent provides UI crash recovery because scheduled-action failures did not
+trigger the configured restart policy on the tested Windows host. The UI's
 two-second timer reads small state files. A bounded runner supervises each
 helper, and a shared mutation mutex serializes changes with migration and
 uninstallation. Maintenance distinguishes tray helpers from the controller's

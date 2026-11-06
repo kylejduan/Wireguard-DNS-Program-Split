@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "tray-support.h"
+#include "tray-supervisor.h"
 #include <commdlg.h>
 #include <cwchar>
 #include <cstring>
@@ -250,7 +251,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             return 0;
         }
         const bool smoke = command == L"--smoke-test";
-        if (!command.empty() && !smoke) return 2;
+        if (!command.empty() && !smoke && command != L"--ui") return 2;
         std::vector<wchar_t> module(32768);
         const DWORD length = GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size()));
         if (!length || length >= module.size()) throw std::runtime_error("Cannot locate tray installation");
@@ -258,6 +259,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         if (!smoke) {
             for (const auto* path : {L"\\src\\TrayActions.ps1", L"\\state\\included-apps.txt", L"\\state\\installation.json"})
                 if (!exists(root + path)) throw std::runtime_error("Missing tray installation input");
+        }
+        if (command.empty()) {
+            Handle host(CreateMutexW(nullptr, FALSE, L"Global\\WireGuardProgramSplitTrayHost"));
+            if (!host.value) throw std::runtime_error("Cannot open tray supervisor mutex");
+            const DWORD held = WaitForSingleObject(host.value, 0);
+            if (held == WAIT_TIMEOUT) return 0;
+            if (held != WAIT_OBJECT_0 && held != WAIT_ABANDONED)
+                throw std::runtime_error("Cannot acquire tray supervisor mutex");
+            const DWORD code = supervise(module.data(), L"--ui", root);
+            ReleaseMutex(host.value);
+            if (code) throw std::runtime_error("The tray UI repeatedly failed. Start it again after resolving the failure.");
+            return 0;
         }
         Handle mutex(CreateMutexW(nullptr, FALSE, smoke ? nullptr : L"Global\\WireGuardProgramSplitTray"));
         if (!mutex.value) throw std::runtime_error("Cannot open tray instance mutex");

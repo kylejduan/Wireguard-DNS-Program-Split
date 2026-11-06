@@ -12,7 +12,7 @@ try {
     foreach ($dir in @('bin', 'src', 'config', 'profiles', 'state')) {
         [IO.Directory]::CreateDirectory((Join-Path $root $dir)) | Out-Null
     }
-    foreach ($name in @('controller-service.exe', 'tray.exe', 'test-tray-action.exe', 'test-tray-dialog.exe', 'test-tray-session.exe', 'test-tray-backstop.exe', 'test-tray-stub.exe')) {
+    foreach ($name in @('controller-service.exe', 'tray.exe', 'test-tray-action.exe', 'test-tray-dialog.exe', 'test-tray-session.exe', 'test-tray-backstop.exe', 'test-tray-supervisor.exe', 'test-tray-stub.exe')) {
         Copy-Item -LiteralPath (Join-Path $RepositoryRoot "build\$name") -Destination (Join-Path $root 'bin')
     }
     foreach ($name in @('Common.ps1', 'Tray.ps1', 'TrayActions.ps1', 'Prepare-Profile.ps1')) {
@@ -149,6 +149,8 @@ Start-Sleep -Seconds 60
     Copy-Item (Join-Path $root 'bin\test-tray-stub.exe') (Join-Path $backstopRoot 'bin\controller-service.exe')
     & (Join-Path $root 'bin\test-tray-backstop.exe') $backstopRoot
     Assert-True ($LASTEXITCODE -eq 0) 'a stuck runner is cancelled only before mutation starts'
+    & (Join-Path $root 'bin\test-tray-supervisor.exe') $root
+    Assert-True ($LASTEXITCODE -eq 0) 'native supervision recovers failures without resurrecting a clean exit'
     $smokeError = Join-Path $root 'smoke-error.txt'
     $smoke = Start-Process -FilePath (Join-Path $root 'bin\tray.exe') -ArgumentList '--smoke-test' -RedirectStandardError $smokeError -PassThru
     $null = $smoke.Handle

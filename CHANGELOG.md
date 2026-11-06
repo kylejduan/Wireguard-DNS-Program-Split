@@ -8,6 +8,9 @@
   New installations and same-release migrations register the native executable
   directly, while task ownership checks continue to recognize the exact legacy
   PowerShell action.
+- Windows: a small native parent waits for the UI and retries abnormal exits
+  three times with bounded backoff. A deliberate Exit stays exited. This
+  does not rely on Task Scheduler retrying an already-started action.
 - Tests: exercise native tray lifecycle, Unicode application paths, failed
   last-app removal, profile commit/readiness rollback, bounded preparation,
   preserved backups, shutdown refusal during a mutation, maintenance ownership
