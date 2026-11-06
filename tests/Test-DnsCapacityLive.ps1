@@ -78,10 +78,12 @@ function Test-ImageStalls([string] $DirectExe, [string[]] $StalledApps) {
     $drain = [Diagnostics.Stopwatch]::StartNew()
     do {
         $log = Read-Text 'dispatcher.log'
-        if ([regex]::Matches($log, '(?m)^DNS direct-[^\r\n]* -> DIRECT').Count -ge $result.successes) { break }
+        $decisions = [regex]::Matches($log, '(?m)^DNS direct-[^\r\n]* -> DIRECT').Count
+        $received = [regex]::Matches((Read-Text 'resolver.out'), '(?m)^DIRECT direct-').Count
+        if ($decisions -ge $result.successes -and $received -ge $result.successes) { break }
         Start-Sleep -Milliseconds 25
     } while ($drain.Elapsed.TotalSeconds -lt 3)
-    if ([regex]::Matches($log, '(?m)^DNS direct-[^\r\n]* -> DIRECT').Count -lt $result.successes) { throw 'Image-stall diagnostics did not drain.' }
+    if ($decisions -lt $result.successes -or $received -lt $result.successes) { throw 'Image-stall positive evidence did not drain.' }
     if ($log -notmatch '(?m)^HINT stalled-[^\r\n]*identity=pending') { throw 'The image-resolution fault was not exercised.' }
     if ($log -match '(?m)^LOG QUEUE DROPPED|^BARRIER INCOMPLETE' -or
         $log -match ("(?m)^HINT [^\r\n]*pid=$($ordinary.Id)\s[^\r\n]*identity=(pending|none)")) {

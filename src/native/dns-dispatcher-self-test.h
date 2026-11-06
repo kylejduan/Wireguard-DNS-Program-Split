@@ -197,37 +197,6 @@ int blockedHintLogTest() {
     return independent && route == std::optional<bool>(false) && gLog->dropped() ? 0 : 108;
 }
 
-bool longImagePathTest() {
-    wchar_t temporary[32768]{};
-    if (!GetTempPathW(32768, temporary)) return false;
-    const std::wstring root = std::wstring(temporary) + L"wgps-long-image-" +
-        std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
-    const std::wstring extended = L"\\\\?\\" + root;
-    struct Cleanup {
-        std::vector<std::wstring> directories;
-        std::wstring file;
-        ~Cleanup() {
-            if (!file.empty()) DeleteFileW(file.c_str());
-            for (auto it = directories.rbegin(); it != directories.rend(); ++it) RemoveDirectoryW(it->c_str());
-        }
-    } cleanup;
-    if (!CreateDirectoryW(extended.c_str(), nullptr)) return false;
-    cleanup.directories.push_back(extended);
-    std::wstring path = root;
-    while (path.size() < MAX_PATH + 40) {
-        path += L"\\" + std::wstring(40, L'a');
-        if (!CreateDirectoryW((L"\\\\?\\" + path).c_str(), nullptr)) return false;
-        cleanup.directories.push_back(L"\\\\?\\" + path);
-    }
-    path += L"\\image.exe";
-    cleanup.file = L"\\\\?\\" + path;
-    HANDLE file = CreateFileW((L"\\\\?\\" + path).c_str(), GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
-    CloseHandle(file);
-    return lower(finalImagePath(path)) == lower(path);
-}
-
 int barrierTest() {
     if (const int progress = hintProgressDoesNotFinishBarrierTest()) return progress;
     // The selected query's event is delivered after its packet, behind an earlier unlisted hint: TUNNEL.
@@ -703,7 +672,7 @@ int selfTest() {
     if (const int capacity = tunnelCapacityTest(query)) return capacity;
     if (!wgps::asyncLogSelfTest()) return 100;
     if (!wgps::asyncLogContentionSelfTest()) return 110;
-    if (!longImagePathTest()) return 112;
+    if (!wgps::asyncLogFinalDropSelfTest()) return 112;
     if (!wgps::imageResolverSelfTest()) return 104;
     if (!wgps::imageResolverExhaustionTest()) return 105;
     if (!wgps::imageResolverCancellationTest()) return 109;

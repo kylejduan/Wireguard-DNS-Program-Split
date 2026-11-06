@@ -41,6 +41,24 @@ inline bool asyncLogContentionSelfTest() {
     return true;
 }
 
+inline bool asyncLogFinalDropSelfTest() {
+    struct Notice {
+        HANDLE reported{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        std::atomic_bool exact{};
+        ~Notice() { if (reported) CloseHandle(reported); }
+    };
+    auto notice = std::make_shared<Notice>();
+    if (!notice->reported) return false;
+    AsyncLog log([notice](std::string_view line) {
+        notice->exact = line == "LOG QUEUE DROPPED 1\r\n";
+        SetEvent(notice->reported);
+    });
+    // No accepted message follows this loss: waking an empty writer must itself
+    // report the final drop, rather than waiting for a later successful write.
+    if (log.write(std::string(AsyncLog::kMaxMessageBytes + 1, 'x')) || log.dropped() != 1) return false;
+    return WaitForSingleObject(notice->reported, 1000) == WAIT_OBJECT_0 && notice->exact;
+}
+
 inline bool asyncLogSelfTest() {
     struct Events {
         HANDLE entered{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
