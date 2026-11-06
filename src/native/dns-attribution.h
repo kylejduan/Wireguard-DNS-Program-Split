@@ -8,9 +8,10 @@ public:
     // retransmits and falls back to TCP without raising a new query event.
     explicit Hints(std::unordered_set<std::wstring> included,
                    std::chrono::milliseconds reuseWindow = std::chrono::milliseconds(3000),
-                   std::chrono::milliseconds barrierTimeout = std::chrono::milliseconds(500))
+                   std::chrono::milliseconds barrierTimeout = std::chrono::milliseconds(500),
+                   wgps::ImageResolver* images = nullptr)
         : included_(std::make_shared<const std::unordered_set<std::wstring>>(std::move(included))),
-          reuseWindow_(reuseWindow), barrierTimeout_(barrierTimeout) {}
+          images_(images), reuseWindow_(reuseWindow), barrierTimeout_(barrierTimeout) {}
 
     // A reload swaps the whole set; a lookup in progress keeps the set it started with.
     void setIncluded(std::unordered_set<std::wstring> included) {
@@ -28,16 +29,25 @@ public:
         return included->count(lowerPath) != 0;
     }
 
+    void stopImageResolution() { if (images_) images_->cancel(); }
+
     void add(const std::wstring& name, uint16_t type, DWORD pid, long long eventQpc,
              long long deliveryMilliseconds, USHORT eventId) {
-        const std::wstring path = lower(processPath(pid));
+        const auto started = std::chrono::steady_clock::now();
+        const auto identity = images_ ? images_->identify(pid) : wgps::ImageResolver::Result{};
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        const std::wstring path = lower(identity.path);
         const bool selected = !path.empty() && isIncluded(path);
         addResolved(name, type, path);
         logLine(L"HINT " + normalizeName(name) + L" type=" + std::to_wstring(type) +
                 L" pid=" + std::to_wstring(pid) + L" selected=" +
                 std::to_wstring(selected ? 1 : 0) + L" delivery=" +
                 std::to_wstring(deliveryMilliseconds) + L"ms event=" + std::to_wstring(eventId) +
-                L" event-qpc=" + std::to_wstring(eventQpc) + L" path=" + path);
+                L" event-qpc=" + std::to_wstring(eventQpc) + L" identity=" +
+                (identity.status == wgps::ImageResolver::Status::Known ? L"known" :
+                 identity.status == wgps::ImageResolver::Status::Pending ? L"pending" : L"none") +
+                L" resolve=" + std::to_wstring(elapsed) + L"us path=" + path);
     }
 
     bool addResolved(const std::wstring& name, uint16_t type, const std::wstring& path) {
@@ -204,8 +214,11 @@ private:
         if (const HANDLE flush = gTraceFlushRequested.load()) SetEvent(flush);
         lock.lock();
         if (written && changed_.wait_until(lock, deadline, [&] { return processed_ >= sequence && checked_ >= sequence; })) return true;
-        logLine(L"BARRIER INCOMPLETE sequence=" + std::to_wstring(sequence) + L" written=" + std::to_wstring(written) +
-                L" processed=" + std::to_wstring(processed_) + L" checked=" + std::to_wstring(checked_), true);
+        const std::wstring diagnostic = L"BARRIER INCOMPLETE sequence=" + std::to_wstring(sequence) + L" written=" + std::to_wstring(written) +
+                L" processed=" + std::to_wstring(processed_) + L" checked=" + std::to_wstring(checked_);
+        lock.unlock();
+        logLine(diagnostic, true);
+        lock.lock();
         return false;
     }
 
@@ -296,6 +309,7 @@ private:
     std::chrono::steady_clock::time_point directBlockedUntil_{};
     mutable std::mutex includedMutex_;
     std::shared_ptr<const std::unordered_set<std::wstring>> included_;
+    wgps::ImageResolver* images_;
     std::chrono::milliseconds reuseWindow_;
     std::chrono::milliseconds barrierTimeout_;
     SentinelWriter writer_;

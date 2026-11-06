@@ -181,6 +181,9 @@ try {
     # Ordering, measured: every forwarded query has a query event for its name logged before its packet
     # arrived, on the same QPC clock. The dispatcher's barrier relies on this.
     $log = Read-SharedText (Join-Path $root 'dispatcher.log')
+    if ($log -match '(?m)^LOG QUEUE DROPPED' -or $log -match 'identity=pending') {
+        throw 'Ordinary DNS integration lost diagnostic evidence or exceeded the image-resolution deadline.'
+    }
     $events = @{}
     foreach ($match in [regex]::Matches($log, '(?m)^HINT (\S+) type=1 .*?event-qpc=(\d+)')) {
         $key = $match.Groups[1].Value

@@ -132,6 +132,71 @@ int hintProgressDoesNotFinishBarrierTest() {
     return held && finished && !answer.has_value() ? 0 : 72;
 }
 
+int pendingImageTest() {
+    auto gate = std::make_shared<wgps::ImageTestGate>();
+    struct Release { std::shared_ptr<wgps::ImageTestGate> gate; ~Release() { SetEvent(gate->release); } } release{gate};
+    wgps::ImageResolver images([gate](HANDLE) {
+        SetEvent(gate->entered);
+        WaitForSingleObject(gate->release, INFINITE);
+        return std::wstring(L"c:\\apps\\direct.exe");
+    }, 40);
+    Hints hints({}, std::chrono::milliseconds(3000), std::chrono::milliseconds(100), &images);
+    immediateBarrier(hints);
+    hints.addResolved(L"slow.example", 1, L"c:\\apps\\direct.exe");
+    const auto start = std::chrono::steady_clock::now();
+    hints.add(L"slow.example", 1, GetCurrentProcessId(), 0, 0, kQueryEvent);
+    if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(250) ||
+        hints.take(L"slow.example", 1).has_value() || !hints.directAnswerUnsafe(L"slow.example", 1)) return 101;
+    // Reload changes while the resolver is still blocked. The late result is a
+    // path, not a stale selected/direct decision, and cannot lift the quarantine.
+    hints.setIncluded({L"c:\\apps\\direct.exe"});
+    SetEvent(gate->release);
+    auto result = images.identify(GetCurrentProcessId());
+    for (unsigned i = 0; i < 20 && result.status == wgps::ImageResolver::Status::Pending; ++i) {
+        Sleep(10); result = images.identify(GetCurrentProcessId());
+    }
+    if (result.path.empty() || hints.take(L"slow.example", 1).has_value()) return 102;
+    hints.add(L"after.example", 1, GetCurrentProcessId(), 0, 0, kQueryEvent);
+    return hints.take(L"after.example", 1) == std::optional<bool>(true) ? 0 : 103;
+}
+
+int blockedHintLogTest() {
+    wgps::ImageResolver images([](HANDLE) { return std::wstring(L"c:\\apps\\direct.exe"); });
+    auto identity = images.identify(GetCurrentProcessId());
+    for (unsigned i = 0; i < 20 && identity.status == wgps::ImageResolver::Status::Pending; ++i) {
+        Sleep(10); identity = images.identify(GetCurrentProcessId());
+    }
+    if (identity.path.empty()) return 106;
+    auto gate = std::make_shared<wgps::ImageTestGate>();
+    struct Restore {
+        std::unique_ptr<wgps::AsyncLog> previous;
+        std::shared_ptr<wgps::ImageTestGate> gate;
+        ~Restore() { SetEvent(gate->release); gLog.reset(); gLog = std::move(previous); }
+    } restore{std::move(gLog), gate};
+    gLog = std::make_unique<wgps::AsyncLog>([gate](std::string_view) {
+        SetEvent(gate->entered);
+        WaitForSingleObject(gate->release, INFINITE);
+    });
+    gLog->write("start\r\n");
+    if (WaitForSingleObject(gate->entered, 1000) != WAIT_OBJECT_0) return 107;
+    Hints hints({}, std::chrono::milliseconds(3000), std::chrono::milliseconds(100), &images);
+    immediateBarrier(hints);
+    std::atomic_bool finished{};
+    std::optional<bool> route;
+    std::unique_lock held(gLogMutex);
+    std::thread consumer([&] {
+        for (unsigned i = 0; i < 1000; ++i) hints.add(L"logs.example", 1, GetCurrentProcessId(), 0, 0, kQueryEvent);
+        route = hints.take(L"logs.example", 1);
+        finished = true;
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!finished && std::chrono::steady_clock::now() < deadline) Sleep(1);
+    const bool independent = finished;
+    held.unlock();
+    consumer.join();
+    return independent && route == std::optional<bool>(false) && gLog->dropped() ? 0 : 108;
+}
+
 int barrierTest() {
     if (const int progress = hintProgressDoesNotFinishBarrierTest()) return progress;
     // The selected query's event is delivered after its packet, behind an earlier unlisted hint: TUNNEL.
@@ -456,9 +521,15 @@ int selfTest() {
                                  0, 0, 1, 44, 0, 4, 1, 2, 3, 4});
     if (!zeroResponseTtls(answer) || answer[answer.size() - 10] || answer[answer.size() - 9] ||
         answer[answer.size() - 8] || answer[answer.size() - 7]) return 7;
-    const auto firstPath = processPath(GetCurrentProcessId());
-    const auto cachedPath = processPath(GetCurrentProcessId());
-    if (firstPath.empty() || firstPath != cachedPath) return 8;
+    {
+        wgps::ImageResolver images(resolveImagePath);
+        auto first = images.identify(GetCurrentProcessId());
+        for (unsigned i = 0; i < 20 && first.status == wgps::ImageResolver::Status::Pending; ++i) {
+            Sleep(10); first = images.identify(GetCurrentProcessId());
+        }
+        const auto cached = images.identify(GetCurrentProcessId());
+        if (first.path.empty() || first.path != cached.path) return 8;
+    }
     Hints precedence({L"c:\\apps\\selected.exe"});
     immediateBarrier(precedence);
     // An event whose process could not be identified (it may have exited before the event was read) makes
@@ -592,13 +663,19 @@ int selfTest() {
         // The refusals these cases provoke are logged; keep them out of the test's output.
         wchar_t directory[MAX_PATH + 1]{};
         GetTempPathW(MAX_PATH + 1, directory);
-        gLog = std::make_unique<wgps::BoundedLog>(std::filesystem::path(directory) / L"wgps-dispatcher-self-test.log");
+        setLogFile(std::filesystem::path(directory) / L"wgps-dispatcher-self-test.log");
         const int barrier = barrierTest();
         gLog.reset();
         if (barrier) return barrier;
     }
     if (const int failover = failoverTest(query)) return failover;
     if (const int capacity = tunnelCapacityTest(query)) return capacity;
+    if (!wgps::asyncLogSelfTest()) return 100;
+    if (!wgps::imageResolverSelfTest()) return 104;
+    if (!wgps::imageResolverExhaustionTest()) return 105;
+    if (!wgps::imageResolverCancellationTest()) return 109;
+    if (const int pending = pendingImageTest()) return pending;
+    if (const int logging = blockedHintLogTest()) return logging;
     // A resolver list is one to three distinct IPv4 addresses, or the input is rejected whole.
     if (resolverList(L"192.0.2.1,198.51.100.2").size() != 2 || resolverList(L"192.0.2.1").size() != 1) return 86;
     for (const wchar_t* malformed : {L"", L"192.0.2.1,", L",192.0.2.1", L"192.0.2.1,192.0.2.1", L"192.0.2.1;192.0.2.2",

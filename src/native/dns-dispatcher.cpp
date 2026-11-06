@@ -29,6 +29,10 @@
 #include "path-identity.h"
 #include "bounded-log.h"
 #include "dns-capacity.h"
+#include "async-log.h"
+#include "async-log-self-test.h"
+#include "dns-image-resolver.h"
+#include "dns-image-resolver-self-test.h"
 
 namespace {
 
@@ -55,22 +59,17 @@ std::atomic_bool gRunning{true};
 std::atomic<HANDLE> gTraceFlushRequested{nullptr};
 std::atomic_uint gActiveWorkers{};
 std::atomic_uint gHintWaiters{};
+std::atomic_ullong gAdmissionRefusals{}, gTunnelRefusals{}, gNextTunnelDetail{};
 SOCKET gUdpListener{INVALID_SOCKET};
 SOCKET gTcpListener{INVALID_SOCKET};
 std::mutex gLogMutex;
-std::unique_ptr<wgps::BoundedLog> gLog;
-std::mutex gProcessCacheMutex;
-
-struct CachedProcess {
-    ULONGLONG creationTime{};
-    std::wstring path;
-};
-
-std::unordered_map<DWORD, CachedProcess> gProcessCache;
+std::unique_ptr<wgps::AsyncLog> gLog;
+bool gLogToFile{};
 
 bool acquireWorker() {
     if (gActiveWorkers.fetch_add(1) < kMaxWorkers) return true;
     gActiveWorkers.fetch_sub(1);
+    ++gAdmissionRefusals;
     return false;
 }
 
@@ -108,39 +107,15 @@ std::wstring canonicalPath(const std::wstring& path) {
     return resolved.empty() ? path : resolved;
 }
 
-std::wstring processPath(DWORD pid) {
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!process) return {};
-    FILETIME created{}, exited{}, kernel{}, user{};
-    if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) {
-        CloseHandle(process);
-        return {};
-    }
-    ULARGE_INTEGER createdValue{};
-    createdValue.LowPart = created.dwLowDateTime;
-    createdValue.HighPart = created.dwHighDateTime;
-    {
-        std::lock_guard lock(gProcessCacheMutex);
-        const auto found = gProcessCache.find(pid);
-        if (found != gProcessCache.end() && found->second.creationTime == createdValue.QuadPart) {
-            CloseHandle(process);
-            return found->second.path;
-        }
-    }
+// Called only by the bounded resolver pool, never by the ETW consumer.
+std::wstring resolveImagePath(HANDLE process) {
     std::vector<wchar_t> buffer(32768);
     DWORD size = static_cast<DWORD>(buffer.size());
     bool ok = QueryFullProcessImageNameW(process, 0, buffer.data(), &size);
-    CloseHandle(process);
     if (!ok) return {};
-    std::wstring path = canonicalPath(std::wstring(buffer.data(), size));
-    {
-        std::lock_guard lock(gProcessCacheMutex);
-        // a bounded reset is enough; use lifecycle notifications only if this host
-        // ever sustains thousands of distinct processes between dispatcher restarts.
-        if (gProcessCache.size() >= 2048) gProcessCache.clear();
-        gProcessCache[pid] = CachedProcess{createdValue.QuadPart, path};
-    }
-    return path;
+    // A running image that cannot be opened is unknown. Guessing from a raw or
+    // partially resolved alias could misclassify a selected executable as direct.
+    return wgps::finalPath(std::wstring(buffer.data(), size), VOLUME_NAME_DOS);
 }
 
 std::unordered_set<std::wstring> parseIncludedText(const std::wstring& text) {
@@ -218,17 +193,30 @@ std::unordered_set<std::wstring> loadIncludedPaths(const std::wstring& path) {
     return result;
 }
 
+void setLogFile(const std::filesystem::path& path) {
+    auto file = std::make_shared<wgps::BoundedLog>(path);
+    gLog = std::make_unique<wgps::AsyncLog>([file](std::string_view bytes) { file->write(bytes); });
+    gLogToFile = true;
+}
+
 void logLine(const std::wstring& line, bool flush = false) {
-    std::lock_guard lock(gLogMutex);
     if (gLog) {
         gLog->write(wgps::utf8(line + L"\r\n"));
         // stdout is only a readiness channel when a bounded log owns diagnostics.
-        if (line.rfind(L"READY:", 0) == 0) std::wcout << line << std::endl;
+        if (gLogToFile && line.rfind(L"READY:", 0) == 0) std::wcout << line << std::endl;
     } else {
         // Interactive diagnostic usage retains the original stdout contract.
+        std::lock_guard lock(gLogMutex);
         std::wcout << line << L'\n';
         if (flush) std::wcout.flush();
     }
+}
+
+bool logTunnelRefusalDetail() {
+    ++gTunnelRefusals;
+    const auto now = GetTickCount64();
+    auto next = gNextTunnelDetail.load(std::memory_order_relaxed);
+    return now >= next && gNextTunnelDetail.compare_exchange_strong(next, now + 1000, std::memory_order_relaxed);
 }
 
 long long qpcNow() {
@@ -332,11 +320,22 @@ public:
                 std::vector<BYTE> query(sizeof(EVENT_TRACE_PROPERTIES) + 2 * kNameBytes);
                 auto* current = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(query.data());
                 ULONG lostEvents{}, lostBuffers{}, flushFailure{};
+                ULONGLONG nextCounters = GetTickCount64() + 1000;
                 while (!stopping_) {
                     // Queries request an immediate flush. Keep the low-latency retry cadence
                     // only while attribution is pending; idle DNS does not need 100 flushes/s.
                     WaitForSingleObject(flushRequested_, gHintWaiters.load() ? 10 : 1000);
                     if (stopping_) break;
+                    const auto now = GetTickCount64();
+                    if (now >= nextCounters) {
+                        if (const auto refused = gAdmissionRefusals.exchange(0)) {
+                            logLine(L"WORKERS EXHAUSTED count=" + std::to_wstring(refused), true);
+                        }
+                        if (const auto refused = gTunnelRefusals.exchange(0)) {
+                            logLine(L"TUNNEL LANE REFUSED count=" + std::to_wstring(refused), true);
+                        }
+                        nextCounters = now + 1000;
+                    }
                     // Every barrier sequence assigned before this flush began is covered by its loss check.
                     const unsigned long long covered = hints_.lastSequence();
                     std::fill(query.begin(), query.end(), BYTE{});
@@ -349,14 +348,15 @@ public:
                         flushFailure = flushed;
                         continue;
                     }
-                    if (current->EventsLost != lostEvents || current->RealTimeBuffersLost != lostBuffers) {
+                    const bool lost = current->EventsLost != lostEvents || current->RealTimeBuffersLost != lostBuffers;
+                    if (lost) {
                         lostEvents = current->EventsLost;
                         lostBuffers = current->RealTimeBuffersLost;
                         hints_.lostEvents();
-                        logLine(L"ETW LOST events=" + std::to_wstring(lostEvents) + L" buffers=" +
-                                std::to_wstring(lostBuffers) + L"; refusing direct routes for 10s", true);
                     }
                     hints_.flushChecked(covered);
+                    if (lost) logLine(L"ETW LOST events=" + std::to_wstring(lostEvents) + L" buffers=" +
+                                      std::to_wstring(lostBuffers) + L"; refusing direct routes for 10s", true);
                 }
             } catch (...) { gRunning = false; } });
         } catch (...) {
@@ -373,6 +373,7 @@ public:
 private:
     void stop() noexcept {
         stopping_ = true;
+        hints_.stopImageResolution();
         hints_.setSentinelWriter(nullptr);
         gTraceFlushRequested.store(nullptr);
         if (flushRequested_) SetEvent(flushRequested_);
@@ -680,7 +681,7 @@ void handleUdpQuery(Hints& hints, std::vector<char> packet, sockaddr_in client, 
     if (tunnel) {
         // A withheld answer is not reused; the entry's tunnel evidence decides the retries.
         if (!withheld) hints.complete(question->name, question->type, generation);
-        logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
+        if (!capacityLimited || logTunnelRefusalDetail()) logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
                 (*tunnel ? L"TUNNEL" : L"DIRECT") + (reused ? L" (reused)" : L"") + (completed ? L" (completed over TCP)" : L"") +
                 (resolverIndex ? L" (resolver " + std::to_wstring(resolverIndex + 1) + L")" : L"") +
                 (capacityLimited ? L" (tunnel lane full)" : L"") +
@@ -722,7 +723,7 @@ void handleTcpClient(SOCKET client, Hints& hints) {
         if (!sendDnsFrame(client, *response, responseDeadline)) break;
         if (question && tunnel) {
             if (!withheld) hints.complete(question->name, question->type, generation);
-            logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
+            if (!capacityLimited || logTunnelRefusalDetail()) logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
                     (*tunnel ? L"TUNNEL" : L"DIRECT") + L" (TCP)" + (reused ? L" (reused)" : L"") +
                     (capacityLimited ? L" (tunnel lane full)" : L"") +
                     (withheld ? L" WITHHELD (selected lookup of the same name)" : answered ? L"" : L" FAILED") +
@@ -751,8 +752,15 @@ int wmain(int argc, wchar_t** argv) {
             return 2;
         }
         const std::wstring root = stateMode ? argv[2] : L"";
-        if (stateMode) gLog = std::make_unique<wgps::BoundedLog>(root + L"\\logs\\dns-dispatcher.log");
-        else if (argc == 8) gLog = std::make_unique<wgps::BoundedLog>(argv[7]);
+        if (stateMode) setLogFile(root + L"\\logs\\dns-dispatcher.log");
+        else if (argc == 8) setLogFile(argv[7]);
+        else {
+            const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+            gLog = std::make_unique<wgps::AsyncLog>([output](std::string_view bytes) {
+                DWORD written{};
+                WriteFile(output, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+            });
+        }
         WSADATA winsock{};
         if (WSAStartup(MAKEWORD(2, 2), &winsock)) throw std::runtime_error("WSAStartup failed");
         SetConsoleCtrlHandler(consoleControl, TRUE);
@@ -771,7 +779,8 @@ int wmain(int argc, wchar_t** argv) {
             traceName = argv[6];
         }
         const size_t includedCount = included.size();
-        Hints hints(std::move(included));
+        wgps::ImageResolver images(resolveImagePath);
+        Hints hints(std::move(included), std::chrono::milliseconds(3000), std::chrono::milliseconds(500), &images);
         DnsTrace trace(hints, traceName);
 
         gUdpListener = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);

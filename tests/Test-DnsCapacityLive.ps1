@@ -72,10 +72,18 @@ try {
     Wait-Client $warm 'warm'
     $warmResults = Read-Text 'warm.out' | ConvertFrom-Json
     if ($warmResults.directAnswers -ne 5) { throw 'Direct fixture DNS failed before load.' }
+    $server.Refresh()
+    $before = [pscustomobject]@{ PrivateMiB = $server.PrivateMemorySize64 / 1MB; Threads = $server.Threads.Count }
+    $cpuBefore = $server.TotalProcessorTime.TotalSeconds
+    $sample = [Diagnostics.Stopwatch]::StartNew()
     $flood = Launch $selected @('selected', $zone, '100', '12') 'selected'
     $ordinary = Launch $direct @('direct', $zone, '20', '12') 'direct'
     Wait-Client $flood 'selected'
     Wait-Client $ordinary 'direct'
+    $sample.Stop()
+    $server.Refresh()
+    $cpuOneCorePercent = 100 * ($server.TotalProcessorTime.TotalSeconds - $cpuBefore) / $sample.Elapsed.TotalSeconds
+    $after = [pscustomobject]@{ PrivateMiB = $server.PrivateMemorySize64 / 1MB; Threads = $server.Threads.Count }
     $selectedResults = Read-Text 'selected.out' | ConvertFrom-Json
     $directResults = Read-Text 'direct.out' | ConvertFrom-Json
     if ($selectedResults.started / $selectedResults.launch_seconds -lt 80) {
@@ -89,6 +97,9 @@ try {
     if (-not $ExpectStarvation -and $log -notmatch '\(tunnel lane full\)') {
         throw 'No tunnel-capacity refusal was observed; the test did not exercise the limit.'
     }
+    if (-not $ExpectStarvation -and $log -match '(?m)^WORKERS EXHAUSTED') {
+        throw 'Selected upstream requests exhausted global worker admission despite the lane cap.'
+    }
     if ($log -match '(?m)^DNS selected-[^\r\n]* -> DIRECT') { throw 'Selected attribution crossed to the direct lane.' }
     # Let the remaining four-second upstream exchanges finish, then resume the
     # same tunnel resolver. The dispatcher and its attribution stay in place.
@@ -98,6 +109,9 @@ try {
     if ((Read-Text 'recovery.out') -notmatch 'ANSWER 192\.0\.2\.1') { throw 'Tunnel DNS did not recover.' }
     Write-Output ("OBSERVED: baseline=$ExpectStarvation selected=$($selectedResults|ConvertTo-Json -Compress) " +
         "direct=$($directResults|ConvertTo-Json -Compress); selected never reached direct, tunnel recovered under the same dispatcher.")
+    Write-Output ("OBSERVED: dispatcher-only outage-load sample before=$($before|ConvertTo-Json -Compress) " +
+        "after=$($after|ConvertTo-Json -Compress) one-core-percent=$cpuOneCorePercent seconds=$($sample.Elapsed.TotalSeconds); " +
+        'excludes external processes and system-wide driver/DPC/interrupt work.')
     Write-Output 'PASS: tunnel outage capacity regression and resolver recovery.'
 } catch {
     foreach ($file in Get-ChildItem -LiteralPath $root -File -ErrorAction SilentlyContinue) {
