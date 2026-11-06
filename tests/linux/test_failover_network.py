@@ -126,6 +126,31 @@ class NetworkSwitchTests(unittest.TestCase):
                 self.assertTrue(resumed.health().ready)
                 self.assertFalse(list(self.wireguard.iterdir()))
 
+    def test_removed_private_objects_before_receipt_forget_replay(self):
+        for kind in ('private_file', 'private_directory'):
+            with self.subTest(kind=kind):
+                self.setUp()
+                forget = self.network._forget
+                def interrupted(resource):
+                    if resource.kind == kind: raise Died()
+                    return forget(resource)
+                with patch.object(self.network, '_forget', side_effect=interrupted):
+                    with self.assertRaises(Died):
+                        self.network.switch_peer(self.target, guard_blocked=True)
+                self.assert_anchors()
+                resumed = self.make_network()
+                resumed.switch_peer(self.target, guard_blocked=True)
+                self.assertTrue(resumed.health().ready)
+                self.assertFalse(list(self.wireguard.iterdir()))
+
+    def test_post_birth_capture_cannot_adopt_a_replacement_interface(self):
+        link = next(x for x in self.kernel.links if x['ifname'] == 'wgps0')
+        link['ifindex'] += 100
+        with self.assertRaises(NetworkError):
+            self.network._capture('interface', 'wgps0')
+        self.assertIn('interface:wgps0', self.network.health().changed)
+        self.assert_anchors()
+
     def test_unsafe_unrecorded_configuration_is_never_removed(self):
         record = self.network._record
         def interrupted(which, name, identity):

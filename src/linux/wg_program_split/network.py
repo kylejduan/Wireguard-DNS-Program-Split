@@ -412,6 +412,9 @@ class Network:
         if identity is None:
             raise NetworkError('newly acquired network resource is missing during readback')
         previous = next((r.identity for r in self.receipt.resources if (r.kind, r.name) == (kind, name)), {})
+        if (kind == 'interface' and previous and provisional is not True and
+                identity.get('ifindex') != previous.get('ifindex')):
+            raise NetworkError('interface was replaced during configuration')
         if kind == 'interface' and (provisional is True or (provisional is None and previous.get('provisional'))):
             identity['provisional'] = True
         if kind == 'nft_table' and (type(identity['handle']) is not int or identity['handle'] <= 0 or
@@ -768,7 +771,9 @@ class Network:
         a = self.allocation
         anchors = {'route:fallback', 'rule:vpn', 'nft_table:' + a.nft_table, 'conntrack_zone:vpn'}
         replaceable = {'route:preferred', 'interface:' + a.interface, 'sysctl:route_localnet'}
-        if health.changed or not anchors.issubset(health.matching) or not set(health.missing) <= replaceable:
+        temporary = {r.kind + ':' + r.name for r in self.receipt.resources
+                     if r.kind in ('private_file', 'private_directory')}
+        if health.changed or not anchors.issubset(health.matching) or not set(health.missing) <= replaceable | temporary:
             raise NetworkError('peer switch requires intact packet-level safety anchors')
         if bound == target_digest and health.ready:
             return self.receipt  # Repair completed before the controller committed.
