@@ -104,7 +104,7 @@ while([DateTime]::UtcNow -lt $until){
     Remove-Item (Join-Path $root 'state\block-stop')
     & $runner $root Import $profileInput
     Assert-True ($LASTEXITCODE -eq 0 -and ([IO.File]::ReadAllText((Join-Path $root 'config\settings.json')) | ConvertFrom-Json).TunnelAddress -eq '192.0.2.3') 'the real profile transaction commits after the fixture confirms readiness'
-    Assert-True (-not (Test-Path (Join-Path $root 'profiles\WireGuardSplit.conf.previous')) -and (Test-Path (Join-Path $root 'state\keep-filters.request'))) 'successful import preserves the temporary hold for a controller that sampled the old disabled intent'
+    Assert-True (-not (Test-Path (Join-Path $root 'profiles\WireGuardSplit.conf.previous')) -and -not (Test-Path (Join-Path $root 'state\keep-filters.request'))) 'successful import clears the temporary hold after confirmed readiness'
     $profileHash = (Get-FileHash (Join-Path $root 'profiles\WireGuardSplit.conf')).Hash
     $settingsHash = (Get-FileHash (Join-Path $root 'config\settings.json')).Hash
     Write-FixtureProfile '192.0.2.254'

@@ -45,6 +45,7 @@ function Import-Profile([string] $InputPath) {
     $replacementAttempted = $false
     $holdWritten = $false
     $resumeRequested = $false
+    $resumeConfirmed = $false
     try {
         if (-not (Test-Path -LiteralPath $InputPath -PathType Leaf)) { throw 'Profile input does not exist.' }
         $wasEnabled = Test-Path -LiteralPath $enabledFile -PathType Leaf
@@ -91,6 +92,7 @@ function Import-Profile([string] $InputPath) {
             if (-not (Test-Path -LiteralPath $activeFile -PathType Leaf)) {
                 throw 'The imported profile failed its tunnel-DNS readiness check.'
             }
+            $resumeConfirmed = $true
         }
         try {
             Remove-Item -LiteralPath "$activeProfile.previous", "$activeSettings.previous" -Force -ErrorAction Stop
@@ -134,10 +136,10 @@ function Import-Profile([string] $InputPath) {
         throw $failure
     }
     finally {
-        # Keep the hold after re-enabling: a controller pass may already have
-        # sampled the disabled intent. It ignores the hold when enabled, and the
-        # next explicit Disable clears it. Abandoned holds expire in the controller.
-        if ($holdWritten -and -not $resumeRequested) {
+        # An unconfirmed re-enable may race a controller pass that sampled the
+        # disabled intent. A new active marker proves that pass has completed,
+        # so successful imports can clear the hold without leaving stale state.
+        if ($holdWritten -and (-not $resumeRequested -or $resumeConfirmed)) {
             Remove-Item -LiteralPath $keepFiltersFile -Force -ErrorAction SilentlyContinue
         }
     }
