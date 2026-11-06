@@ -710,6 +710,69 @@ class Network:
         if self._run('conntrack', '-L', '--zone', str(a.zone), '-o', 'extended').strip():
             raise NetworkError('owned conntrack zone still contains flows after cleanup')
 
+    def switch_peer(self, target, *, guard_blocked):
+        """Keep packet-level safety anchors, including across interrupted switches.
+
+        A blocked LSM guard does not stop already-queued TCP retransmissions.
+        Therefore the rule, unreachable route, nft drop rules and zone binding
+        must never disappear. Only the preferred route and WG interface change.
+        Their old records remain as absence/replacement fences for repair_missing.
+        The nft receipt's profile digest is rebound only after verifying its exact
+        unchanged kernel identity; that digest records which configuration is
+        being installed if the controller dies before committing its peer index.
+        """
+        if guard_blocked is not True or self.uncertain or self.receipt is None:
+            raise NetworkError('peer switch requires a blocked guard and owned network')
+        old = asdict(self.profile)
+        new = asdict(target)
+        for field in ('public_key', 'endpoint_host', 'endpoint_port'):
+            old.pop(field)
+            new.pop(field)
+        if old != new:
+            raise NetworkError('peer switch cannot change client identity or firewall inputs')
+        table = next((r for r in self.receipt.resources if r.kind == 'nft_table'), None)
+        if table is None:
+            raise NetworkError('peer switch lost its firewall receipt')
+        target_digest = _digest(asdict(target))
+        bound = table.identity.get('profile_sha256')
+        if bound == target_digest:
+            self.profile = target
+        elif bound != _digest(asdict(self.profile)):
+            raise NetworkError('peer switch has an unrecognized profile binding')
+        health = self.health()
+        a = self.allocation
+        anchors = {'route:fallback', 'rule:vpn', 'nft_table:' + a.nft_table, 'conntrack_zone:vpn'}
+        replaceable = {'route:preferred', 'interface:' + a.interface, 'sysctl:route_localnet'}
+        if health.changed or not anchors.issubset(health.matching) or not set(health.missing) <= replaceable:
+            raise NetworkError('peer switch requires intact packet-level safety anchors')
+        if bound == target_digest and health.ready:
+            return self.receipt  # Repair completed before the controller committed.
+        for kind in ('private_file', 'private_directory'):
+            for resource in [r for r in self.receipt.resources if r.kind == kind]:
+                self._remove(resource)
+        self._sweep_private(self.receipt.attempt_id)
+        # Keep each record so a death after delete is a provable missing object.
+        for kind, name, argv in (
+                ('route', 'preferred', self._route_argv('delete', 'preferred')),
+                ('interface', a.interface, ('ip', 'link', 'delete', 'dev', a.interface))):
+            resource = next((r for r in self.receipt.resources if (r.kind, r.name) == (kind, name)), None)
+            if resource is None:
+                raise NetworkError('peer switch lost a tunnel ownership fence')
+            live = self._observe(resource, self._snapshot())
+            if live is not None:
+                own.verify_resource(self.receipt, kind, name, live,
+                                    boot_id=self.boot_id, attempt_id=self.receipt.attempt_id)
+                self._run(*argv)
+        self._flush_zone()
+        health = self.health()
+        if health.changed or not anchors.issubset(health.matching) or set(health.missing) != replaceable:
+            raise NetworkError('peer switch did not preserve its safety anchors')
+        table = next(r for r in self.receipt.resources if r.kind == 'nft_table')
+        self._record('nft_table', table.name, {**table.identity, 'profile_sha256': target_digest})
+        self.profile = target
+        self.repair_missing(guard_blocked=True)
+        return self.receipt
+
     def _sweep_private(self, attempt_id):
         """Remove a private configuration orphaned by a crash before its scoped removal."""
         name = 'wgps-' + attempt_id

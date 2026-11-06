@@ -205,13 +205,7 @@ class Controller:
         return self._peer_pool[rotation['active']]
 
     def _resume_peer_change(self, state, profile, journal, identity):
-        """Finish intent before selecting a new peer; the pinned guard stays blocked.
-
-        Cleanup is restartable from the old peer's receipt. An empty receipt is
-        retained until network_started=False is durable, just as activation's
-        interrupted-acquisition recovery does. Never use the new profile to
-        interpret or delete the old peer's owned resources.
-        """
+        """Retarget only the tunnel while guard, drop rules and route anchors stay."""
         rotation = journal['failover']
         target = rotation['pending']
         if target is None:
@@ -219,16 +213,10 @@ class Controller:
         if target >= len(self._peer_pool) or journal['pending'] is not None:
             raise ControllerError('invalid pending peer change')
         self._block(journal)
-        if _present(state, 'receipt.json'):
-            network = self._network(state, profile, journal)
-            receipt = network.disable(guard_blocked=True)
-            if receipt is not None and receipt.resources:
-                raise ControllerError('peer cleanup is incomplete')
-            journal['network_started'] = False
-            identity = self._save(state, journal, identity)
-            self._discard_receipt(state)
-        elif journal['network_started']:
+        if not _present(state, 'receipt.json') or not journal['network_started']:
             raise ControllerError('peer change lost its ownership receipt')
+        network = self._network(state, profile, journal)
+        network.switch_peer(self._peer_pool[target], guard_blocked=True)
         rotation.update(active=target, pending=None)
         journal.update(state='degraded', probe_at=None)
         return self._save(state, journal, identity)

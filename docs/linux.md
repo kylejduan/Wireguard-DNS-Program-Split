@@ -527,15 +527,21 @@ retry storm. Healthy peers are retained; there is no automatic primary
 preemption during a boot. A fresh boot begins with the configured primary and
 can recover through the same bounded sequence.
 
-Peer changes keep the BPF guard attached and blocked. Only the recorded VPN
-network resources are removed and recreated; host DNS, ordinary routes,
-Tailscale and unlisted traffic are not modified. New selected connections are
+Peer changes keep the BPF guard attached and blocked, and preserve the nftables
+firewall, marked policy rule, unreachable fallback route and conntrack zone.
+Only the recorded WireGuard interface and preferred route are recreated; host
+DNS, ordinary routes, Tailscale and unlisted traffic are not modified. Keeping
+packet-level protection is necessary because already-queued TCP retransmissions
+can outlive a blocked socket call. New selected connections are
 allowed after fresh DNS, handshake and ownership verification. Existing VPN
 connections can need application reconnection when the peer changes.
 
-The journal records rotation intent before cleanup and retains the old peer
-index until its receipt is empty. Controller interruption resumes that cleanup
-using the old peer's identity, then prepares the new peer. Missing or modified
+The journal records rotation intent before changing the tunnel and retains the
+old peer index until the replacement is configured. Missing tunnel objects keep
+their recorded ownership fences, and the firewall receipt binds the pending
+profile after its exact unchanged kernel identity is verified. Controller
+interruption resumes against those old-or-pending identities; it does not
+remove the packet-level protection or adopt arbitrary replacement resources. Missing or modified
 ownership evidence blocks recovery instead of adopting or deleting foreign
 resources. All peers unavailable means selected applications remain blocked
 and bounded retries continue. A provider-wide outage, expired client credential

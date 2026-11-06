@@ -69,9 +69,21 @@ class RecoveryTests(unittest.TestCase):
                 raise RuntimeError('simulated peer outage')
             return {'dns': True, 'handshake_recent': True}
         return Controller(paths=self.paths, owner_uid=os.getuid(), kernel=self.kernel,
-                          network_factory=self.network.factory, host_check=lambda: None,
+                          network_factory=self.network_factory, host_check=lambda: None,
                           select_allocation=lambda profile: ALLOCATION, probe=probe,
                           processes=lambda: list(self.processes))
+
+    def network_factory(self, profile, directory_fd, **kwargs):
+        instance = self.network.factory(profile, directory_fd, **kwargs)
+
+        def switch_peer(target, *, guard_blocked):
+            self.assertTrue(guard_blocked)
+            self.assertEqual(self.kernel.state, 'blocked')
+            self.kernel.events.append('network-switch')
+            return instance.receipt
+
+        instance.switch_peer = switch_peer
+        return instance
 
     def journal(self):
         return json.loads((self.paths.state / 'controller.json').read_text())
@@ -94,11 +106,11 @@ class RecoveryTests(unittest.TestCase):
     def test_switch_blocks_before_cleanup_and_retains_pinned_guard(self):
         self.fail_primary()
         self.assertEqual(self.journal()['failover']['active'], 1)
-        self.assertFalse(self.journal()['network_started'])
+        self.assertTrue(self.journal()['network_started'])
         self.assertEqual(self.kernel.state, 'blocked')
         self.assertNotIn('unload', self.kernel.events)
         self.assertEqual(self.kernel.events.count('load-blocked'), 1)
-        self.assertLess(self.kernel.events.index('state-blocked'), self.kernel.events.index('network-disable'))
+        self.assertLess(self.kernel.events.index('state-blocked'), self.kernel.events.index('network-switch'))
         status = self.controller.activate()
         self.assertEqual(status['state'], 'ready')
         self.assertTrue(status['protection_verified'])
@@ -123,7 +135,7 @@ class RecoveryTests(unittest.TestCase):
             for _ in range(10):
                 self.new_controller().check()
         self.assertEqual(self.journal()['failover']['active'], 1)
-        self.assertEqual(self.kernel.events.count('network-disable'), 1)
+        self.assertEqual(self.kernel.events.count('network-switch'), 1)
         self.now += failover.SWITCH_INTERVAL
         self.controller.check()
         self.assertEqual(self.journal()['failover']['active'], 0)
@@ -183,7 +195,7 @@ class RecoveryTests(unittest.TestCase):
             self.controller.activate()
 
     def test_interrupted_rotation_resumes_each_durable_boundary(self):
-        for boundary in ('intent', 'empty_receipt', 'receipt_removed', 'selected'):
+        for boundary in ('intent', 'selected'):
             with self.subTest(boundary=boundary):
                 # Complete the previous scenario before setting up another rotation.
                 self.dead.clear()
@@ -194,24 +206,16 @@ class RecoveryTests(unittest.TestCase):
                 self.controller.check()
                 self.controller.check()
                 original_save = self.controller._save
-                original_discard = self.controller._discard_receipt
 
                 def save(state, journal, identity):
                     result = original_save(state, journal, identity)
                     rotation = journal['failover']
                     if ((boundary == 'intent' and rotation['pending'] is not None and journal['network_started']) or
-                            (boundary == 'empty_receipt' and rotation['pending'] is not None and not journal['network_started']) or
                             (boundary == 'selected' and rotation['active'] != active and rotation['pending'] is None)):
                         raise Died()
                     return result
 
-                def discard(state):
-                    original_discard(state)
-                    if boundary == 'receipt_removed':
-                        raise Died()
-
-                with patch.object(self.controller, '_save', side_effect=save), patch.object(
-                        self.controller, '_discard_receipt', side_effect=discard):
+                with patch.object(self.controller, '_save', side_effect=save):
                     with self.assertRaises(Died):
                         self.controller.check()
                 self.assertEqual(self.kernel.state, 'blocked')
