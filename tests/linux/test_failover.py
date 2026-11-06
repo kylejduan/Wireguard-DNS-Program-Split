@@ -13,6 +13,7 @@ from test_lifecycle import ALLOCATION, PROFILE, Died
 from wg_program_split.controller import Controller, ControllerError
 from wg_program_split.preflight import NativeGuard, ProbeUnavailable
 from wg_program_split import failover
+from wg_program_split.network import Health, UnderlayUnavailable
 from wg_program_split.config import parse_profile, ConfigError
 
 
@@ -184,6 +185,27 @@ class RecoveryTests(unittest.TestCase):
         self.assertIsNone(self.journal()['failover']['pending'])
         self.assertEqual(self.journal()['failover']['active'], 0)
         self.assertNotIn('network-switch', self.kernel.events)
+
+    def test_missing_tunnel_underlay_failure_can_schedule_another_peer(self):
+        self.controller.activate()
+        factory = self.controller.network_factory
+
+        def incomplete(*args, **kwargs):
+            instance = factory(*args, **kwargs)
+            instance.health = lambda: Health(
+                ('route:fallback', 'rule:vpn', 'nft_table:wg_program_split', 'conntrack_zone:vpn'),
+                ('route:preferred', 'interface:wgps0', 'sysctl:route_localnet'), (), False)
+            def no_underlay(**kwargs):
+                raise UnderlayUnavailable('temporary route loss')
+            instance.repair_missing = no_underlay
+            return instance
+
+        self.controller.network_factory = incomplete
+        for _ in range(3):
+            self.controller.check()
+        self.assertEqual(self.journal()['failover']['active'], 1)
+        self.assertIsNone(self.journal()['failover']['pending'])
+        self.assertIn('network-switch', self.kernel.events)
 
     def test_pool_in_memory_must_match_verified_digest(self):
         self.controller.activate()

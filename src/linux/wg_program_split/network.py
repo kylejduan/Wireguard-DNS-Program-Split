@@ -20,6 +20,10 @@ from .firewall import Firewall
 from . import ownership as own
 
 
+class UnderlayUnavailable(NetworkError):
+    """A peer currently has no compatible ordinary transport route."""
+
+
 @dataclass(frozen=True)
 class Allocation:
     mask: int
@@ -117,6 +121,13 @@ def _inspect(profile, *, runner, require_underlay):
 
 
 def _underlay(profile, links, runner):
+    try:
+        return _underlay_checked(profile, links, runner)
+    except NetworkError as error:
+        raise UnderlayUnavailable(str(error)) from None
+
+
+def _underlay_checked(profile, links, runner):
     tunnel_names = {link.get('ifname') for link in links if
                     link.get('linkinfo', {}).get('info_kind') in
                     ('wireguard', 'tun', 'ipip', 'gre', 'sit', 'vti', 'ip6tnl', 'xfrm')}
@@ -331,6 +342,8 @@ class Network:
             result = {'state': routes[0]}
             if name == 'fallback':
                 result['allocation'] = asdict(a)
+            if resource.identity.get('repair_pending') and _canonical(result['state']) == _canonical(resource.identity['state']):
+                result['repair_pending'] = True
             return result
         if kind == 'rule':
             rules = [r for r in snapshot['rules'] if r.get('priority') == a.priority]
@@ -352,10 +365,15 @@ class Network:
             result = {'ifindex': link['ifindex'], 'kind': link.get('linkinfo', {}).get('info_kind'),
                       'alias': link.get('ifalias', ''), 'mtu': link.get('mtu'),
                       'up': 'UP' in link.get('flags', [])}
-            if (result['kind'] != 'wireguard' or resource.identity and any(
-                    result[field] != resource.identity.get(field) for field in ('ifindex', 'alias'))):
+            aliases = {resource.identity.get('alias')}
+            if resource.identity.get('provisional'):
+                aliases.add('wgps:' + self.receipt.attempt_id)
+            if (result['kind'] != 'wireguard' or resource.identity and
+                    (result['ifindex'] != resource.identity.get('ifindex') or result['alias'] not in aliases)):
                 # Never request key-bearing output for a known replacement.
                 return result
+            if resource.identity.get('provisional'):
+                return dict(resource.identity)  # Same ifindex/kind and recorded-or-planned alias; never readiness.
             addresses = _json(self.runner, 'ip', '-j', '-4', 'address', 'show', 'dev', a.interface)
             result['addresses'] = sorted(f"{x['local']}/{x['prefixlen']}" for dev in addresses
                                          for x in dev.get('addr_info', []) if x.get('family') == 'inet')
@@ -389,10 +407,13 @@ class Network:
                 os.close(fd)
         raise NetworkError('receipt contains a resource outside the network adapter scope')
 
-    def _capture(self, kind, name):
+    def _capture(self, kind, name, *, provisional=None):
         identity = self._observe(own.ResourceIdentity(kind, name, {}), self._snapshot())
         if identity is None:
             raise NetworkError('newly acquired network resource is missing during readback')
+        previous = next((r.identity for r in self.receipt.resources if (r.kind, r.name) == (kind, name)), {})
+        if kind == 'interface' and (provisional is True or (provisional is None and previous.get('provisional'))):
+            identity['provisional'] = True
         if kind == 'nft_table' and (type(identity['handle']) is not int or identity['handle'] <= 0 or
                                    identity['comment'] != 'wgps:' + self.receipt.attempt_id):
             raise NetworkError('new nft table lacks its required handle and attempt marker')
@@ -436,7 +457,7 @@ class Network:
         # A timeout/death between them must not turn into name-only adoption.
         self.uncertain = True
         self._run(*argv, input=input)
-        result = self._capture(kind, name)
+        result = self._capture(kind, name, provisional=kind == 'interface')
         self.uncertain = False
         return result
 
@@ -511,7 +532,7 @@ class Network:
         self._run('sysctl', '-w', 'net.ipv4.conf.wgps0.route_localnet=1')
         self._capture('sysctl', 'route_localnet')
         self._run('ip', 'link', 'set', 'dev', a.interface, 'up')
-        self._capture('interface', a.interface)
+        self._capture('interface', a.interface, provisional=False)
 
     def prepare(self, *, guard_blocked, on_receipt=None):
         """on_receipt runs once the new empty receipt is durable, before any mutation."""
@@ -583,7 +604,8 @@ class Network:
             changed.append('allocation:foreign')
         required = {kind + ':' + name for kind, name in self._required()}
         private_pending = any(r.kind in ('private_file', 'private_directory') for r in self.receipt.resources)
-        ready = self._configured_interface() and required.issubset(matching) and not missing and not changed and not private_pending
+        pending = any(r.identity.get('repair_pending') for r in self.receipt.resources)
+        ready = self._configured_interface() and required.issubset(matching) and not missing and not changed and not private_pending and not pending
         return Health(tuple(matching), tuple(missing), tuple(changed), ready)
 
     def _required(self):
@@ -631,6 +653,8 @@ class Network:
     def _configured_interface(self):
         a, p = self.allocation, self.profile
         interface = next((r.identity for r in self.receipt.resources if r.kind == 'interface'), {})
+        if interface.get('provisional'):
+            return False
         expected = {'kind': 'wireguard', 'alias': 'wgps:' + self.receipt.attempt_id,
                     'mtu': p.mtu, 'up': True, 'addresses': [p.address], 'prefix_route_flags': [True],
                     'fwmark': a.outer_mark, 'peers': [[p.public_key]],
@@ -655,7 +679,7 @@ class Network:
         if health.ready:
             return self.receipt
         temporary = [r for r in self.receipt.resources if r.kind in ('private_file', 'private_directory')]
-        if temporary and not health.changed:
+        if not health.changed:
             # An interrupted repair left its temporary configuration; remove
             # exactly that (verified), then repair what is still missing.
             for kind in ('private_file', 'private_directory'):
@@ -682,6 +706,12 @@ class Network:
                                 self._observe(resource, self._snapshot()),
                                 boot_id=self.boot_id, attempt_id=self.receipt.attempt_id)
             self._run('ip', 'link', 'delete', 'dev', a.interface)
+            health = self.health()
+        preferred = next((r for r in self.receipt.resources if r.kind == 'route' and r.name == 'preferred'), None)
+        if preferred and preferred.identity.get('repair_pending') and 'route:preferred' in health.matching:
+            own.verify_resource(self.receipt, 'route', 'preferred', self._observe(preferred, self._snapshot()),
+                                boot_id=self.boot_id, attempt_id=self.receipt.attempt_id)
+            self._run(*self._route_argv('delete', 'preferred'))
             health = self.health()
         missing = set(health.missing)
         if (health.changed or not anchors.issubset(health.matching) or
@@ -810,9 +840,13 @@ class Network:
                 directory = own.open_private_dir(self.wireguard_root / name, owner_uid=self.owner_uid)
                 try:
                     try:
-                        os.unlink('wg.conf', dir_fd=directory)
+                        os.stat('wg.conf', dir_fd=directory, follow_symlinks=False)
                     except FileNotFoundError:
                         pass
+                    else:
+                        identity = own.file_identity(directory, 'wg.conf')
+                        own.verify_file(directory, 'wg.conf', identity)
+                        os.unlink('wg.conf', dir_fd=directory)
                     os.fsync(directory)
                 finally:
                     os.close(directory)
@@ -845,6 +879,18 @@ class Network:
                 os.close(fd)
         elif kind == 'private_directory':
             path = Path(resource.identity['path'])
+            directory = own.open_private_dir(path, owner_uid=self.owner_uid)
+            try:
+                try:
+                    os.stat('wg.conf', dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    identity = own.file_identity(directory, 'wg.conf')
+                    own.verify_file(directory, 'wg.conf', identity)
+                    os.unlink('wg.conf', dir_fd=directory)
+            finally:
+                os.close(directory)
             fd = own.open_private_dir(path.parent, owner_uid=self.owner_uid)
             try:
                 os.rmdir(path.name, dir_fd=fd)

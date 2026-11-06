@@ -541,7 +541,14 @@ old peer index until the replacement is configured. Missing tunnel objects keep
 their recorded ownership fences, and the firewall receipt binds the pending
 profile after its exact unchanged kernel identity is verified. Controller
 interruption resumes against those old-or-pending identities; it does not
-remove the packet-level protection or adopt arbitrary replacement resources. Missing or modified
+remove the packet-level protection or adopt arbitrary replacement resources.
+Partly configured replacements remain provisional and cannot establish
+readiness. Their recorded interface identity permits deletion and reconstruction;
+fenced route births are likewise removed and recreated. Private temporary
+configuration is removed only inside the owned attempt directory with verified
+root ownership, private permissions and a single regular-file link. An interface
+creation interrupted before its first ownership capture still requires operator
+inspection; it is never adopted solely by name. Missing or modified
 ownership evidence blocks recovery instead of adopting or deleting foreign
 resources. An explicit disable can cancel a pending switch using its recorded
 old-or-target binding without first bringing the tunnel online. All peers

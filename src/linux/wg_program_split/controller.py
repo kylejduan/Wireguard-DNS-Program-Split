@@ -19,7 +19,7 @@ from . import ownership as own
 from . import failover
 from .config import (Settings, canonical_executable, parse_policy, parse_profile,
                      policy_path, settings_json)
-from .network import Allocation, Network, allocate, inspect
+from .network import Allocation, Network, UnderlayUnavailable, allocate, inspect
 from .preflight import (ControllerError, ProbeUnavailable, NativeGuard, check_host, process_snapshot,
                         read_private, readiness_probe, restart_audit)
 
@@ -219,17 +219,29 @@ class Controller:
         if not _present(state, 'receipt.json') or not journal['network_started']:
             raise ControllerError('peer change lost its ownership receipt')
         network = self._network(state, profile, journal)
-        network.switch_peer(self._peer_pool[target], guard_blocked=True)
+        try:
+            network.switch_peer(self._peer_pool[target], guard_blocked=True)
+        except UnderlayUnavailable:
+            # The target binding and absence fences are durable. Commit that
+            # identity so later checks can repair it or try another peer.
+            if network.profile != self._peer_pool[target]:
+                raise
         rotation.update(active=target, pending=None)
         journal.update(state='degraded', probe_at=None)
         return self._save(state, journal, identity)
 
-    def _failed_probe(self, state, profile, journal, identity):
+    def _failed_probe(self, state, profile, journal, identity, *, incomplete=False):
         """Rotate only after repeated liveness failures with intact ownership."""
+        if journal['pending'] is not None:
+            raise ControllerError('finish the policy transaction before peer failover')
         self._block(journal)
         network = self._network(state, profile, journal)
         health = network.health()
-        if not health.ready or health.changed or health.missing:
+        a = journal['allocation']
+        anchors = {'route:fallback', 'rule:vpn', 'nft_table:' + a['nft_table'], 'conntrack_zone:vpn'}
+        replaceable = {'route:preferred', 'interface:' + a['interface'], 'sysctl:route_localnet'}
+        safe_incomplete = incomplete and anchors.issubset(health.matching) and set(health.missing) <= replaceable
+        if health.changed or (not health.ready and not safe_incomplete) or (health.missing and not safe_incomplete):
             raise ControllerError('ownership changed during failed readiness probe')
         rotation = journal['failover']
         rotation['failures'] = min(failover.FAILURES_BEFORE_SWITCH, rotation['failures'] + 1)
@@ -410,7 +422,12 @@ class Controller:
             # interrupted repair left: repair under a blocked guard.
             self._block(journal)
             was_ready = False
-            network.repair_missing(guard_blocked=True)
+            try:
+                network.repair_missing(guard_blocked=True)
+            except UnderlayUnavailable:
+                if 'failover' not in journal:
+                    raise
+                return self._failed_probe(state, profile, journal, identity, incomplete=True)
             health = network.health()
         if not health.ready or health.changed or health.missing:
             raise ControllerError('owned network is incomplete or changed')

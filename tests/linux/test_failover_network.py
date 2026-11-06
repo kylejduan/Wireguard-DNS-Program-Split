@@ -73,6 +73,90 @@ class NetworkSwitchTests(unittest.TestCase):
         self.assert_anchors()
         self.assertFalse(any(c[:3] == ('ip', 'link', 'delete') for c in self.kernel.calls[before:]))
 
+    def test_every_kernel_mutation_boundary_recovers_or_refuses_unrecorded_birth(self):
+        def mutation(argv):
+            return ((argv[0] == 'ip' and any(x in argv for x in ('add', 'set', 'delete'))) or
+                    argv[:2] in (('wg', 'setconf'), ('sysctl', '-w'), ('conntrack', '-D')))
+        calls = []
+        runner = self.kernel
+        def observe(argv, **kwargs):
+            value = runner(argv, **kwargs)
+            if mutation(tuple(argv)): calls.append(tuple(argv))
+            return value
+        self.network.runner = observe
+        self.network.switch_peer(self.target, guard_blocked=True)
+        for index, boundary in enumerate(calls):
+            with self.subTest(index=index, boundary=boundary[:4]):
+                self.setUp()
+                kernel, counter = self.kernel, []
+                def interrupted(argv, **kwargs):
+                    value = kernel(argv, **kwargs)
+                    if mutation(tuple(argv)):
+                        counter.append(tuple(argv))
+                        if len(counter) - 1 == index: raise Died()
+                    return value
+                self.network.runner = interrupted
+                with self.assertRaises(Died):
+                    self.network.switch_peer(self.target, guard_blocked=True)
+                self.assert_anchors()
+                resumed = self.make_network()
+                if boundary[:3] == ('ip', 'link', 'add'):
+                    # No ifindex was ever recorded. Never adopt that birth.
+                    with self.assertRaises(NetworkError):
+                        resumed.switch_peer(self.target, guard_blocked=True)
+                else:
+                    resumed.switch_peer(self.target, guard_blocked=True)
+                    self.assertTrue(resumed.health().ready)
+                self.assert_anchors()
+
+    def test_unrecorded_private_file_and_directory_are_safely_removed(self):
+        for kind in ('private_directory', 'private_file'):
+            with self.subTest(kind=kind):
+                self.setUp()
+                record = self.network._record
+                def interrupted(which, name, identity):
+                    if which == kind: raise Died()
+                    return record(which, name, identity)
+                with patch.object(self.network, '_record', side_effect=interrupted):
+                    with self.assertRaises(Died):
+                        self.network.switch_peer(self.target, guard_blocked=True)
+                self.assert_anchors()
+                resumed = self.make_network()
+                resumed.switch_peer(self.target, guard_blocked=True)
+                self.assertTrue(resumed.health().ready)
+                self.assertFalse(list(self.wireguard.iterdir()))
+
+    def test_unsafe_unrecorded_configuration_is_never_removed(self):
+        record = self.network._record
+        def interrupted(which, name, identity):
+            if which == 'private_file': raise Died()
+            return record(which, name, identity)
+        with patch.object(self.network, '_record', side_effect=interrupted):
+            with self.assertRaises(Died):
+                self.network.switch_peer(self.target, guard_blocked=True)
+        config = next(self.wireguard.glob('*/wg.conf'))
+        config.chmod(0o644)
+        with self.assertRaises((NetworkError, own.OwnershipError)):
+            self.make_network().switch_peer(self.target, guard_blocked=True)
+        self.assertTrue(config.exists())
+        self.assert_anchors()
+
+    def test_underlay_loss_after_binding_leaves_fences_for_later_repair(self):
+        from wg_program_split.network import UnderlayUnavailable
+        record = self.network._record
+        def lose_underlay(kind, name, identity):
+            record(kind, name, identity)
+            if kind == 'nft_table':
+                self.kernel.fail_prefix = ('ip', '-j', '-4', 'route', 'get')
+        with patch.object(self.network, '_record', side_effect=lose_underlay):
+            with self.assertRaises(UnderlayUnavailable):
+                self.network.switch_peer(self.target, guard_blocked=True)
+        self.assert_anchors()
+        self.kernel.fail_prefix = None
+        resumed = self.make_network()
+        resumed.switch_peer(self.target, guard_blocked=True)
+        self.assertTrue(resumed.health().ready)
+
     def test_interruptions_after_old_route_or_interface_deletion_resume(self):
         for prefix in [('ip', '-4', 'route', 'delete'), ('ip', 'link', 'delete')]:
             with self.subTest(prefix=prefix):
