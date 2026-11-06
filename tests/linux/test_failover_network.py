@@ -139,6 +139,7 @@ class NetworkSwitchTests(unittest.TestCase):
                         self.network.switch_peer(self.target, guard_blocked=True)
                 self.assert_anchors()
                 resumed = self.make_network()
+                self.assertTrue(any(key.startswith(kind + ':') for key in resumed.health().missing))
                 resumed.switch_peer(self.target, guard_blocked=True)
                 self.assertTrue(resumed.health().ready)
                 self.assertFalse(list(self.wireguard.iterdir()))
