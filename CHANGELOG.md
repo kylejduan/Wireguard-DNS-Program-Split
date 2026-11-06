@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-11-06
+
+- Windows: preserve direct DNS capacity during a slow or unavailable tunnel
+  resolver by limiting outstanding tunnel exchanges to 128 of 256 workers.
+  Excess selected work fails closed; it never falls back to direct DNS.
+- Windows: resolve executable images in four fixed workers with bounded slots,
+  process-lifetime caching and a shared wait budget. A blocked filesystem or
+  antivirus image lookup no longer holds the attribution consumer indefinitely.
+  Late results cannot remove unknown-name quarantine or rewrite previous hints.
+- Windows: keep file/console logging off DNS attribution and query threads with
+  a bounded asynchronous queue, explicit drop notices and bounded shutdown.
+- Windows: let the installing account read the logs subtree so **Open logs**
+  works from Explorer, while keeping configuration, keys and state protected.
+  Add the manually invoked read-only `Get-PerformanceState.ps1` diagnostic.
+- Tests: exercise real DNS Client/ETW tunnel outages, image-resolution stalls,
+  receiver-side selected-name isolation, recovery, log contention and lifetime
+  handling. The unchanged baseline fails the outage test while direct DNS stays
+  available with the new dispatcher. See [measurements and limits](docs/performance.md#november-6-2026-dns-isolation-and-reboot-verification).
+- Windows: reduce supervision polling and wait for a usable physical route at
+  startup, avoiding repeated full rebuilds while the uplink is unavailable.
 - Windows: route DNS-component failures to their own repair, cap full rebuilds and
   failed starts at three attempts per fifteen minutes across controller restarts,
   and retain the first snapshot of repeated failures with bounded retention.

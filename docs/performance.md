@@ -549,3 +549,82 @@ quantum, and a zero per-round reading does not mean zero cost. The contention
 fixture deliberately exposes needless wakeups; it does not establish a similar
 improvement in DNS latency, game latency, throughput or normal idle CPU. Real
 ETW and service-lifecycle tests remain necessary alongside these fixtures.
+
+
+## November 6, 2026: DNS isolation and reboot verification
+
+The Windows dispatcher now bounds slow tunnel DNS exchanges, executable-image
+resolution and diagnostic logging. The normal payload path, WFP rules, DNS
+privacy policy and health-check cadence are preserved. Details and failure
+bounds are in [DNS outage isolation](dns-isolation.md).
+
+### Failure-isolation evidence
+
+[CI 42190721000](https://github.com/kylejduan/Wireguard-DNS-Program-Split/actions/runs/42190721000)
+passed Windows native/PowerShell checks, service/supervisor lifecycle tests,
+real DNS Client/ETW integration and Linux unit/native checks at `878ec5f`.
+Privileged Linux VM acceptance was not run; Linux runtime code is unchanged
+from 0.3.3.
+
+The disposable Windows fixture offered 1,200 selected and 240 distinct-name
+direct lookups over twelve seconds while the tunnel resolver was silent:
+
+| Dispatcher | Direct successes | Successful direct DNS p99 |
+|---|---:|---:|
+| Unchanged baseline `dd5ddfa8` | 105 / 240 | 2.12 ms |
+| Hardened dispatcher | 240 / 240 | 2.01 ms |
+
+Latency among successful requests alone hides the baseline's 135 failures.
+Receiver-side checks confirmed selected names never reached the direct
+resolver. Selected DNS recovered under load when the same tunnel responder
+resumed. This proves the tested outage scenario, not arbitrary flood immunity.
+
+A separate compile-only fault build delayed twenty executable-image lookups
+by five seconds each. Warmed direct-process DNS succeeded 240/240, with
+67.32 ms p99, no incomplete ordering barriers and no stalled selected name at
+the direct resolver. Thus faults can still add DNS latency. Four stuck image
+resolutions can refuse new uncached identities; cached identities remain
+available, subject to the existing same-name quarantine. The fault build is
+never used as the normal dispatcher.
+
+Native tests also cover process-lifetime cache keys, late completion and
+reloads, queue contention, final log-drop notices, cancellation and bounded
+worker ownership. Identical counterfactual tests held the original consumer
+for 3,113 ms across twenty slow identities versus 164 ms with the shared wait
+budget. This budget uses fixed windows and is not a hard real-time guarantee.
+
+### Cost and scope
+
+In the same CI fixture, warm dispatcher private memory changed from 1.64 to
+1.80 MiB and its thread count from eight to thirteen. During the outage the
+old/new samples were 25.63/15.03 MiB and 243/140 threads. These are dispatcher
+samples, not total operating-system costs.
+
+A sixty-second reference-workstation sample after activation measured 0.0317%
+of the 32-logical-processor machine's CPU and 483.3 MiB private memory across
+persistent product processes. The dispatcher itself used 4.58 MiB and 0.104%
+of one core. Most private memory remains in PowerShell; no controller/tray
+rewrite or reduction in that cost is claimed. These samples exclude transient
+helpers and system-wide driver, DPC and interrupt work.
+
+No bulk-download gain is claimed. Receive segment coalescing was configured
+on but operationally restricted by WFP compatibility on the reference host.
+That observation does not identify a responsible driver or measure its
+throughput impact. No offload flags or kernel drivers were changed.
+
+### Live reboot observation
+
+After activation, a normal workstation reboot independently verified the
+installed binary hash, service command paths, current process ownership,
+Automatic controller/Manual tunnel startup, preserved profile/settings/app
+hashes, logs/profile permissions, owned NRPT policy, WFP identities and PIA
+callout registration. System DNS, tunnel DNS and HTTPS succeeded. The tray
+started at logon and no product file replacements remained pending.
+
+The controller started about 27 seconds after OS boot, the tunnel about
+33 seconds after boot, and the first full filter/dispatcher/tunnel validation
+completed about 37 seconds after boot. The physical interface was correctly
+rediscovered after its numeric index changed. Subsequent health checks passed.
+These are observations of this reboot, not a startup-time or long-term
+availability guarantee. Private host identifiers, keys, logs and rollback
+files are not part of this source release.
