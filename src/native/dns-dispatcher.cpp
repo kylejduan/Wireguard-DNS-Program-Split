@@ -107,6 +107,16 @@ std::wstring canonicalPath(const std::wstring& path) {
     return resolved.empty() ? path : resolved;
 }
 
+std::wstring finalImagePath(std::wstring name) {
+    // The kernel supplies a full Win32 image name. Preserve long DOS and UNC
+    // paths without changing system-wide long-path policy or guessing identity.
+    if (name.size() >= MAX_PATH && name.rfind(L"\\\\?\\", 0) != 0) {
+        if (name.rfind(L"\\\\", 0) == 0) name = L"\\\\?\\UNC\\" + name.substr(2);
+        else if (name.size() > 2 && name[1] == L':' && name[2] == L'\\') name = L"\\\\?\\" + name;
+    }
+    return wgps::finalPath(name, VOLUME_NAME_DOS);
+}
+
 // Called only by the bounded resolver pool, never by the ETW consumer.
 std::wstring resolveImagePath(HANDLE process) {
     std::vector<wchar_t> buffer(32768);
@@ -115,7 +125,14 @@ std::wstring resolveImagePath(HANDLE process) {
     if (!ok) return {};
     // A running image that cannot be opened is unknown. Guessing from a raw or
     // partially resolved alias could misclassify a selected executable as direct.
-    return wgps::finalPath(std::wstring(buffer.data(), size), VOLUME_NAME_DOS);
+#ifdef WGPS_DNS_TEST_STALL_IMAGES
+    // Fault-injected CI build only; no runtime setting can enable this in the
+    // shipped dispatcher. The normal executable is built without this define.
+    const std::wstring image(buffer.data(), size);
+    const auto separator = image.find_last_of(L"\\/");
+    if (lower(image.substr(separator == std::wstring::npos ? 0 : separator + 1)).rfind(L"stall-", 0) == 0) Sleep(5000);
+#endif
+    return finalImagePath(std::wstring(buffer.data(), size));
 }
 
 std::unordered_set<std::wstring> parseIncludedText(const std::wstring& text) {

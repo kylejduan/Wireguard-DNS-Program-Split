@@ -11,8 +11,9 @@
 
 namespace wgps {
 // Best-effort diagnostics must not hold DNS attribution, its mutex, or a query
-// worker behind disk/pipe I/O. A single writer owns the sink. Producers never
-// wait for it, and queued memory is bounded independently of the rotating file.
+// worker behind disk/pipe I/O. A single writer owns the sink. The queue lock
+// covers fixed memory operations only; no sink I/O or allocation occurs under
+// it. Queued memory is bounded independently of the rotating file.
 class AsyncLog {
 public:
     using Sink = std::function<void(std::string_view)>;
@@ -53,8 +54,8 @@ public:
             // Allocate/copy outside the queue lock. Queue slots are fixed and
             // moved by swap; the writer never holds this lock during sink I/O.
             std::string message(bytes);
-            std::unique_lock lock(state_->mutex, std::try_to_lock);
-            if (!lock || !state_->accepting || state_->count == kMaxMessages ||
+            std::unique_lock lock(state_->mutex);
+            if (!state_->accepting || state_->count == kMaxMessages ||
                 bytes.size() > kMaxBytes - state_->bytes) return drop();
             state_->slots[state_->tail].swap(message);
             state_->tail = (state_->tail + 1) % kMaxMessages;
@@ -82,7 +83,11 @@ private:
         std::atomic<ULONGLONG> stopAt{};
         std::atomic<unsigned long long> dropped{};
     };
-    bool drop() noexcept { ++state_->dropped; return false; }
+    bool drop() noexcept {
+        ++state_->dropped;
+        if (state_->ready) SetEvent(state_->ready);
+        return false;
+    }
     static DWORD WINAPI run(void* opaque) noexcept {
         std::unique_ptr<std::shared_ptr<State>> context(static_cast<std::shared_ptr<State>*>(opaque));
         auto state = std::move(*context);
@@ -94,21 +99,26 @@ private:
                 for (;;) {
                     if (state->stopping && GetTickCount64() >= state->stopAt) return 0;
                     std::string message;
+                    bool empty{};
                     {
                         std::lock_guard lock(state->mutex);
                         if (!state->count) {
-                            if (state->stopping) return 0;
-                            break;
+                            empty = true;
+                        } else {
+                            message.swap(state->slots[state->head]);
+                            state->head = (state->head + 1) % kMaxMessages;
+                            --state->count;
+                            state->bytes -= message.size();
                         }
-                        message.swap(state->slots[state->head]);
-                        state->head = (state->head + 1) % kMaxMessages;
-                        --state->count;
-                        state->bytes -= message.size();
                     }
                     const auto lost = state->dropped.load();
                     if (lost != reported) {
                         state->sink("LOG QUEUE DROPPED " + std::to_string(lost - reported) + "\r\n");
                         reported = lost;
+                    }
+                    if (empty) {
+                        if (state->stopping) return 0;
+                        break;
                     }
                     state->sink(message);
                 }

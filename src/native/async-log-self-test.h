@@ -1,8 +1,46 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "async-log.h"
+#include <thread>
+#include <vector>
 
 namespace wgps {
+inline bool asyncLogContentionSelfTest() {
+    struct Acks {
+        std::array<HANDLE, 8> ready{};
+        std::array<std::atomic_uint, 8> received{};
+        std::atomic_bool failed{};
+        ~Acks() { for (HANDLE event : ready) if (event) CloseHandle(event); }
+    };
+    auto acks = std::make_shared<Acks>();
+    for (auto& event : acks->ready) {
+        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event) return false;
+    }
+    AsyncLog log([acks](std::string_view line) {
+        const unsigned producer = line.empty() ? 8 : static_cast<unsigned>(line[0] - '0');
+        if (producer >= 8) { acks->failed = true; return; }
+        ++acks->received[producer];
+        SetEvent(acks->ready[producer]);
+    });
+    std::vector<std::thread> producers;
+    for (unsigned i = 0; i < 8; ++i) producers.emplace_back([&, i] {
+        for (unsigned n = 0; n < 128; ++n) {
+            // One outstanding message per producer keeps the queue below eight
+            // entries, so a drop demonstrates contention rather than overload.
+            if (!log.write(std::to_string(i) + ":" + std::to_string(n) + "\r\n") ||
+                WaitForSingleObject(acks->ready[i], 5000) != WAIT_OBJECT_0) {
+                acks->failed = true;
+                return;
+            }
+        }
+    });
+    for (auto& producer : producers) producer.join();
+    if (acks->failed || log.dropped()) return false;
+    for (auto& received : acks->received) if (received != 128) return false;
+    return true;
+}
+
 inline bool asyncLogSelfTest() {
     struct Events {
         HANDLE entered{CreateEventW(nullptr, TRUE, FALSE, nullptr)};

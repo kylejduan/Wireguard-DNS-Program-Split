@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include <windows.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <list>
 #include <memory>
@@ -108,7 +110,24 @@ public:
         }
         const ULONGLONG elapsed = GetTickCount64() - submitted;
         const HANDLE waits[]{state_->stop, done};
-        if (elapsed < wait_) WaitForMultipleObjects(2, waits, FALSE, static_cast<DWORD>(wait_ - elapsed));
+        const auto beforeWait = std::chrono::steady_clock::now();
+        if (beforeWait - windowStarted_ >= std::chrono::seconds(1)) {
+            windowStarted_ = beforeWait;
+            waited_ = {};
+        }
+        // One slow process must not turn a stream of cache misses into an
+        // unbounded sequence of waits ahead of every ordering sentinel. Share
+        // the wait allowance across all identities, not just one process key.
+        const auto available = std::chrono::milliseconds(wait_) - waited_;
+        DWORD allowance{};
+        if (elapsed < wait_ && available > std::chrono::steady_clock::duration::zero()) {
+            allowance = std::min<DWORD>(static_cast<DWORD>(wait_ - elapsed),
+                static_cast<DWORD>(std::chrono::duration_cast<std::chrono::milliseconds>(available).count()));
+        }
+        if (allowance) {
+            WaitForMultipleObjects(2, waits, FALSE, allowance);
+            waited_ += std::chrono::steady_clock::now() - beforeWait;
+        }
         if (WaitForSingleObject(state_->stop, 0) == WAIT_OBJECT_0) return {};
         harvest();
         if (auto hit = cached(key, GetTickCount64())) return *hit;
@@ -210,6 +229,8 @@ private:
     std::array<HANDLE, kWorkers> threads_{};
     unsigned count_{};
     DWORD wait_;
+    std::chrono::steady_clock::time_point windowStarted_{std::chrono::steady_clock::now()};
+    std::chrono::steady_clock::duration waited_{};
     std::list<Key> recent_;
     std::unordered_map<Key, Cached, Hash> cache_;
 };

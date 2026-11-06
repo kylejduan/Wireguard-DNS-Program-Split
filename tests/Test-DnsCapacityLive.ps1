@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory)] [string] $RepositoryRoot,
     [Parameter(Mandatory)] [string] $Dispatcher,
-    [switch] $ExpectStarvation
+    [switch] $ExpectStarvation,
+    [switch] $ImageStalls
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -50,6 +51,47 @@ function Wait-Client($Process, [string] $Label) {
     if (-not $Process.WaitForExit(60000)) { throw "$Label exceeded its deadline." }
     if ($Process.ExitCode -ne 0) { throw "$Label failed: $(Read-Text "$Label.err")" }
 }
+function Test-ImageStalls([string] $DirectExe, [string[]] $StalledApps) {
+    # The direct process warms its own identity before the stalled executables
+    # start. Four stuck identities may refuse new misses; cached identities must
+    # still progress and ordering sentinels must not sit behind repeated waits.
+    $ordinary = Launch $DirectExe @('direct', $zone, '20', '12', '--warm') 'image-direct'
+    $ready = [Diagnostics.Stopwatch]::StartNew()
+    while ((Read-Text 'image-direct.err') -notmatch 'READY pid=') {
+        if ($ordinary.HasExited -or $ready.Elapsed.TotalSeconds -gt 10) { throw 'Normal DNS process did not warm before image stalls.' }
+        Start-Sleep -Milliseconds 25
+    }
+    $stalled = @()
+    for ($i = 0; $i -lt $StalledApps.Count; ++$i) {
+        $label = "stalled-$i"
+        $stalled += [pscustomobject]@{ Label = $label; Process = (Launch $StalledApps[$i] @($label, $zone, '1', '1') $label) }
+    }
+    foreach ($client in $stalled) {
+        Wait-Client $client.Process $client.Label
+        if ((Read-Text "$($client.Label).out" | ConvertFrom-Json).directAnswers) { throw 'A stalled selected process received direct DNS.' }
+    }
+    Wait-Client $ordinary 'image-direct'
+    $result = Read-Text 'image-direct.out' | ConvertFrom-Json
+    if ($result.successes -lt $result.started * 0.99 -or $result.p99_ms -gt 1000) {
+        throw 'Image stalls disrupted ordinary cached-process DNS.'
+    }
+    $drain = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $log = Read-Text 'dispatcher.log'
+        if ([regex]::Matches($log, '(?m)^DNS direct-[^\r\n]* -> DIRECT').Count -ge $result.successes) { break }
+        Start-Sleep -Milliseconds 25
+    } while ($drain.Elapsed.TotalSeconds -lt 3)
+    if ([regex]::Matches($log, '(?m)^DNS direct-[^\r\n]* -> DIRECT').Count -lt $result.successes) { throw 'Image-stall diagnostics did not drain.' }
+    if ($log -notmatch '(?m)^HINT stalled-[^\r\n]*identity=pending') { throw 'The image-resolution fault was not exercised.' }
+    if ($log -match '(?m)^LOG QUEUE DROPPED|^BARRIER INCOMPLETE' -or
+        $log -match ("(?m)^HINT [^\r\n]*pid=$($ordinary.Id)\s[^\r\n]*identity=(pending|none)")) {
+        throw 'A stalled image blocked attribution, lost evidence, or affected the warmed process identity.'
+    }
+    if ((Read-Text 'resolver.out') -match '(?m)^DIRECT stalled-') { throw 'A stalled selected name reached the direct resolver.' }
+    Write-Output ("OBSERVED: 20 stalled selected image lookups; normal DNS=$($result|ConvertTo-Json -Compress); " +
+        'no ordering-barrier failure, no direct resolver received a stalled selected name.')
+    Write-Output 'PASS: real DNS/ETW image-stall isolation.'
+}
 try {
     [IO.Directory]::CreateDirectory($root) | Out-Null
     $selected = Join-Path $root 'selected.exe'
@@ -59,8 +101,18 @@ try {
     $probe = Join-Path $root 'selected-probe.exe'
     Copy-Item (Join-Path $RepositoryRoot 'build\test-net-probe.exe') $probe
     $includes = Join-Path $root 'included.txt'
-    [IO.File]::WriteAllText($includes, "$selected`r`n$probe`r`n", [Text.UTF8Encoding]::new($false))
-    $resolver = Launch (Join-Path $RepositoryRoot 'build\test-dns-responder.exe') @('--fixture', '180', '--tunnel-outage') 'resolver'
+    $stalledApps = @()
+    if ($ImageStalls) {
+        foreach ($i in 0..19) {
+            $path = Join-Path $root "stall-$i.exe"
+            Copy-Item (Join-Path $RepositoryRoot 'build\test-dns-load.exe') $path
+            $stalledApps += $path
+        }
+    }
+    [IO.File]::WriteAllLines($includes, @($selected, $probe) + $stalledApps, [Text.UTF8Encoding]::new($false))
+    $resolverArguments = @('--fixture', '180')
+    if (-not $ImageStalls) { $resolverArguments += '--tunnel-outage' }
+    $resolver = Launch (Join-Path $RepositoryRoot 'build\test-dns-responder.exe') $resolverArguments 'resolver'
     Wait-Ready $resolver 'resolver'
     $server = Launch $Dispatcher @(
         ('"{0}"' -f $includes), '127.0.0.2', '127.0.0.2', '127.0.0.3', '127.0.0.3', $trace,
@@ -68,6 +120,7 @@ try {
     ) 'dispatcher'
     Wait-Ready $server 'dispatcher'
     $rule = Add-DnsClientNrptRule -Namespace ".$zone" -NameServers '127.0.0.1' -DisplayName "WgpsCapacity-$id" -PassThru
+    if ($ImageStalls) { Test-ImageStalls $direct $stalledApps; return }
     $warm = Launch $direct @('warm', $zone, '5', '1') 'warm'
     Wait-Client $warm 'warm'
     $warmResults = Read-Text 'warm.out' | ConvertFrom-Json
@@ -93,12 +146,26 @@ try {
     $protected = $directResults.successes -ge $directResults.started * 0.99 -and $directResults.p99_ms -le 1000
     if ($ExpectStarvation -and $protected) { throw 'Pre-fix baseline did not expose the intended starvation regression.' }
     if (-not $ExpectStarvation -and -not $protected) { throw 'Direct DNS was disrupted by the selected tunnel outage.' }
-    $log = Read-Text 'dispatcher.log'
+    $logTimer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $log = Read-Text 'dispatcher.log'
+        $resolverLog = Read-Text 'resolver.out'
+        $decisions = [regex]::Matches($log, '(?m)^DNS direct-[^\r\n]* -> DIRECT').Count
+        $received = [regex]::Matches($resolverLog, '(?m)^DIRECT direct-').Count
+        if ($decisions -ge $directResults.successes -and $received -ge $directResults.successes) { break }
+        Start-Sleep -Milliseconds 50
+    } while ($logTimer.Elapsed.TotalSeconds -lt 3)
+    if ($decisions -lt $directResults.successes -or $received -lt $directResults.successes) {
+        throw 'The fixture did not drain its positive query evidence.'
+    }
     if (-not $ExpectStarvation -and $log -notmatch '\(tunnel lane full\)') {
         throw 'No tunnel-capacity refusal was observed; the test did not exercise the limit.'
     }
     if (-not $ExpectStarvation -and $log -match '(?m)^WORKERS EXHAUSTED') {
         throw 'Selected upstream requests exhausted global worker admission despite the lane cap.'
+    }
+    if (-not $ExpectStarvation -and $log -match '(?m)^LOG QUEUE DROPPED') {
+        throw 'Capacity fixture diagnostic evidence was dropped.'
     }
     if ($log -match '(?m)^DNS selected-[^\r\n]* -> DIRECT') { throw 'Selected attribution crossed to the direct lane.' }
     # Let the remaining four-second upstream exchanges finish, then resume the
@@ -107,6 +174,15 @@ try {
     $recovery = Launch $probe @('system-dns', "resume.$zone") 'recovery'
     Wait-Client $recovery 'recovery'
     if ((Read-Text 'recovery.out') -notmatch 'ANSWER 192\.0\.2\.1') { throw 'Tunnel DNS did not recover.' }
+    $recovered = Launch $selected @('recovered', $zone, '50', '2') 'recovered'
+    Wait-Client $recovered 'recovered'
+    $healthy = Read-Text 'recovered.out' | ConvertFrom-Json
+    if ($healthy.tunnelAnswers -lt $healthy.started * 0.99 -or $healthy.directAnswers) {
+        throw 'Healthy selected DNS did not sustain load after recovery.'
+    }
+    if ((Read-Text 'resolver.out') -match '(?m)^DIRECT (selected-|recovered-)') {
+        throw 'A selected query reached the direct resolver, even if its answer was withheld.'
+    }
     Write-Output ("OBSERVED: baseline=$ExpectStarvation selected=$($selectedResults|ConvertTo-Json -Compress) " +
         "direct=$($directResults|ConvertTo-Json -Compress); selected never reached direct, tunnel recovered under the same dispatcher.")
     Write-Output ("OBSERVED: dispatcher-only outage-load sample before=$($before|ConvertTo-Json -Compress) " +

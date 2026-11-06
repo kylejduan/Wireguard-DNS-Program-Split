@@ -109,4 +109,23 @@ inline bool imageResolverCancellationTest() {
     return entered && immediate && result.status == ImageResolver::Status::Unavailable &&
            resolver.identifyPinned({1234, 2}, imageTestHandle()).status == ImageResolver::Status::Unavailable;
 }
+
+inline bool imageResolverWaitBudgetTest() {
+    auto calls = std::make_shared<std::atomic_uint>();
+    ImageResolver resolver([calls](HANDLE) {
+        if (++*calls > 1) Sleep(300);
+        return std::wstring(L"c:\\apps\\direct.exe");
+    });
+    const ImageResolver::Key warm{10, 1};
+    auto cached = resolver.identifyPinned(warm, imageTestHandle());
+    for (unsigned i = 0; i < 20 && cached.status == ImageResolver::Status::Pending; ++i) {
+        Sleep(10); cached = resolver.identifyPinned(warm, imageTestHandle());
+    }
+    if (cached.path.empty()) return false;
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < 20; ++i) resolver.identifyPinned({100 + i, 1}, imageTestHandle());
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    return elapsed < std::chrono::milliseconds(400) &&
+           resolver.identifyPinned(warm, imageTestHandle()).path == cached.path;
+}
 } // namespace wgps

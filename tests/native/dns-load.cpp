@@ -111,9 +111,19 @@ int load(const std::wstring& prefix, const std::wstring& zone, unsigned rate, un
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 5) return 2;
+    if (argc != 5 && argc != 6) return 2;
     const unsigned rate = static_cast<unsigned>(_wtoi(argv[3]));
     const unsigned seconds = static_cast<unsigned>(_wtoi(argv[4]));
     if (!rate || rate > 200 || !seconds || seconds > 20) return 2;
+    if (argc == 6) {
+        if (std::wstring(argv[5]) != L"--warm") return 2;
+        const std::wstring name = L"warm-" + std::wstring(argv[1]) + L"." + argv[2];
+        PDNS_RECORDW records{};
+        const auto status = DnsQuery_W(name.c_str(), DNS_TYPE_A, DNS_QUERY_BYPASS_CACHE | DNS_QUERY_NO_HOSTS_FILE,
+                                      nullptr, &records, nullptr);
+        if (records) DnsRecordListFree(reinterpret_cast<PDNS_RECORD>(records), DnsFreeRecordList);
+        if (status != ERROR_SUCCESS) return 4;
+        std::cerr << "READY pid=" << GetCurrentProcessId() << std::endl;
+    }
     return load(argv[1], argv[2], rate, seconds);
 }

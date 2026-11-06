@@ -7,7 +7,7 @@ flowchart LR
   E[DNS Client query event] --> C{PID and creation-time cache}
   C -->|known| H[Record attribution]
   C -->|miss| R[Fixed image resolver pool]
-  R -->|within 150 ms| H
+  R -->|within wait budget| H
   R -->|pending or unavailable| U[Record unknown-name quarantine]
   R -->|late completion| C
   H --> B[Ordering sentinel may advance]
@@ -29,7 +29,7 @@ This protects direct capacity from sustained slow tunnel exchanges. It does not 
 
 ## Image resolution
 
-Canonicalization can block in a filesystem or an antivirus filter. Four workers perform it outside the ETW consumer. Sixteen fixed slots own their process handles; a request for an already pending PID/creation-time pair reuses the existing job and original deadline. There is no unbounded thread creation, handle collection or queue of query names. If all workers are overdue, or slots are full, new misses fail closed immediately. A process cache hit still works independently of those workers.
+Canonicalization can block in a filesystem or an antivirus filter. Four workers perform it outside the ETW consumer. Sixteen fixed slots own their process handles; a request for an already pending PID/creation-time pair reuses the existing job and original deadline. All processes also share a 150 ms waiting budget per one-second window, so a stream of slow new processes cannot accumulate a full wait for each event ahead of ordering sentinels. This is a fixed-window budget, not a hard real-time scheduling guarantee. There is no unbounded thread creation, handle collection or queue of query names. If all workers are overdue, or slots are full, new misses fail closed immediately. A process cache hit still works independently of those workers.
 
 The consumer records unknown attribution before handling the next sentinel. Its ten-second quarantine protects both direct decisions and direct answers, including when another process already supplied unlisted evidence for that name. A late completion only inserts the resolved path into the 2,048-entry LRU cache; it never edits a DNS hint or shortens quarantine. Selection is evaluated against the current included list, including after a reload.
 
@@ -41,10 +41,12 @@ Native process names were considered as a replacement for final-path identity. T
 
 ## Logging and shutdown
 
-All dispatcher diagnostics go through one asynchronous writer. A fixed 256-slot ring holds at most 256 KiB, with a 64 KiB per-message limit. Producers use a brief try-lock and drop/count diagnostics rather than wait for the writer. Only the writer touches the existing 8 MiB log and its three archives. Console diagnostic mode uses the same queue for stdout. Dropped logs do not discard attribution state, and normal DNS integration requires zero drops.
+All dispatcher diagnostics go through one asynchronous writer. A fixed 256-slot ring holds at most 256 KiB, with a 64 KiB per-message limit. A brief queue lock covers only fixed memory operations; allocation and sink I/O occur outside it. Ordinary contention does not lose messages. Full queues, oversized messages or an unavailable writer drop/count diagnostics, and drops wake the writer so even a final lost message is reported once the sink can progress. Only the writer touches the existing 8 MiB log and its three archives. Console diagnostic mode uses the same queue for stdout. Dropped logs do not discard attribution state, and normal DNS integration requires zero drops.
 
 Barrier-failure diagnostics run outside the hint mutex. Lost-event safety state and barrier progress are applied before logging. Lane-full details are rate-limited, and the background flusher reports refusal counters; the receive loop and TCP acceptor never wait for a log write.
 
 Resolver and logger shutdown each request cancellation and wait at most one second. Workers own their slots, callbacks, events and sinks through shared state. An operation that ignores cancellation retains that state until it returns or the process exits, rather than accessing freed dispatcher memory. Fixed workers are created once per dispatcher; no retry spawns additional workers behind a stuck one.
 
 Native self-tests inject stuck resolvers, reused PID cache keys, pool exhaustion, late completion across a reload, an uncancellable logging sink and a held old log mutex. They check bounded waits, retained quarantine, handle stability, independent progress and safe shutdown. They use private memory/events and ephemeral loopback sockets; the privileged DNS policy/load fixture remains CI-only.
+
+A separate CI-only build injects five-second resolutions for twenty `stall-*.exe` clients. The real DNS/ETW fixture requires cached-process direct DNS to retain at least 99% success without incomplete barriers, and checks the responder never received a stalled selected name. The shipped dispatcher has no runtime switch for this fault. Healthy logger contention is tested with eight producers and acknowledgements keeping occupancy below eight, so zero-drop verification does not confuse intentional queue overflow with lock contention.
