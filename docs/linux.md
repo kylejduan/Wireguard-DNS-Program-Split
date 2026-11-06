@@ -543,7 +543,9 @@ profile after its exact unchanged kernel identity is verified. Controller
 interruption resumes against those old-or-pending identities; it does not
 remove the packet-level protection or adopt arbitrary replacement resources. Missing or modified
 ownership evidence blocks recovery instead of adopting or deleting foreign
-resources. All peers unavailable means selected applications remain blocked
+resources. An explicit disable can cancel a pending switch using its recorded
+old-or-target binding without first bringing the tunnel online. All peers
+unavailable means selected applications remain blocked
 and bounded retries continue. A provider-wide outage, expired client credential
 or every configured server being retired still requires provider/operator
 attention. The JSON status includes the zero-based active peer index, pending

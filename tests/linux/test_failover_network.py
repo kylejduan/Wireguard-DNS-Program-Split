@@ -127,6 +127,22 @@ class NetworkSwitchTests(unittest.TestCase):
             self.network.switch_peer(self.target, guard_blocked=True)
         self.assertEqual(self.kernel.peer, fixture.PUBLIC)
 
+    def test_explicit_disable_after_binding_commit_does_not_need_underlay(self):
+        record = self.network._record
+
+        def interrupted(kind, name, identity):
+            record(kind, name, identity)
+            if kind == 'nft_table':
+                raise Died()
+
+        with patch.object(self.network, '_record', side_effect=interrupted):
+            with self.assertRaises(Died):
+                self.network.switch_peer(self.target, guard_blocked=True)
+        self.kernel.fail_prefix = ('ip', '-j', '-4', 'route', 'get')
+        receipt = self.make_network().cancel_peer_change(self.target, guard_blocked=True)
+        self.assertEqual(receipt.resources, ())
+        self.assertFalse(any(x['ifname'] == 'wgps0' for x in self.kernel.links))
+
 
 if __name__ == '__main__':
     unittest.main()

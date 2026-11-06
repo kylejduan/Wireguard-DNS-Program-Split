@@ -665,9 +665,15 @@ class Controller:
                 identity = self._save(state, journal, identity)
                 if _present(state, 'receipt.json'):
                     network = self._network(state, profile, journal)
-                    if network.health().changed:
-                        raise ControllerError('changed network resources cannot be removed')
-                    receipt = network.disable(guard_blocked=True)
+                    target = journal.get('failover', {}).get('pending')
+                    if target is not None:
+                        if target >= len(self._peer_pool):
+                            raise ControllerError('pending peer is outside the configured pool')
+                        receipt = network.cancel_peer_change(self._peer_pool[target], guard_blocked=True)
+                    else:
+                        if network.health().changed:
+                            raise ControllerError('changed network resources cannot be removed')
+                        receipt = network.disable(guard_blocked=True)
                     if receipt.resources:
                         raise ControllerError('network cleanup is incomplete')
                     self._discard_receipt(state)
@@ -678,6 +684,8 @@ class Controller:
                 if self.kernel.exists():
                     raise ControllerError('guard removal did not complete')
                 journal.update(state='disabled', pins=None, pending=None, reason=None, probe_at=None)
+                if 'failover' in journal:
+                    journal['failover']['pending'] = None
                 self._save(state, journal, identity)
                 return self._result(journal, protection=False)
         except (OSError, ValueError, RuntimeError):

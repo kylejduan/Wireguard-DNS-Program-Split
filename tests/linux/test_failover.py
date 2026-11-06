@@ -83,6 +83,7 @@ class RecoveryTests(unittest.TestCase):
             return instance.receipt
 
         instance.switch_peer = switch_peer
+        instance.cancel_peer_change = lambda target, guard_blocked: instance.disable(guard_blocked=guard_blocked)
         return instance
 
     def journal(self):
@@ -182,6 +183,17 @@ class RecoveryTests(unittest.TestCase):
             self.controller.activate()
         self.assertEqual(self.kernel.state, 'blocked')
         self.assertEqual(self.kernel.events.count('network-prepare'), 1)
+
+    def test_explicit_disable_cancels_pending_rotation(self):
+        self.controller.activate()
+        path = self.paths.state / 'controller.json'
+        journal = self.journal()
+        journal['failover']['pending'] = 1
+        path.write_text(json.dumps(journal))
+        result = self.controller.disable()
+        self.assertEqual(result['state'], 'disabled')
+        self.assertIsNone(result['failover']['pending'])
+        self.assertIn('network-disable', self.kernel.events)
 
     def test_pool_symlinks_and_public_permissions_are_rejected(self):
         self.controller.activate()

@@ -723,22 +723,7 @@ class Network:
         """
         if guard_blocked is not True or self.uncertain or self.receipt is None:
             raise NetworkError('peer switch requires a blocked guard and owned network')
-        old = asdict(self.profile)
-        new = asdict(target)
-        for field in ('public_key', 'endpoint_host', 'endpoint_port'):
-            old.pop(field)
-            new.pop(field)
-        if old != new:
-            raise NetworkError('peer switch cannot change client identity or firewall inputs')
-        table = next((r for r in self.receipt.resources if r.kind == 'nft_table'), None)
-        if table is None:
-            raise NetworkError('peer switch lost its firewall receipt')
-        target_digest = _digest(asdict(target))
-        bound = table.identity.get('profile_sha256')
-        if bound == target_digest:
-            self.profile = target
-        elif bound != _digest(asdict(self.profile)):
-            raise NetworkError('peer switch has an unrecognized profile binding')
+        bound, target_digest = self._bind_pending_peer(target)
         health = self.health()
         a = self.allocation
         anchors = {'route:fallback', 'rule:vpn', 'nft_table:' + a.nft_table, 'conntrack_zone:vpn'}
@@ -772,6 +757,33 @@ class Network:
         self.profile = target
         self.repair_missing(guard_blocked=True)
         return self.receipt
+
+    def _bind_pending_peer(self, target):
+        """Interpret only the two configurations named by durable switch intent."""
+        old = asdict(self.profile)
+        new = asdict(target)
+        for field in ('public_key', 'endpoint_host', 'endpoint_port'):
+            old.pop(field)
+            new.pop(field)
+        if old != new:
+            raise NetworkError('peer switch cannot change client identity or firewall inputs')
+        table = next((r for r in self.receipt.resources if r.kind == 'nft_table'), None)
+        if table is None:
+            raise NetworkError('peer switch lost its firewall receipt')
+        target_digest = _digest(asdict(target))
+        bound = table.identity.get('profile_sha256')
+        if bound == target_digest:
+            self.profile = target
+        elif bound != _digest(asdict(self.profile)):
+            raise NetworkError('peer switch has an unrecognized profile binding')
+        return bound, target_digest
+
+    def cancel_peer_change(self, target, *, guard_blocked):
+        """Explicit disable may cancel a switch without repairing a dead tunnel."""
+        if guard_blocked is not True or self.uncertain or self.receipt is None:
+            raise NetworkError('cancel requires a blocked guard and owned network')
+        self._bind_pending_peer(target)
+        return self.disable(guard_blocked=True)
 
     def _sweep_private(self, attempt_id):
         """Remove a private configuration orphaned by a crash before its scoped removal."""
