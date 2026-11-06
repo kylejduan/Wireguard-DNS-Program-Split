@@ -118,8 +118,8 @@ function Enter-ProgramSplitTrayMutationLock {
 
 function Test-ProgramSplitTrayRunnerCommand {
     param([string] $CommandLine, [Parameter(Mandatory)] [string[]] $TrayPaths)
-    if ($CommandLine -notmatch '(?i)^\s*(?:"[^"]*"|\S+)\s+--run(?:\s|$)') { return $false }
-    if ($CommandLine -notmatch '(?i)^\s*(?:"[^"]*"|\S+)\s+--run\s+\S+\s+(\S+)\s*$') { return $true }
+    if ($CommandLine -notmatch '(?i)^\s*(?:"[^"]*"|[^"\s]+)\s+--run(?:\s|$)') { return $false }
+    if ($CommandLine -notmatch '(?i)^\s*(?:"[^"]*"|[^"\s]+)\s+--run\s+\S+\s+(\S+)\s*$') { return $true }
     try {
         $bytes = [Convert]::FromBase64String($Matches[1])
         if ($bytes.Length % 2) { return $true }
