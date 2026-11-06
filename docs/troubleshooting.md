@@ -49,6 +49,7 @@ If the controller is gone or the installation is broken, inspect and remove the 
 - Disable application-owned Secure DNS/DoH during testing.
 - Confirm the profile had exactly one reachable IPv4 DNS address.
 - Inspect `dns-dispatcher.log` for `TUNNEL`, `DIRECT`, `BLOCKED`, or `FAILED`.
+- `(tunnel lane full)` means 128 tunnel upstream exchanges are already outstanding. The query fails closed; it does not fall back to direct DNS. Check tunnel-resolver connectivity if this persists.
 - `(resolver 2)` on a `DIRECT` line means the first physical resolver did not answer and a later one did.
 - `RELOADED generation=N` records an in-place reload, and `RELOAD REJECTED` a rejected one, after which the loaded inputs stay in use. `state\dns-dispatcher-status.txt` names the process and generation that published `state\dns-dispatcher-loaded-*` copies. `controller-service.log` records each dispatcher start and end, and an NRPT suspension or restoration; `state\nrpt-suspended` exists while the rule is suspended.
 - `BLOCKED (no process hint)` means the dispatcher deliberately returned `SERVFAIL` because it could not safely attribute the query. A preceding `BARRIER INCOMPLETE` line means the ordering barrier did not complete within 500 ms, and `ETW FLUSH FAILED` that the session could not be flushed; both refuse rather than guess.
@@ -59,12 +60,40 @@ If the controller is gone or the installation is broken, inspect and remove the 
 
 Unlisted payload should not traverse the tunnel. Confirm the physical default route wins and the tunnel route remains metric `9999`. Compare the same server, browser, protocol, and time window; multi-gigabit browser tests are sensitive to CPU, server capacity, extensions, and HTTP implementation.
 
-To decide whether the stack is involved at all, measure the same workload with it removed. Take a paired sample of new connections to fixed addresses, stop the split, repeat the sample, and start it again:
+Also distinguish configured receive offloads from their operational state. From an
+elevated Windows PowerShell session, the read-only diagnostic below reports the
+process sample and RSC state without changing the installation:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\Program Files\WireGuardProgramSplit\src\Get-PerformanceState.ps1' -SampleSeconds 60
+```
+
+Wait about a minute after activation and check `ValidationWorkerPresentAtStart`;
+a failed validation can dispose that worker. The process sample includes each
+process's own kernel time, but does not measure system-wide driver/DPC/interrupt
+work, work in other processes, or transient helpers. If `Get-NetAdapterRsc`
+reports `WFPCompatibility`, RSC can be configured
+enabled while remaining non-operational. Incompatible WFP callouts can suppress
+receive coalescing and add TCP receive work even when traffic uses the physical
+route. Other security/VPN providers may contribute; that state alone does not
+identify the responsible driver or quantify the throughput impact. See
+[Microsoft's RSC driver guidance](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/programming-considerations-for-rsc-drivers).
+
+To measure the active user-mode stack and owned filters, take paired samples of new
+connections to fixed addresses, stop the split, repeat, and start it again. This
+is not a complete kernel-driver bypass: stopping the controller leaves shared
+drivers loaded. Record RSC's operational state in both phases and account for
+other WFP providers before attributing a receive-performance difference.
 
 - Windows: `Stop-Service WireGuardProgramSplitController` removes the persistent payload filters, the NRPT rule and `dns-dispatcher.exe`, and stops the tunnel service; `Start-Service` restores them. Confirm `bin\wfp-probe.exe status` reports `ABSENT` and that `dns-dispatcher`, the NRPT rule and the tunnel address are absent during the window.
 - Linux: `wg-program-split disable` removes `wgps0`, the `wg_program_split` nftables table, the routing rule and the BPF pins; `wg-program-split activate` restores them. Unlisted traffic is untouched either way, so the only cost of the window is that enrolled programs lose the tunnel.
 
-Selected applications leave through the physical path while the split is stopped, so keep the window short and do not use it as a workaround.
+Selected applications can leave through the physical path while the split is
+stopped. Close them or establish verified temporary outbound blocks before the
+test, then remove those blocks only after the protected stack is restored.
+Keep an elevated local console open with
+`Start-Service WireGuardProgramSplitController` ready before stopping it, and do
+not use service-off as a workaround.
 
 A paired run on both reference hosts on September 17, 2026 measured TCP handshake latency to three fixed public addresses, about 130 to 190 samples per phase:
 
@@ -75,7 +104,7 @@ A paired run on both reference hosts on September 17, 2026 measured TCP handshak
 | Windows host, split active | 8 ms | 269 ms | 455 ms | 20.1% |
 | Windows host, split disabled | 8 ms | 295 ms | 510 ms | 18.5% |
 
-Removing the split did not remove the stalls on either operating system, and a Linux probe that overlapped the Windows disabled window spiked in the same ten-second buckets on both hosts (14 of 14 buckets agreed). Connection setup delays of this size are upstream of the host; the measured local cost is microseconds per packet and per socket, and connections that terminate on the local network traverse the same hooks without spiking. Compare a local destination before suspecting the stack.
+Removing the split did not remove the stalls on either operating system, and a Linux probe that overlapped the Windows disabled window spiked in the same ten-second buckets on both hosts (14 of 14 buckets agreed). That run supports a shared-path explanation for that particular stall pattern. It does not quantify Windows kernel-driver receive overhead, certify RSC operation, or exclude other local bottlenecks. Compare a local destination and record the offload state before attributing a new slowdown.
 
 ## Extra WireGuard network adapter
 

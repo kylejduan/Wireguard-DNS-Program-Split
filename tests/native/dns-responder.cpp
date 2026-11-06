@@ -7,6 +7,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -58,6 +59,9 @@ bool receiveAll(SOCKET socket, char* data, int size) {
 
 int main(int argc, char** argv) {
     const unsigned long lifetime = argc > 2 ? std::strtoul(argv[2], nullptr, 10) : 90;
+    // Only the capacity fixture uses this mode. A query starting resume. makes
+    // the same tunnel endpoint answer again without restarting the dispatcher.
+    bool tunnelOutage = argc > 3 && std::strcmp(argv[3], "--tunnel-outage") == 0;
     WSADATA data{};
     if (WSAStartup(MAKEWORD(2, 2), &data)) return 1;
     SOCKET udp[2]{INVALID_SOCKET, INVALID_SOCKET};
@@ -102,6 +106,10 @@ int main(int argc, char** argv) {
                     answer(packet, i, false, probe);
                     const bool truncate = probe.rfind("tc-", 0) == 0 || probe.rfind("tcbig-", 0) == 0;
                     const auto reply = answer(packet, i, truncate, name);
+                    if (i && tunnelOutage) {
+                        if (name.rfind("resume.", 0) != 0) continue;
+                        tunnelOutage = false;
+                    }
                     if (!reply.empty()) {
                         sendto(udp[i], reinterpret_cast<const char*>(reply.data()), static_cast<int>(reply.size()), 0,
                                reinterpret_cast<sockaddr*>(&peer), peerSize);
@@ -121,6 +129,7 @@ int main(int argc, char** argv) {
                         std::string probe;
                         answer(packet, i, false, probe);
                         auto reply = answer(packet, i, false, name, probe.rfind("tcbig-", 0) == 0);
+                        if (i && tunnelOutage) reply.clear();
                         if (!reply.empty()) {
                             const unsigned char size[2]{static_cast<unsigned char>(reply.size() >> 8),
                                                         static_cast<unsigned char>(reply.size() & 0xff)};

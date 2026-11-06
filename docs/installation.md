@@ -60,7 +60,9 @@ From Windows PowerShell, `-PlanOnly` validates all paths and transforms the prof
 
 Repeat the command in an elevated Windows PowerShell session without `-PlanOnly`. Add `-DisableBrowserSecureDns` if selected browsers must use the WireGuard profile's DNS rather than browser-owned DoH.
 
-The installation is machine-wide. Runtime files are ACL-locked beneath `C:\Program Files\WireGuardProgramSplit`; only SYSTEM and Administrators retain access. The tray appears after interactive logon.
+The installation is machine-wide. Runtime files are ACL-locked beneath `C:\Program Files\WireGuardProgramSplit`; SYSTEM and Administrators retain access. The installing Windows account also receives read-only access to the logs subtree so **Open logs** works without elevation. Those logs can include DNS names and executable paths from other accounts on this machine; the grant excludes configuration, keys, executable code, and mutable state. The tray appears after interactive logon.
+
+If elevation uses another account's credentials, the log grant belongs to that account. Migration preserves the previous ACLs and does not add this installer grant.
 
 The controller starts automatically; the tunnel service is Manual so it starts only after adapter preflight. Before starting a stopped tunnel, the controller serializes creation and refuses creation if an enumerated root WireGuard device or another split adapter remains. Running/starting owned tunnels are reused. Background maintenance reports inactive root adapters but never automatically removes them: inactivity does not establish which VPN owns a device. An administrator can explicitly select an inspected device for removal; identity, traffic, address and route checks still apply. See [adapter maintenance](troubleshooting.md#extra-wireguard-network-adapter) and [optional physical recovery](network-recovery.md).
 

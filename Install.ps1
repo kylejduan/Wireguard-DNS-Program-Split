@@ -141,6 +141,13 @@ try {
     & icacls.exe (Join-Path $DestinationRoot '*') /inheritance:e /T /C /Q | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to inherit the protected installation ACL.' }
 
+    # Explorer uses the signed-in user's normal token even when the tray is elevated.
+    # Grant that account read access to logs without exposing the profile or writable code.
+    $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    & icacls.exe (Join-Path $DestinationRoot 'logs') /grant:r `
+        ('*{0}:(OI)(CI)RX' -f $currentUserSid) /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to grant the installing user read access to logs.' }
+
     Copy-Item -Path (Join-Path $PSScriptRoot 'src\powershell\*.ps1') -Destination (Join-Path $DestinationRoot 'src')
     foreach ($name in $projectExecutables) {
         Copy-Item -LiteralPath (Join-Path $BuildDirectory $name) -Destination (Join-Path $DestinationRoot "bin\$name")

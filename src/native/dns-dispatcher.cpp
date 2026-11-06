@@ -28,6 +28,7 @@
 #include <memory>
 #include "path-identity.h"
 #include "bounded-log.h"
+#include "dns-capacity.h"
 
 namespace {
 
@@ -45,6 +46,8 @@ struct EventIdFilter {
     USHORT events[1];
 };
 constexpr unsigned kMaxWorkers = 256;
+constexpr unsigned kMaxTunnelExchanges = kMaxWorkers / 2;
+ExchangeLimit gTunnelExchanges(kMaxTunnelExchanges);
 constexpr ULONG kProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD |
                                     PROCESS_TRACE_MODE_RAW_TIMESTAMP;
 static_assert(kProcessTraceMode & PROCESS_TRACE_MODE_RAW_TIMESTAMP);
@@ -580,7 +583,11 @@ size_t advertisedUdpSize(const std::vector<char>& query) {
 // The upstream exchange of a UDP query on its chosen route. A truncated answer is completed over TCP from the
 // same resolver within the remaining time and returned over UDP when it fits the client's size.
 std::optional<std::vector<char>> exchangeUdpRoute(const std::vector<char>& packet, bool tunnel, const Routes& routes,
-                                                  DirectResolvers& state, bool& completed, size_t& resolverIndex) {
+                                                  DirectResolvers& state, bool& completed, size_t& resolverIndex,
+                                                  bool* capacityLimited = nullptr) {
+    ExchangeLimit::Lease lease(tunnel ? &gTunnelExchanges : nullptr);
+    if (capacityLimited) *capacityLimited = !lease;
+    if (!lease) return std::nullopt;
     const auto deadline = upstreamDeadline();
     const sockaddr_in source = tunnel ? routes.tunnelSource : routes.directSource;
     sockaddr_in resolver = routes.tunnelDns;
@@ -609,7 +616,10 @@ std::optional<std::vector<char>> exchangeUdpRoute(const std::vector<char>& packe
 // The upstream exchange of a TCP query: over TCP, and for the direct route over UDP if the resolvers refuse
 // TCP, all within one deadline that keeps the last kPerResolverMilliseconds for that UDP fallback.
 std::optional<std::vector<char>> exchangeTcpRoute(const std::vector<char>& packet, bool tunnel, const Routes& routes,
-                                                  DirectResolvers& state) {
+                                                  DirectResolvers& state, bool* capacityLimited = nullptr) {
+    ExchangeLimit::Lease lease(tunnel ? &gTunnelExchanges : nullptr);
+    if (capacityLimited) *capacityLimited = !lease;
+    if (!lease) return std::nullopt;
     const auto deadline = upstreamDeadline();
     if (tunnel) return tcpExchange(packet, routes.tunnelSource, routes.tunnelDns, remainingMilliseconds(deadline));
     auto response = directExchange(packet, routes.directSource, routes.directDns, state,
@@ -656,10 +666,11 @@ void handleUdpQuery(Hints& hints, std::vector<char> packet, sockaddr_in client, 
     const auto tunnel = selectRoute(hints, *question, L"UDP", queryQpc, classifyMicroseconds, reused, generation);
     std::optional<std::vector<char>> response;
     bool completed = false;
+    bool capacityLimited = false;
     size_t resolverIndex = 0;
     // A truncated answer sends the client to TCP, where the Windows DNS Client can hand it another process's
     // answer for the same name, so exchangeUdpRoute completes it on the same route, with no new classification.
-    if (tunnel) response = exchangeUdpRoute(packet, *tunnel, routes, gDirectResolvers, completed, resolverIndex);
+    if (tunnel) response = exchangeUdpRoute(packet, *tunnel, routes, gDirectResolvers, completed, resolverIndex, &capacityLimited);
     const bool withheld = response && tunnel && !*tunnel && hints.directAnswerUnsafe(question->name, question->type);
     if (withheld) response.reset();
     const bool answered = response.has_value();
@@ -672,6 +683,7 @@ void handleUdpQuery(Hints& hints, std::vector<char> packet, sockaddr_in client, 
         logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
                 (*tunnel ? L"TUNNEL" : L"DIRECT") + (reused ? L" (reused)" : L"") + (completed ? L" (completed over TCP)" : L"") +
                 (resolverIndex ? L" (resolver " + std::to_wstring(resolverIndex + 1) + L")" : L"") +
+                (capacityLimited ? L" (tunnel lane full)" : L"") +
                 (withheld ? L" WITHHELD (selected lookup of the same name)" : answered ? L"" : L" FAILED") + L" classify=" + std::to_wstring(classifyMicroseconds) + L"us query-qpc=" +
                 std::to_wstring(queryQpc), !answered);
     }
@@ -696,10 +708,11 @@ void handleTcpClient(SOCKET client, Hints& hints) {
         unsigned long long generation{};
         if (question) tunnel = selectRoute(hints, *question, L"TCP", queryQpc, classifyMicroseconds, reused, generation);
         std::optional<std::vector<char>> response;
+        bool capacityLimited = false;
         if (question && tunnel) {
             // Each request uses the routes current when it arrives, so a reload takes effect between requests.
             const auto routes = currentRoutes();
-            response = exchangeTcpRoute(packet, *tunnel, *routes, gDirectResolvers);
+            response = exchangeTcpRoute(packet, *tunnel, *routes, gDirectResolvers, &capacityLimited);
         }
         const bool withheld = response && question && tunnel && !*tunnel && hints.directAnswerUnsafe(question->name, question->type);
         if (withheld) response.reset();
@@ -711,6 +724,7 @@ void handleTcpClient(SOCKET client, Hints& hints) {
             if (!withheld) hints.complete(question->name, question->type, generation);
             logLine(L"DNS " + question->name + L" type=" + std::to_wstring(question->type) + L" -> " +
                     (*tunnel ? L"TUNNEL" : L"DIRECT") + L" (TCP)" + (reused ? L" (reused)" : L"") +
+                    (capacityLimited ? L" (tunnel lane full)" : L"") +
                     (withheld ? L" WITHHELD (selected lookup of the same name)" : answered ? L"" : L" FAILED") +
                     L" classify=" + std::to_wstring(classifyMicroseconds) + L"us query-qpc=" +
                     std::to_wstring(queryQpc), !answered);

@@ -279,6 +279,56 @@ long long millisecondsSince(std::chrono::steady_clock::time_point started) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
 }
 
+int tunnelCapacityTest(const std::vector<char>& query) {
+    // The actual UDP/TCP route functions refuse before I/O at the tunnel cap,
+    // while a direct exchange still reaches its resolver. No port 53 or NRPT.
+    WSADATA winsock{};
+    if (WSAStartup(MAKEWORD(2, 2), &winsock)) return 90;
+    struct Cleanup { ~Cleanup() { WSACleanup(); } } cleanup;
+    TestResolver direct(true);
+    Routes routes{address(L"127.0.0.1", 0), {direct.endpoint}, address(L"127.0.0.1", 0), direct.endpoint};
+    DirectResolvers state;
+    std::vector<std::unique_ptr<ExchangeLimit::Lease>> held;
+    for (unsigned i = 0; i < kMaxTunnelExchanges; ++i) {
+        held.push_back(std::make_unique<ExchangeLimit::Lease>(&gTunnelExchanges));
+        if (!*held.back()) return 91;
+    }
+    bool completed = false, limited = false;
+    size_t resolverIndex{};
+    if (exchangeUdpRoute(query, true, routes, state, completed, resolverIndex, &limited) || !limited) return 92;
+    if (exchangeTcpRoute(query, true, routes, state, &limited) || !limited) return 93;
+    if (!exchangeUdpRoute(query, false, routes, state, completed, resolverIndex, &limited) || limited) return 94;
+    if (gTunnelExchanges.active() != kMaxTunnelExchanges) return 95;
+    held.clear();
+    if (!exchangeUdpRoute(query, true, routes, state, completed, resolverIndex, &limited) || limited ||
+        gTunnelExchanges.active()) return 96;
+    // Exception unwinding releases exactly one reservation.
+    try {
+        ExchangeLimit::Lease lease(&gTunnelExchanges);
+        if (!lease) return 97;
+        throw 1;
+    } catch (int) {}
+    if (gTunnelExchanges.active()) return 98;
+    // Contending callers cannot exceed the limit or leak reservations.
+    ExchangeLimit small(2);
+    std::atomic_uint inside{}, peak{}, accepted{};
+    std::vector<std::thread> callers;
+    for (unsigned i = 0; i < 8; ++i) callers.emplace_back([&] {
+        for (unsigned attempt = 0; attempt < 256; ++attempt) {
+            ExchangeLimit::Lease lease(&small);
+            if (!lease) { std::this_thread::yield(); continue; }
+            ++accepted;
+            const unsigned active = ++inside;
+            unsigned old = peak.load();
+            while (old < active && !peak.compare_exchange_weak(old, active)) {}
+            std::this_thread::yield();
+            --inside;
+        }
+    });
+    for (auto& caller : callers) caller.join();
+    return accepted && peak <= 2 && !inside && !small.active() ? 0 : 99;
+}
+
 // The direct route passes over a physical resolver that takes datagrams and never answers, prefers the one
 // that answered, and under continuous traffic still re-probes the first-listed one within the window. Every
 // upstream attempt for a query, over every resolver and transport, stays within one deadline.
@@ -548,6 +598,7 @@ int selfTest() {
         if (barrier) return barrier;
     }
     if (const int failover = failoverTest(query)) return failover;
+    if (const int capacity = tunnelCapacityTest(query)) return capacity;
     // A resolver list is one to three distinct IPv4 addresses, or the input is rejected whole.
     if (resolverList(L"192.0.2.1,198.51.100.2").size() != 2 || resolverList(L"192.0.2.1").size() != 1) return 86;
     for (const wchar_t* malformed : {L"", L"192.0.2.1,", L",192.0.2.1", L"192.0.2.1,192.0.2.1", L"192.0.2.1;192.0.2.2",
