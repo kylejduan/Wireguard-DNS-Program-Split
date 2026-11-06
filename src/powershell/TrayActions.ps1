@@ -63,9 +63,16 @@ function Import-Profile([string] $InputPath) {
 
         $prepared = "$activeProfile.new"
         $preparedSettings = "$activeSettings.new"
-        $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Prepare-Profile.ps1') `
-            -InputPath $InputPath -OutputPath $prepared -SettingsPath $preparedSettings -SkipAcl 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "Profile preparation failed: $($output -join ' ')" }
+        $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $preparation = Invoke-ProgramSplitProcess -FilePath $powerShell -ArgumentList @(
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+            (Join-Path $PSScriptRoot 'Prepare-Profile.ps1'), '-InputPath', $InputPath,
+            '-OutputPath', $prepared, '-SettingsPath', $preparedSettings, '-SkipAcl'
+        ) -TimeoutMilliseconds 30000 -Encoding Oem
+        if ($preparation.TimedOut) { throw 'Profile preparation timed out.' }
+        if ($preparation.ExitCode -ne 0 -or $preparation.OutputTruncated -or $preparation.ErrorTruncated) {
+            throw "Profile preparation failed: $(@($preparation.Error + $preparation.Output) -join ' ')"
+        }
         $replacementAttempted = $true
         Install-ProgramSplitProfilePair -ActiveProfile $activeProfile -ActiveSettings $activeSettings `
             -PreparedProfile $prepared -PreparedSettings $preparedSettings | Out-Null

@@ -3,13 +3,14 @@
 ## Unreleased
 
 - Windows: replace the resident PowerShell/Windows Forms tray with a native
-  notification icon. Profile and application changes use a short-lived,
+  notification icon. File pickers use short-lived native children. Profile and application changes use a short-lived,
   supervised helper; the existing profile rollback guards remain in place.
   New installations and same-release migrations register the native executable
   directly, while task ownership checks continue to recognize the exact legacy
   PowerShell action.
 - Tests: exercise native tray lifecycle, Unicode application paths, failed
-  last-app removal, preserved profile backups and action cancellation against
+  last-app removal, profile commit/readiness rollback, bounded preparation,
+  preserved backups and action cancellation against
   a disposable installation tree.
 
 ## 0.4.0 - 2026-11-06

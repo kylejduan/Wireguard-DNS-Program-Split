@@ -14,6 +14,17 @@ struct Menu {
     HMENU value{CreatePopupMenu()};
     ~Menu() { if (value) DestroyMenu(value); }
 };
+std::wstring selectFile(bool profile) {
+    std::vector<wchar_t> path(32768);
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.lpstrFilter = profile ? L"WireGuard profiles (*.conf)\0*.conf\0\0" : L"Applications (*.exe)\0*.exe\0\0";
+    dialog.lpstrFile = path.data(); dialog.nMaxFile = static_cast<DWORD>(path.size());
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_DONTADDTORECENT | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameW(&dialog)) return path.data();
+    if (CommDlgExtendedError()) throw std::runtime_error("The file dialog failed.");
+    return {};
+}
 struct Tray {
     std::wstring root;
     HWND window{};
@@ -26,7 +37,7 @@ struct Tray {
         wcsncpy_s(icon.szInfoTitle, title, _TRUNCATE);
         wcsncpy_s(icon.szInfo, message.c_str(), _TRUNCATE);
         icon.dwInfoFlags = ok ? NIIF_INFO : NIIF_ERROR;
-        icon.uFlags = NIF_INFO;
+        icon.uFlags = NIF_INFO | NIF_SHOWTIP;
         Shell_NotifyIconW(NIM_MODIFY, &icon);
     }
     void update(bool create = false) {
@@ -36,10 +47,10 @@ struct Tray {
             icon.cbSize = sizeof(icon); icon.hWnd = window; icon.uID = 1;
             icon.uCallbackMessage = callback;
             icon.hIcon = LoadIconW(nullptr, IDI_SHIELD);
-            icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+            icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         } else {
             if (text == icon.szTip) return;
-            icon.uFlags = NIF_TIP;
+            icon.uFlags = NIF_TIP | NIF_SHOWTIP;
         }
         wcsncpy_s(icon.szTip, text.c_str(), _TRUNCATE);
         if (!Shell_NotifyIconW(create ? NIM_ADD : NIM_MODIFY, &icon)) {
@@ -55,17 +66,6 @@ struct Tray {
     void start(const std::wstring& name, const std::wstring& input = {}) {
         try { action.start(root, name, input); }
         catch (const std::exception& e) { notice(wide(e.what()), false); }
-    }
-    std::wstring select(bool profile) {
-        std::vector<wchar_t> path(32768);
-        OPENFILENAMEW dialog{};
-        dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = window;
-        dialog.lpstrFilter = profile ? L"WireGuard profiles (*.conf)\0*.conf\0\0" : L"Applications (*.exe)\0*.exe\0\0";
-        dialog.lpstrFile = path.data(); dialog.nMaxFile = static_cast<DWORD>(path.size());
-        dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_DONTADDTORECENT | OFN_NOCHANGEDIR;
-        if (GetOpenFileNameW(&dialog)) return path.data();
-        if (CommDlgExtendedError()) notice(L"The file dialog failed.", false);
-        return {};
     }
     void menu() {
         Menu menu;
@@ -94,16 +94,14 @@ struct Tray {
         const UINT command = TrackPopupMenu(menu.value, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                             point.x, point.y, 0, window, nullptr);
         PostMessageW(window, WM_NULL, 0, 0);
+        Shell_NotifyIconW(NIM_SETFOCUS, &icon);
         if (command >= removeBase && command - removeBase < apps.size() && !action.busy()) {
             start(L"Remove", apps[command - removeBase]); return;
         }
         switch (command) {
         case toggle: if (!action.busy()) start(L"Toggle"); break;
         case add: case importProfile:
-            if (!action.busy()) {
-                const auto path = select(command == importProfile);
-                if (!path.empty()) start(command == add ? L"Add" : L"Import", path);
-            }
+            if (!action.busy()) start(command == add ? L"PickAdd" : L"PickImport");
             break;
         case logs:
             if (reinterpret_cast<INT_PTR>(ShellExecuteW(window, L"open", (root + L"\\logs").c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
@@ -127,11 +125,12 @@ struct Tray {
             if (smoke) { DestroyWindow(window); return 0; }
             update(icon.szTip[0] == 0);
             if (action.event() && !action.busy()) {
-                auto result = action.take(); notice(result.message, result.ok);
+                auto result = action.take();
+                if (!result.message.empty()) notice(result.message, result.ok);
             }
             return 0;
         case callback:
-            if (LOWORD(lparam) == WM_CONTEXTMENU || LOWORD(lparam) == WM_RBUTTONUP) menu();
+            if (LOWORD(lparam) == WM_CONTEXTMENU || LOWORD(lparam) == WM_RBUTTONUP || LOWORD(lparam) == NIN_KEYSELECT) menu();
             else if (LOWORD(lparam) == WM_LBUTTONDBLCLK && !action.busy()) start(L"Toggle");
             return 0;
         case WM_CLOSE: if (!action.busy()) DestroyWindow(window); return 0;
@@ -158,6 +157,7 @@ int selfTest() {
     require(quote(L"a\"b") == L"\"a\\\"b\"", "Embedded quote");
     const auto apps = applications("\xef\xbb\xbf# comment\r\n C:\\Jos\xc3\xa9\\App.exe \r\n\nD:\\App.exe\n");
     require(apps.size() == 2 && apps[0] == L"C:\\Jos\u00e9\\App.exe", "UTF-8 include list");
+    require(utf8(apps[0]) == "C:\\Jos\xc3\xa9\\App.exe", "Unicode output");
     require(menuText(L"A&B") == L"A&&B", "Menu escaping");
     require(resultFrame("WGPS-RUN 1\nexit=0\ntimedout=0\nstdout-truncated=0\nstderr-truncated=0\nstdout=T0s=\nstderr=\n").message == L"OK", "Runner output");
     require(!resultFrame("WGPS-RUN 1\nexit=0\ntimedout=1\nstdout-truncated=0\nstderr-truncated=0\nstdout=\nstderr=\n").ok, "Runner deadline");
@@ -179,6 +179,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (argc > 2) return 2;
     try {
         if (command == L"--self-test") return selfTest();
+        if (command == L"--pick-app" || command == L"--pick-profile") {
+            const auto selected = selectFile(command == L"--pick-profile");
+            const auto reply = selected.empty() ? std::string("CANCEL") : "SELECT:" + utf8(selected);
+            DWORD written{};
+            if (!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), reply.data(), static_cast<DWORD>(reply.size()), &written, nullptr) || written != reply.size()) return 1;
+            return 0;
+        }
         const bool smoke = command == L"--smoke-test";
         if (!command.empty() && !smoke) return 2;
         std::vector<wchar_t> module(32768);
@@ -209,7 +216,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     } catch (const std::exception& e) {
         DWORD written{};
         WriteFile(GetStdHandle(STD_ERROR_HANDLE), e.what(), static_cast<DWORD>(std::strlen(e.what())), &written, nullptr);
-        if (command != L"--self-test" && command != L"--smoke-test")
+        if (command != L"--self-test" && command != L"--smoke-test" && command != L"--pick-app" && command != L"--pick-profile")
             MessageBoxA(nullptr, e.what(), "WireGuard Program Split", MB_OK | MB_ICONERROR);
         return 1;
     }

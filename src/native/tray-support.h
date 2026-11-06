@@ -44,6 +44,14 @@ inline std::wstring wide(const std::string& text) {
     MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), result.data(), count);
     return result;
 }
+inline std::string utf8(const std::wstring& text) {
+    if (text.empty()) return {};
+    const int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (!count) throw std::runtime_error("Invalid Unicode in tray data");
+    std::string result(count, 0);
+    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), result.data(), count, nullptr, nullptr);
+    return result;
+}
 inline std::string readFile(const std::wstring& path, size_t limit = 4 * 1024 * 1024) {
     Handle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
@@ -74,7 +82,10 @@ inline std::vector<std::wstring> applications(const std::string& bytes) {
     if (result.size() > 60000) throw std::runtime_error("Too many applications for the tray menu");
     return result;
 }
-inline bool exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+inline bool exists(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
 inline std::wstring status(const std::wstring& root) {
     if (exists(root + L"\\state\\active")) return L"Enabled";
     if (exists(root + L"\\state\\enabled")) return L"Starting / recovering";
@@ -141,7 +152,6 @@ inline Result resultFrame(const std::string& frame) {
     if (parsed.ec != std::errc() || parsed.ptr != exit.data() + exit.size()) throw std::runtime_error("Invalid action exit code");
     std::wstring message = wide(unbase64(fields[code ? "stderr" : "stdout"]));
     if (message.empty()) message = wide(unbase64(fields[code ? "stdout" : "stderr"]));
-    if (message.size() > 16384) message.resize(16384);
     return {code == 0, message.empty() ? (code ? L"The operation failed." : L"The operation completed.") : message};
 }
 // Only one operation runs at a time. Its bounded runner owns the PowerShell
@@ -155,16 +165,10 @@ class Action {
     };
     std::shared_ptr<State> state_;
     std::thread thread_;
-    static Result execute(const std::wstring& root, const std::wstring& action,
-                          const std::wstring& value, const std::shared_ptr<State>& state) {
-        wchar_t system[MAX_PATH]{};
-        if (!GetSystemDirectoryW(system, MAX_PATH)) throw std::runtime_error("Cannot find Windows PowerShell");
-        const std::wstring ps = std::wstring(system) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
-        std::wstring child = quote(ps) + L" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " +
-            quote(root + L"\\src\\TrayActions.ps1") + L" -Action " + quote(action);
-        if (!value.empty()) child += L" -InputPath " + quote(value);
+    static Result run(const std::wstring& root, const std::wstring& child, DWORD timeout,
+                      const std::shared_ptr<State>& state) {
         const std::wstring runner = root + L"\\bin\\controller-service.exe";
-        std::wstring command = quote(runner) + L" --run 120000 " + base64(child);
+        std::wstring command = quote(runner) + L" --run " + std::to_wstring(timeout) + L" " + base64(child);
         SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
         HANDLE read{}, write{};
         if (!CreatePipe(&read, &write, &security, 0)) throw std::runtime_error("Cannot create action pipe");
@@ -179,7 +183,7 @@ class Action {
             throw std::runtime_error("Cannot start bounded tray action");
         Handle process(childProcess.hProcess), thread(childProcess.hThread);
         CloseHandle(writer.value); writer.value = nullptr;
-        const ULONGLONG deadline = GetTickCount64() + 125000;
+        const ULONGLONG deadline = GetTickCount64() + timeout + 5000;
         std::string frame;
         bool overflow{};
         try {
@@ -207,6 +211,27 @@ class Action {
         if (overflow) throw std::runtime_error("Tray action result exceeds its limit");
         return resultFrame(frame);
     }
+    static Result execute(const std::wstring& root, std::wstring action,
+                          std::wstring value, const std::shared_ptr<State>& state) {
+        if (action == L"PickAdd" || action == L"PickImport") {
+            const auto selected = run(root, quote(root + L"\\bin\\tray.exe") +
+                (action == L"PickAdd" ? L" --pick-app" : L" --pick-profile"), 600000, state);
+            if (!selected.ok) return selected;
+            if (selected.message == L"CANCEL") return {true, {}};
+            if (!selected.message.starts_with(L"SELECT:") || selected.message.size() <= 7)
+                throw std::runtime_error("Invalid file-picker result");
+            value = selected.message.substr(7);
+            action = action == L"PickAdd" ? L"Add" : L"Import";
+        }
+        wchar_t system[MAX_PATH]{};
+        if (!GetSystemDirectoryW(system, MAX_PATH)) throw std::runtime_error("Cannot find Windows PowerShell");
+        const std::wstring ps = std::wstring(system) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+        std::wstring child = quote(ps) + L" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " +
+            quote(root + L"\\src\\TrayActions.ps1") + L" -Action " + quote(action);
+        if (!value.empty()) child += L" -InputPath " + quote(value);
+        return run(root, child, action == L"Import" ? 180000 : 30000, state);
+    }
+
 public:
     ~Action() {
         if (!thread_.joinable()) return;
@@ -222,7 +247,7 @@ public:
         auto state = std::make_shared<State>();
         if (!state->done.value) throw std::runtime_error("Cannot create action completion event");
         std::thread worker([state, root = std::move(root), action = std::move(action), value = std::move(value)] {
-            Result result;
+            Result result{false, L"The operation failed."};
             try { result = execute(root, action, value, state); }
             catch (const std::exception& e) {
                 try { result = {false, wide(e.what())}; }
