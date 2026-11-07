@@ -154,8 +154,8 @@ struct Tray {
                 if (!message.empty()) message += L"\n\n";
                 message += L"Controller:\n" + controllerError;
             } catch (...) {}
-            if (message.empty()) notice(L"No readable error has been recorded.", true);
-            else MessageBoxW(window, message.c_str(), title, MB_OK | MB_ICONINFORMATION);
+            if (message.empty()) message = L"No readable error has been recorded.";
+            MessageBoxW(window, message.c_str(), title, MB_OK | MB_ICONINFORMATION);
             break;
         }
         case quit: if (!action.busy()) DestroyWindow(window); break;
