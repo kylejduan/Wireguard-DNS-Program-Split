@@ -400,6 +400,7 @@ class StagingTests(unittest.TestCase):
                            'sha256': {name: own.digest(directory / name) for name in NAMES}}
         probe = root / 'probe'; probe.write_bytes(b'probe'); probe.chmod(0o755)
         return {'schema': 1, 'run_id': run_id, 'names': own.names(run_id), 'evidence': str(root / 'evidence'),
+                'native_account_verified': f'{root.parts[2]}@{own.socket.gethostname()}' if len(root.parts) > 2 and root.parts[1] == 'home' else None,
                 'root_preflight_complete': True, 'protected_services_reviewed': ['ssh.service'], 'builds': builds,
                 'probe': str(probe), 'probe_sha256': own.digest(probe), 'management_ips': ['192.0.2.10'],
                 'host_port': 51820, 'peer_port': 51821, 'payload_port': 55553, 'underlay': '192.0.2.0/30',
