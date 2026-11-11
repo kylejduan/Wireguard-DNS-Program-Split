@@ -75,6 +75,8 @@ jobs:
         run: |
           ./tests/Test-PowerShell.ps1 -RepositoryRoot $PWD
           ./tests/Test-TcpListener.ps1 -RepositoryRoot $PWD
+          ./tests/Test-PhysicalRouteSelection.ps1 -RepositoryRoot $PWD
+          ./tests/Test-DispatcherReloadAccess.ps1 -RepositoryRoot $PWD
           ./tests/Test-NetworkRecovery.ps1 -RepositoryRoot $PWD
           ./tests/Test-NetworkRecoveryExecution.ps1 -RepositoryRoot $PWD
           ./tests/Test-RepairPolicy.ps1 -RepositoryRoot $PWD

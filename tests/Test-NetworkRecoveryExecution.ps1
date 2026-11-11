@@ -27,6 +27,7 @@ function Assert-True([bool]$Condition,[string]$Message){if(-not $Condition){thro
 function Get-Service {param($Name,$ErrorAction) [pscustomobject]@{Status='Running'}}
 function Get-ProgramSplitConfiguration {param($Root) [pscustomobject]@{AdapterName='Fixture tunnel'}}
 function Get-ProgramSplitPhysicalDefault {param($AdapterName) [pscustomobject]@{InterfaceIndex=$script:activeInterface}}
+function Get-NetIPInterface {param($AddressFamily,$InterfaceIndex,$ErrorAction) [pscustomobject]@{ConnectionState='Connected'}}
 function Get-NetRoute {param($AddressFamily,$DestinationPrefix,$PolicyStore,$ErrorAction)
     if($script:routeUnknown){throw 'Simulated route inventory error'}
     if($DestinationPrefix -and $script:routeMissing){throw [Management.Automation.ErrorRecord]::new([Exception]::new('No matching route'),'CmdletizationQuery_NotFound_DestinationPrefix',[Management.Automation.ErrorCategory]::ObjectNotFound,$DestinationPrefix)}

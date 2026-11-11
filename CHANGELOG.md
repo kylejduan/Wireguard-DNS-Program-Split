@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.2 - 2026-11-10
+
+- Windows: apply connected-route gating to opt-in adapter recovery, so stale
+  disconnected defaults do not indefinitely defer an enrolled Wi-Fi reconnect.
+  Unknown route inventories still refuse recovery.
+- Windows: report SYSTEM-owned dispatcher reload access denial before changing
+  a running dispatcher's inputs. Keep event permissions unchanged.
+- Existing installations need a controller restart (normal reboot or an
+  approved maintenance window) to activate its cached helper definitions.
+
+- Windows: ignore disconnected interfaces when choosing the physical IPv4
+  default. A retained, lower-metric route on an unplugged adapter could keep
+  split DNS bound to its old source address after an Ethernet or Wi-Fi handoff.
+  Connected uplinks retain route-plus-interface metric ordering and the tunnel
+  remains excluded. The controller reloads the dispatcher's inputs in place.
+- Tests: cover disconnected and missing interfaces, reconnecting the preferred
+  uplink, effective metric ordering, tunnel exclusion, resolver selection, and
+  the absence of a connected physical default. Run the regression locally and
+  in Windows CI.
+
+## 0.6.1 - 2026-11-06
+
+- Windows: always open an informational dialog for the tray's Show last error
+  command, including when there is no readable error to display.
+
+## 0.6.0 - 2026-11-06
+
+- Linux: optional bounded failover among explicitly configured trusted peers.
+  Three failed tunnel DNS/handshake checks permit a switch, at least 30 seconds
+  apart, while application guards and routing protections stay installed.
+- Linux: preserve ownership records across interrupted interface, route, and
+  temporary-file operations; distinguish local probe failures from unavailable
+  peers. Existing single-peer configurations remain supported.
+
 ## 0.5.0 - 2026-11-06
 
 - Windows: replace the resident PowerShell/Windows Forms tray with a native

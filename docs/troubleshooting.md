@@ -46,6 +46,24 @@ If the controller is gone or the installation is broken, inspect and remove the 
 
 ## DNS fails
 
+- After changing Ethernet ports or switching between Ethernet and Wi-Fi, compare
+  the active adapter address with the direct source in
+  state/dns-dispatcher-loaded-inputs.txt. Only connected physical IPv4
+  interfaces are eligible; a disconnected adapter's retained lower-metric
+  default must not win. Among connected candidates, the route and interface
+  metrics are added. The controller reloads changed DNS inputs in place without
+  restarting the dispatcher or tunnel. If no connected physical default exists,
+  repair is held and the dispatcher retains its last loaded inputs; DNS may
+  fail until a usable uplink returns. The heartbeat fallback detects a missing
+  dispatcher, not an unreachable upstream resolver.
+- Existing installations must restart the controller to activate a changed
+  Common.ps1 in its resident PowerShell process. Schedule a normal reboot or
+  an approved service maintenance window; stopping the controller removes the
+  filters, NRPT rule, and tunnel. Copying source alone does not activate it.
+- Dispatcher maintenance must be able to signal its SYSTEM-owned reload event.
+  Run that action as SYSTEM through trusted maintenance tooling. Administrator
+  elevation alone can be insufficient. Access denial is reported before
+  replacing a running dispatcher's inputs; do not loosen event permissions.
 - Disable application-owned Secure DNS/DoH during testing.
 - Confirm the profile had exactly one reachable IPv4 DNS address.
 - Inspect `dns-dispatcher.log` for `TUNNEL`, `DIRECT`, `BLOCKED`, or `FAILED`.

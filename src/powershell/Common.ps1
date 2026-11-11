@@ -743,7 +743,7 @@ function Get-ProgramSplitPhysicalDefault {
         -PolicyStore ActiveStore -ErrorAction Stop) {
         $interface = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex `
             -ErrorAction SilentlyContinue
-        if ($interface -and $route.InterfaceAlias -ne $AdapterName) {
+        if ($interface -and $interface.ConnectionState -eq 'Connected' -and $route.InterfaceAlias -ne $AdapterName) {
             [pscustomobject]@{
                 Route = $route
                 EffectiveMetric = [int64] $route.RouteMetric + [int64] $interface.InterfaceMetric

@@ -124,11 +124,26 @@ function Test-LoadedInputs($Process) {
     return $current -and $identity -and $current -ceq (Read-Bytes $loadedInputs) -and $identity -ceq (Read-Bytes $loadedIdentities)
 }
 
+function Open-ReloadEvent {
+    try { return [Threading.EventWaitHandle]::OpenExisting('Global\WireGuardProgramSplitDispatcherReload') }
+    catch [UnauthorizedAccessException] {
+        throw 'DNS dispatcher reload access denied. Run this maintenance action as SYSTEM; administrator elevation alone may not permit access to the SYSTEM-owned event.'
+    }
+    catch [Threading.WaitHandleCannotBeOpenedException] { return $null }
+}
+
+function Assert-ReloadAccess {
+    if (Get-ManagedProcess) {
+        $event = Open-ReloadEvent
+        if ($event) { $event.Dispose() }
+    }
+}
+
 function Request-Reload {
-    try {
-        $event = [Threading.EventWaitHandle]::OpenExisting('Global\WireGuardProgramSplitDispatcherReload')
+    $event = Open-ReloadEvent
+    if ($event) {
         try { $null = $event.Set() } finally { $event.Dispose() }
-    } catch { }
+    }
 }
 
 function Get-DirectNetwork {
@@ -218,6 +233,9 @@ if ($Action -eq 'Stop') {
 foreach ($path in @($exe, $identities)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing dispatcher input: $path" }
 }
+# Check a running worker's event before replacing its inputs. Keep its working
+# configuration intact when this caller cannot signal the SYSTEM-owned event.
+Assert-ReloadAccess
 $network = Get-DirectNetwork
 $text = "# wgps-dispatcher-inputs 1`r`ndirect-source=$($network.Source)`r`ndirect-dns=$($network.Resolver)`r`n" +
     "tunnel-source=$($configuration.TunnelAddress)`r`ntunnel-dns=$($configuration.TunnelDns)`r`n"

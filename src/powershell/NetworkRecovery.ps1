@@ -39,7 +39,8 @@ function Test-ProgramSplitRecoveryRouteSafe([string] $Root, [int] $InterfaceInde
         # Filtering inside the cmdlet throws ObjectNotFound when the default is
         # absent. Enumerate first so a real query error stays distinct from none.
         $routes=@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop |
-            Where-Object {$_.DestinationPrefix -eq '0.0.0.0/0' -and $_.InterfaceAlias -ne $settings.AdapterName})
+            Where-Object {$_.DestinationPrefix -eq '0.0.0.0/0' -and $_.InterfaceAlias -ne $settings.AdapterName} |
+            Where-Object {(Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $_.InterfaceIndex -ErrorAction Stop).ConnectionState -eq 'Connected'})
         if(-not $routes.Count){return $Action -in @('ReconnectWifi','ResetWifi')}
         $preferred=Get-ProgramSplitPhysicalDefault -AdapterName $settings.AdapterName
         return $preferred.InterfaceIndex -eq $InterfaceIndex
