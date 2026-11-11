@@ -400,10 +400,24 @@ class StagingTests(unittest.TestCase):
                            'sha256': {name: own.digest(directory / name) for name in NAMES}}
         probe = root / 'probe'; probe.write_bytes(b'probe'); probe.chmod(0o755)
         return {'schema': 1, 'run_id': run_id, 'names': own.names(run_id), 'evidence': str(root / 'evidence'),
+                'native_account_verified': f'{root.parts[2]}@{own.socket.gethostname()}' if len(root.parts) > 2 and root.parts[1] == 'home' else None,
                 'root_preflight_complete': True, 'protected_services_reviewed': ['ssh.service'], 'builds': builds,
                 'probe': str(probe), 'probe_sha256': own.digest(probe), 'management_ips': ['192.0.2.10'],
                 'host_port': 51820, 'peer_port': 51821, 'payload_port': 55553, 'underlay': '192.0.2.0/30',
                 'host_tunnel': '10.244.0.1', 'peer_tunnel': '10.244.0.2'}
+
+    def test_home_evidence_requires_the_matching_account_and_host(self):
+        root = temporary(self); manifest = self.manifest(root)
+        manifest['evidence'] = '/home/fixture-user/wgps-evidence-' + manifest['run_id']
+        with patch.object(own, 'directory_identity'), patch.object(own.socket, 'gethostname', return_value='fixture-host'), \
+                patch.object(own, 'staged_file', side_effect=RuntimeError('reached artifact validation')):
+            for attestation in (None, 'other@fixture-host', 'fixture-user@other-host'):
+                manifest['native_account_verified'] = attestation
+                with self.assertRaisesRegex(ValueError, 'verify the native account'):
+                    own.validate_manifest(manifest)
+            manifest['native_account_verified'] = 'fixture-user@fixture-host'
+            with self.assertRaisesRegex(RuntimeError, 'reached artifact validation'):
+                own.validate_manifest(manifest)
 
     def test_manifest_validation_checks_every_artifact_and_probe_staging(self):
         root = temporary(self); manifest = self.manifest(root)

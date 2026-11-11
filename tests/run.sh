@@ -61,6 +61,14 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
   -RepositoryRoot "$(wslpath -w "$repo_root")"
 
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  -File "$(wslpath -w "$repo_root/tests/Test-PhysicalRouteSelection.ps1")" \
+  -RepositoryRoot "$(wslpath -w "$repo_root")"
+
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+  -File "$(wslpath -w "$repo_root/tests/Test-DispatcherReloadAccess.ps1")" \
+  -RepositoryRoot "$(wslpath -w "$repo_root")"
+
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
   -File "$(wslpath -w "$repo_root/tests/Test-NetworkRecovery.ps1")" \
   -RepositoryRoot "$(wslpath -w "$repo_root")"
 

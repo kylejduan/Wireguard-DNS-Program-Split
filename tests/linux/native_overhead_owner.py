@@ -180,8 +180,10 @@ def validate_manifest(manifest):
     for parent in root.parents: directory_identity(parent)
     if not manifest.get('root_preflight_complete') or not manifest.get('protected_services_reviewed'):
         raise ValueError('root host/protection review attestation required')
-    if str(root).startswith('/home/tv/') and manifest.get('native_account_verified') != 'tv@TV':
-        raise ValueError('root must verify native tv@TV before writes below /home/tv')
+    if len(root.parts) > 2 and root.parts[1] == 'home':
+        account = f'{root.parts[2]}@{socket.gethostname()}'
+        if manifest.get('native_account_verified') != account:
+            raise ValueError('root must verify the native account before writes below its home')
     if manifest['builds']['baseline']['revision'] != 'b843960':
         raise ValueError('baseline must be the validated b843960 build')
     for arm in ('baseline', 'candidate'):

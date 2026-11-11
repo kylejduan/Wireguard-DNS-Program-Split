@@ -68,10 +68,10 @@ gap longer than 45 seconds, including sleep, hibernate and Fast Startup transiti
   one and two minutes old, and the requested
   network must be visible and connectable with at least 25 percent signal quality,
   with no other preferred physical route. A disconnected Wi-Fi adapter can qualify
-  when the route inventory confirms no physical default route. Authentication failures, a working
+  when the route inventory confirms no connected physical default route. Authentication failures, a working
   connection, radio-off state and another requested profile are left alone.
 
-A Wi-Fi reconnect also defers while another preferred physical route exists,
+A Wi-Fi reconnect also defers while another preferred connected physical route exists,
 so an automatic retry cannot deliberately displace an existing uplink. Unknown
 route inventory defers every action. The route and enrollment are checked again
 after slow inventory and after an asynchronous Wi-Fi scan.

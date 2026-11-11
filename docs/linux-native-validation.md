@@ -109,8 +109,9 @@ per-build `"launcher_sha256"` must equal it. A run that fails after installation
 is removed by the runner's cleanup or by `--recover`.
 
 Evidence must be new, persistent, absolute and resolved, outside `/tmp`; all its
-parents must be root-owned and not group/other writable. Paths below `/home/tv`
-also require `native_account_verified: "tv@TV"` and still face those directory
+parents must be root-owned and not group/other writable. Paths below a user
+home also require `native_account_verified: "<account>@<hostname>"`, matching
+the home directory name and current hostname, and still face those directory
 checks. Prefer a prepared `/var/lib` parent. Ports must be integers 1024–65535.
 The /30 and two /32 addresses must not overlap one another, current addresses,
 non-default routes in any table, or declared reserved/provider networks. Names

@@ -535,6 +535,9 @@ try {
         'dispatcher health validation requires the running dispatcher to have loaded the current inputs'
     Assert-True ($dispatcherStartSource -notmatch 'Start-Process|Invoke-LocalNrpt') `
         'Start leaves launching to the supervisor and never touches the NRPT rule'
+    Assert-True ($dispatcherStartSource.IndexOf('Assert-ReloadAccess') -ge 0 -and
+        $dispatcherStartSource.IndexOf('Assert-ReloadAccess') -lt $dispatcherStartSource.IndexOf('[IO.File]::WriteAllText($temporary')) `
+        'reload event access is checked before writing replacement inputs'
     $inputsWrite = $dispatcherStartSource.IndexOf('Move-Item -LiteralPath $temporary -Destination $inputsFile')
     $flagWrite = $dispatcherStartSource.IndexOf('[IO.File]::WriteAllText($supervisedFile')
     $lockRelease = $dispatcherStartSource.IndexOf('$componentMutex.ReleaseMutex()')
