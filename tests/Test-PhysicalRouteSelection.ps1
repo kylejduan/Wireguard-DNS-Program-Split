@@ -80,4 +80,3 @@ $script:routeUnknown=$false
 $live=@(NetTCPIP\Get-NetIPInterface -AddressFamily IPv4 -ErrorAction Stop)
 Assert-True (@($live | Where-Object {$_.ConnectionState -eq 'Connected'}).Count -gt 0) 'real CIM ConnectionState supports the Connected comparison'
 Write-Output 'PASS: connected physical uplink, DNS inputs, recovery gating and CIM state contract.'
-
